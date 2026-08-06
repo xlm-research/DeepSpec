@@ -3,12 +3,18 @@ import argparse
 import json
 import torch
 from transformers import AutoConfig
-from deepspec.eval.dspark import Gemma4DSparkEvaluator, Qwen3DSparkEvaluator
+from deepspec.eval.dspark import (
+    Gemma4DSparkEvaluator,
+    Qwen3DSparkEvaluator,
+    Qwen3_6DSparkEvaluator,
+)
 from deepspec.eval.eagle3 import Gemma4Eagle3Evaluator, Qwen3Eagle3Evaluator
+from deepspec.data.parser import parse_media_uri_map_entries
 from deepspec.utils import CustomJSONEncoder
 
 EVALUATORS = {
     "Qwen3DSparkModel": Qwen3DSparkEvaluator,
+    "Qwen3_6DSparkModel": Qwen3_6DSparkEvaluator,
     "Gemma4DSparkModel": Gemma4DSparkEvaluator,
     "Qwen3Eagle3Model": Qwen3Eagle3Evaluator,
     "Gemma4Eagle3Model": Gemma4Eagle3Evaluator,
@@ -42,9 +48,53 @@ def parse_args():
     parser.add_argument("--tensorboard-dir", type=str, default=None)
     parser.add_argument("--step", type=int, default=None,help=("step for tensorboard logging"),)
     parser.add_argument("--seed", type=int, default=980406)
+    parser.add_argument("--dataset-root", type=str, default="./eval_datasets")
+    parser.add_argument(
+        "--media-root",
+        type=str,
+        default=None,
+        help="Root used to resolve relative image/video paths in evaluation JSONL.",
+    )
+    parser.add_argument(
+        "--media-uri-map",
+        action="append",
+        default=[],
+        metavar="SOURCE_PREFIX=REPLACEMENT_PREFIX",
+        help="Rewrite media URI prefixes before loading; repeat as needed.",
+    )
+    parser.add_argument("--chat-template", type=str, default="qwen")
+    parser.add_argument(
+        "--task",
+        action="append",
+        default=[],
+        help="Evaluation task as NAME or NAME:MAX_SAMPLES. Repeat as needed.",
+    )
     args = parser.parse_args()
-    args.tasks = list(TASKS)
+    try:
+        args.media_uri_map = parse_media_uri_map_entries(args.media_uri_map)
+    except (TypeError, ValueError) as exc:
+        parser.error(str(exc))
+    args.tasks = [_parse_task(task) for task in args.task] or list(TASKS)
     return args
+
+
+def _parse_task(value: str):
+    name, separator, raw_max_samples = value.partition(":")
+    if not name:
+        raise argparse.ArgumentTypeError("Task name cannot be empty.")
+    if not separator:
+        return name, None
+    try:
+        max_samples = int(raw_max_samples)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"Task max samples must be an integer: {value}"
+        ) from exc
+    if max_samples <= 0:
+        raise argparse.ArgumentTypeError(
+            f"Task max samples must be positive: {value}"
+        )
+    return name, max_samples
 
 
 def main(local_rank: int, args):

@@ -7,11 +7,17 @@ import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import MixedPrecision, ShardingStrategy
+from torch.distributed.fsdp.wrap import ModuleWrapPolicy
 from torch.utils.data import DataLoader
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoProcessor, AutoTokenizer
 
 from deepspec.data import CacheDataset, validate_train_cache
 from deepspec.data.cuda_prefetcher import CUDAPrefetcher
+from deepspec.modeling.target_adapter import (
+    get_target_embeddings,
+    is_multimodal_config,
+    load_target_model_with_head,
+)
 from deepspec.utils import (
     BF16Optimizer,
     StatelessResumableDistributedSampler,
@@ -29,6 +35,7 @@ from deepspec.trainer.ckpt_manager import (
 )
 import deepspec.utils.training_logger as training_logger
 from deepspec.utils.hfai_suspend import SuspendController
+from deepspec.utils.parallel import build_parallel_topology
 
 
 _PRECISION_DTYPES = {
@@ -53,9 +60,24 @@ _HYBRID_STRATEGIES = (
 
 
 def _build_fsdp_kwargs(
-    *, sharding_strategy_name: str, precision_dtype, world_size: int
+    *,
+    sharding_strategy_name: str,
+    precision_dtype,
+    world_size: int,
+    fsdp_size: int,
 ) -> dict:
     sharding_strategy = _SHARDING_STRATEGIES[sharding_strategy_name]
+    replicate_size = world_size // int(fsdp_size)
+    if replicate_size > 1:
+        if sharding_strategy == ShardingStrategy.FULL_SHARD:
+            sharding_strategy = ShardingStrategy.HYBRID_SHARD
+        elif sharding_strategy == ShardingStrategy.SHARD_GRAD_OP:
+            sharding_strategy = ShardingStrategy._HYBRID_SHARD_ZERO2
+        elif sharding_strategy not in _HYBRID_STRATEGIES:
+            raise ValueError(
+                "train.fsdp_size < world_size requires full_shard, "
+                "shard_grad_op, or a hybrid sharding strategy."
+            )
     fsdp_kwargs = dict(
         use_orig_params=True,
         mixed_precision=MixedPrecision(
@@ -65,10 +87,9 @@ def _build_fsdp_kwargs(
         sharding_strategy=sharding_strategy,
     )
     if sharding_strategy in _HYBRID_STRATEGIES:
-        devices_per_node = torch.cuda.device_count()
         fsdp_kwargs["device_mesh"] = init_device_mesh(
             "cuda",
-            (world_size // devices_per_node, devices_per_node),
+            (replicate_size, int(fsdp_size)),
             mesh_dim_names=("replicate", "shard"),
         )
     return fsdp_kwargs
@@ -158,6 +179,22 @@ class BaseTrainer:
     def __init__(self, local_rank, args):
         self.args = args
         self.device, self.global_rank, self.world_size = init_dist(local_rank)
+        self.context_parallel_size = int(
+            self.args.train.get("context_parallel_size", 1)
+        )
+        configured_fsdp_size = self.args.train.get("fsdp_size")
+        self.fsdp_size = (
+            self.world_size // self.context_parallel_size
+            if configured_fsdp_size is None
+            else int(configured_fsdp_size)
+        )
+        self.parallel = build_parallel_topology(
+            context_parallel_size=self.context_parallel_size,
+            fsdp_size=self.fsdp_size,
+            create_fsdp_groups=False,
+        )
+        self.data_parallel_size = self.parallel.sample_parallel_size
+        self.data_parallel_rank = self.parallel.sample_parallel_rank
         self.precision_dtype = _PRECISION_DTYPES[self.args.train.precision]
         self.checkpoint_dir_root = self.args.logging.checkpoint_dir
         self.resume_checkpoint_dir = discover_latest_checkpoint(
@@ -181,13 +218,41 @@ class BaseTrainer:
                 precision_dtype=self.precision_dtype,
                 global_rank=self.global_rank,
             )
+        configure_cp = getattr(
+            self.draft_model, "configure_context_parallel", None
+        )
+        if configure_cp is None:
+            if self.context_parallel_size > 1:
+                raise NotImplementedError(
+                    f"{type(self.draft_model).__name__} does not implement CP."
+                )
+        else:
+            configure_cp(
+                size=self.context_parallel_size,
+                rank=self.parallel.context_parallel_rank,
+                group=self.parallel.context_parallel_group,
+                model_parallel_group=self.parallel.model_parallel_group,
+                model_parallel_src_rank=self.parallel.model_parallel_src_rank,
+            )
         self.model = self.draft_model
+        if self.context_parallel_size > 1 and bool(
+            self.args.train.torch_compile
+        ):
+            print_on_global_main(
+                "Disabling torch.compile because the CP path contains "
+                "autograd collectives and dynamic FlexAttention masks."
+            )
+            self.args.train.torch_compile = False
         if self.args.train.torch_compile:
             print_on_local_main("Compiling training model with torch.compile...")
             self.model = torch.compile(self.model, dynamic=True)
         self.model = self._wrap_with_fsdp(self.model)
 
-        self.train_dataset = CacheDataset(cache_dir=self.args.data.target_cache_path)
+        self.train_dataset = CacheDataset(
+            cache_dir=self.args.data.target_cache_path,
+            context_parallel_size=self.context_parallel_size,
+            context_parallel_rank=self.parallel.context_parallel_rank,
+        )
         validate_train_cache(
             train_dataset=self.train_dataset,
             draft_model=self.draft_model,
@@ -203,7 +268,7 @@ class BaseTrainer:
             self.max_train_steps,
             self.args.train.num_train_epochs,
         ) = _compute_training_schedule(
-            world_size=self.world_size,
+            world_size=self.data_parallel_size,
             dataset_size=len(self.train_dataset),
             local_batch_size=int(self.args.train.local_batch_size),
             global_batch_size=int(self.args.train.global_batch_size),
@@ -240,6 +305,11 @@ class BaseTrainer:
     def info_board(self):
         print_on_local_main("***** Running training *****")
         print_on_local_main(f"  Train dataset size = {len(self.train_dataset)}")
+        print_on_local_main(
+            "  Parallel topology = "
+            f"CP {self.context_parallel_size} x FSDP {self.fsdp_size} "
+            f"(effective data replicas {self.data_parallel_size})"
+        )
         print_on_local_main(f"  Num train epochs = {self.args.train.num_train_epochs}")
         print_on_local_main(f"  Samples per epoch = {self.samples_per_epoch}")
         print_on_local_main(f"  Local batch size = {self.args.train.local_batch_size}")
@@ -251,12 +321,18 @@ class BaseTrainer:
     def build_models(self):
         model_args = self.args.model
 
-        tokenizer = AutoTokenizer.from_pretrained(
-            model_args.target_model_name_or_path,
-        )
         target_config = AutoConfig.from_pretrained(
             model_args.target_model_name_or_path,
         )
+        if is_multimodal_config(target_config):
+            processor = AutoProcessor.from_pretrained(
+                model_args.target_model_name_or_path,
+            )
+            tokenizer = processor.tokenizer
+        else:
+            tokenizer = AutoTokenizer.from_pretrained(
+                model_args.target_model_name_or_path,
+            )
 
         draft_model = self._build_draft_model(
             target_config=target_config,
@@ -266,13 +342,11 @@ class BaseTrainer:
 
         # Training only uses the target checkpoint to initialize frozen draft
         # embeddings and lm_head weights.
-        target_model = AutoModelForCausalLM.from_pretrained(
+        target_model = load_target_model_with_head(
             model_args.target_model_name_or_path,
             dtype=self.precision_dtype,
         ).to(device="cpu").eval()
-        target_embed_tokens = target_model.get_input_embeddings()
-        target_lm_head = target_model.get_output_embeddings()
-        assert (target_lm_head is not None) and (target_embed_tokens is not None)
+        target_embed_tokens, target_lm_head = get_target_embeddings(target_model)
         draft_model.initialize_embeddings_and_head(
             embed_tokens=target_embed_tokens,
             lm_head=target_lm_head,
@@ -289,14 +363,27 @@ class BaseTrainer:
             sharding_strategy_name=self.args.train.sharding_strategy,
             precision_dtype=self.precision_dtype,
             world_size=self.world_size,
+            fsdp_size=self.fsdp_size,
         )
+        fsdp_kwargs["device_id"] = self.device
+        if bool(self.args.train.get("fsdp_layerwise", False)):
+            uncompiled_model = getattr(model, "_orig_mod", model)
+            decoder_layers = list(getattr(uncompiled_model, "layers", []))
+            if not decoder_layers:
+                raise ValueError(
+                    "train.fsdp_layerwise=true but the draft model does not "
+                    "expose decoder layers."
+                )
+            fsdp_kwargs["auto_wrap_policy"] = ModuleWrapPolicy(
+                {type(layer) for layer in decoder_layers}
+            )
         return FSDP(model, **fsdp_kwargs)
 
     def _build_train_dataloader(self, start_offset_samples=0, num_samples=None):
         sampler = StatelessResumableDistributedSampler(
             dataset=self.train_dataset,
-            num_replicas=self.world_size,
-            rank=self.global_rank,
+            num_replicas=self.data_parallel_size,
+            rank=self.data_parallel_rank,
             total_size=self.samples_per_epoch,
             start_global_offset_samples=start_offset_samples,
             num_samples=num_samples,

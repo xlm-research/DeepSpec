@@ -8,6 +8,10 @@ from deepspec.modeling.dspark.qwen3 import Qwen3DSparkModel
 from deepspec.modeling.dspark.qwen3.config import (
     build_draft_config as build_qwen3_draft_config,
 )
+from deepspec.modeling.dspark.qwen3_6 import Qwen3_6DSparkModel
+from deepspec.modeling.dspark.qwen3_6.config import (
+    build_draft_config as build_qwen3_6_draft_config,
+)
 from deepspec.trainer.base_trainer import BaseTrainer
 
 
@@ -28,6 +32,8 @@ class Qwen3DSparkTrainer(BaseTrainer):
             target_hidden_states=batch["target_hidden_states"],
             loss_mask=batch["loss_mask"],
             target_last_hidden_states=batch["target_last_hidden_states"],
+            context_chunk_len=batch["context_chunk_len"],
+            seq_len=batch["seq_len"],
         )
         loss = compute_dspark_loss(
             outputs=outputs,
@@ -46,3 +52,12 @@ class Gemma4DSparkTrainer(Qwen3DSparkTrainer):
             model_args=model_args,
         )
         return Gemma4DSparkModel(draft_config)
+
+
+class Qwen3_6DSparkTrainer(Qwen3DSparkTrainer):
+    def _build_draft_model(self, *, target_config, model_args):
+        draft_config = build_qwen3_6_draft_config(
+            target_config=target_config,
+            model_args=model_args,
+        )
+        return Qwen3_6DSparkModel(draft_config)

@@ -12,7 +12,11 @@ import torch
 import torch.distributed as dist
 from transformers import DynamicCache
 
-from deepspec.data.parser import encode_chat_messages
+from deepspec.data.parser import (
+    encode_chat_messages,
+    encode_multimodal_generation_record,
+)
+from deepspec.modeling.target_adapter import get_target_adapter
 from deepspec.utils.sampling import (
     gather_token_probs,
     logits_to_probs,
@@ -43,14 +47,20 @@ def load_and_process_dataset(
                 continue
             row = json.loads(line)
             turns = row.get("turns")
-            assert (
+            conversation = row.get("messages", row.get("conversations"))
+            valid_turns = (
                 isinstance(turns, list)
                 and len(turns) > 0
                 and all(isinstance(turn, str) for turn in turns)
-            ), (
-                f"{dataset_path}:{line_number} must contain a non-empty string list field `turns`."
             )
-            row["turns"] = turns[:1]
+            valid_conversation = isinstance(conversation, list) and bool(conversation)
+            assert valid_turns or valid_conversation, (
+                f"{dataset_path}:{line_number} must contain either a non-empty "
+                "string list field `turns` or a non-empty `messages`/"
+                "`conversations` list."
+            )
+            if valid_turns:
+                row["turns"] = turns[:1]
             rows.append(row)
     return rows
 
@@ -194,6 +204,7 @@ def verify_draft_tokens(
     max_proposal_tokens: int,
     current_token_ids: torch.Tensor | None = None,
     stop_token_ids: list[int] | None = None,
+    target_adapter=None,
 ) -> VerificationResult:
     """Verify draft tokens with the target model and rejection sampling."""
     if proposal.draft_token_count > max_proposal_tokens:
@@ -213,13 +224,14 @@ def verify_draft_tokens(
 
     draft_token_count = int(proposal.draft_token_count)
     verify_length = draft_token_count + 1
-    verify_position_ids = position_ids[:, start : start + verify_length]
+    target_adapter = target_adapter or get_target_adapter(target_model)
     target_output = target_model(
-        input_ids=proposal.verify_input_ids,
-        position_ids=verify_position_ids,
-        past_key_values=past_key_values_target,
-        use_cache=True,
-        output_hidden_states=True,
+        **target_adapter.build_verify_inputs(
+            verify_input_ids=proposal.verify_input_ids,
+            position_ids=position_ids,
+            start=start,
+            cache=past_key_values_target,
+        )
     )
     if target_output.logits.ndim != 3:
         raise ValueError(
@@ -317,6 +329,8 @@ def generate_decoding_sample(
     propose: Callable[..., DraftProposal],
     update: Callable[[Any, VerificationResult], None],
     post_verify: Callable[[DraftProposal, VerificationResult], None] | None = None,
+    model_inputs: dict[str, torch.Tensor] | None = None,
+    target_adapter=None,
 ) -> SimpleNamespace:
     """Speculative-decoding loop.
 
@@ -333,6 +347,12 @@ def generate_decoding_sample(
     device = input_ids.device
     num_input_tokens = input_ids.shape[1]
     max_length = num_input_tokens + int(max_new_tokens)
+    target_adapter = target_adapter or get_target_adapter(target_model)
+    if model_inputs is None:
+        model_inputs = {"input_ids": input_ids}
+    else:
+        model_inputs = dict(model_inputs)
+        model_inputs["input_ids"] = input_ids
 
     output_ids = torch.empty(
         (1, max_length + max_proposal_tokens + 1),
@@ -340,15 +360,14 @@ def generate_decoding_sample(
         device=device,
     )
     position_ids = torch.arange(output_ids.shape[1], device=device).unsqueeze(0)
-    past_key_values_target = DynamicCache()
+    past_key_values_target = target_adapter.create_generation_cache(target_model)
 
     output = target_model(
-        input_ids=input_ids,
-        position_ids=position_ids[:, :num_input_tokens],
-        past_key_values=past_key_values_target,
-        use_cache=True,
-        output_hidden_states=True,
-        logits_to_keep=1,
+        **target_adapter.build_prefill_inputs(
+            target_model=target_model,
+            model_inputs=model_inputs,
+            cache=past_key_values_target,
+        )
     )
 
     output_ids[:, :num_input_tokens] = input_ids
@@ -400,6 +419,7 @@ def generate_decoding_sample(
             max_proposal_tokens=max_proposal_tokens,
             current_token_ids=output_ids[:, start : start + 1],
             stop_token_ids=stop_token_ids,
+            target_adapter=target_adapter,
         )
         if post_verify is not None:
             post_verify(proposal, verification)
@@ -415,14 +435,21 @@ def generate_decoding_sample(
         if verification.terminated_by_stop_token:
             acceptance_lengths.append(accepted_draft_tokens)
             start += accepted_draft_tokens
-            past_key_values_target.crop(start)
             break
 
         output_ids[:, start + accepted_draft_tokens + 1] = verification.next_token
         new_token_ids = output_ids[:, start + 1 : start + accepted_draft_tokens + 2]
         acceptance_lengths.append(accepted_draft_tokens + 1)
         start += accepted_draft_tokens + 1
-        past_key_values_target.crop(start)
+        past_key_values_target = target_adapter.reconcile_generation_cache(
+            target_model=target_model,
+            cache=past_key_values_target,
+            model_inputs=model_inputs,
+            output_ids=output_ids,
+            committed_length=start,
+            accepted_draft_tokens=accepted_draft_tokens,
+            draft_token_count=int(proposal.draft_token_count),
+        )
         update(context, verification)
 
         if has_stop_token(new_token_ids, stop_token_ids):
@@ -447,6 +474,7 @@ class BaseEvaluator:
         self.args = args
         self.device, self.global_rank, self.world_size = init_dist(local_rank)
         self.tasks = args.tasks
+        self.processor = None
 
         self.target_model, self.draft_model, self.tokenizer = self.build_models()
         self.metrics_rows: list[dict[str, object]] = []
@@ -463,7 +491,9 @@ class BaseEvaluator:
         *,
         input_ids: torch.Tensor,
         stop_token_ids: list[int] | None,
+        model_inputs: dict[str, torch.Tensor] | None = None,
     ) -> SimpleNamespace:
+        del model_inputs
         raise NotImplementedError
 
     def build_metrics_row(
@@ -517,7 +547,14 @@ class BaseEvaluator:
         max_samples: int | None,
     ) -> list[SimpleNamespace]:
         seed_all(int(self.args.seed))
-        dataset = load_and_process_dataset(dataset_name)
+        dataset = load_and_process_dataset(
+            dataset_name,
+            dataset_root=getattr(
+                self.args,
+                "dataset_root",
+                DEFAULT_DATASET_ROOT,
+            ),
+        )
 
         if max_samples is not None and len(dataset) > max_samples:
             rng = random.Random(int(self.args.seed))
@@ -530,20 +567,37 @@ class BaseEvaluator:
         for idx in range(self.global_rank, len(dataset), self.world_size):
             seed_all(int(self.args.seed) + idx)
             instance = dataset[idx]
-            messages = [{"role": "user", "content": instance["turns"][0]}]
-            input_ids = encode_chat_messages(
-                self.tokenizer,
-                messages,
-                add_generation_prompt=True,
-                enable_thinking=False,
-                # enable_thinking=True,
-            ).to(self.device)
-            responses.append(
-                self.generate_one_sample(
-                    input_ids=input_ids,
-                    stop_token_ids=stop_token_ids,
+            model_inputs = None
+            if self.processor is not None and (
+                "messages" in instance or "conversations" in instance
+            ):
+                model_inputs = encode_multimodal_generation_record(
+                    instance,
+                    processor=self.processor,
+                    chat_template=getattr(self.args, "chat_template", "qwen"),
+                    media_root=getattr(self.args, "media_root", None),
+                    media_uri_map=getattr(self.args, "media_uri_map", None),
                 )
-            )
+                model_inputs = {
+                    key: value.to(self.device)
+                    for key, value in model_inputs.items()
+                }
+                input_ids = model_inputs["input_ids"]
+            else:
+                messages = [{"role": "user", "content": instance["turns"][0]}]
+                input_ids = encode_chat_messages(
+                    self.tokenizer,
+                    messages,
+                    add_generation_prompt=True,
+                    enable_thinking=False,
+                ).to(self.device)
+            generation_kwargs = {
+                "input_ids": input_ids,
+                "stop_token_ids": stop_token_ids,
+            }
+            if model_inputs is not None:
+                generation_kwargs["model_inputs"] = model_inputs
+            responses.append(self.generate_one_sample(**generation_kwargs))
 
         return responses
 

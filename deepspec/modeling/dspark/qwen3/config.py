@@ -10,7 +10,8 @@ def build_draft_config(
     target_config,
     model_args,
 ):
-    num_target_layers = int(target_config.num_hidden_layers)
+    target_text_config = getattr(target_config, "text_config", target_config)
+    num_target_layers = int(target_text_config.num_hidden_layers)
     num_draft_layers = int(model_args.num_draft_layers)
     layer_types = ["full_attention"] * num_draft_layers
     assert "target_layer_ids" in model_args, "target_layer_ids must be provided."
@@ -34,7 +35,7 @@ def build_draft_config(
             "markov_head_type must be provided when markov_rank > 0."
         )
 
-    draft_config = copy.deepcopy(target_config)
+    draft_config = copy.deepcopy(target_text_config)
     draft_config.architectures = ["Qwen3DSparkModel"]
     draft_config.num_target_layers = num_target_layers
     draft_config.num_hidden_layers = num_draft_layers

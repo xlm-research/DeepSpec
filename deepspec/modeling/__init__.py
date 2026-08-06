@@ -2,6 +2,7 @@ from .dspark import (
     DSparkForwardOutput,
     Gemma4DSparkModel,
     Qwen3DSparkModel,
+    Qwen3_6DSparkModel,
 )
 from .eagle3 import Gemma4Eagle3Model, Qwen3Eagle3Model
 
@@ -11,4 +12,5 @@ __all__ = [
     "Gemma4DSparkModel",
     "Qwen3Eagle3Model",
     "Qwen3DSparkModel",
+    "Qwen3_6DSparkModel",
 ]

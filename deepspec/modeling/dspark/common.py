@@ -40,6 +40,14 @@ class DSparkForwardOutput:
     aligned_target_logits: Optional[torch.Tensor] = None
 
 
+@dataclass
+class DSparkContextParallelAttentionMask:
+    """Per-shard masks used by ring context-parallel DSpark attention."""
+
+    context_masks: tuple[object, ...]
+    draft_mask: object
+
+
 class AcceptRatePredictor(nn.Module):
     def __init__(self, input_dim: int):
         super().__init__()
@@ -103,6 +111,91 @@ def create_dspark_attention_mask(
         Q_LEN=num_blocks * block_size,
         KV_LEN=seq_len + num_blocks * block_size,
         device=device,
+    )
+
+
+def create_dspark_context_parallel_attention_mask(
+    *,
+    anchor_positions: torch.Tensor,
+    block_keep_mask: torch.Tensor,
+    sequence_length: int,
+    context_chunk_len: int,
+    context_parallel_size: int,
+    block_size: int,
+    device: torch.device,
+):
+    """Build masks for local anchor queries and ring-rotated CP context.
+
+    Each source rank owns PyTorch native CP's balanced head/tail pair.  Masks
+    translate the shard-local K/V index back to its original document index,
+    so padded tail tokens and tokens after an anchor are never visible.
+    """
+    bsz, num_blocks = anchor_positions.shape
+    context_parallel_size = int(context_parallel_size)
+    if context_parallel_size <= 1:
+        raise ValueError(
+            "context_parallel_size must be greater than one for CP attention."
+        )
+    context_chunk_len = int(context_chunk_len)
+    if context_chunk_len <= 0 or context_chunk_len % 2 != 0:
+        raise ValueError(
+            "Native head/tail CP requires a positive even local context "
+            f"length, got {context_chunk_len}."
+        )
+    half_chunk_len = context_chunk_len // 2
+
+    def make_context_mask_mod(source_rank: int):
+        head_start = source_rank * half_chunk_len
+        tail_start = (
+            2 * context_parallel_size - source_rank - 1
+        ) * half_chunk_len
+
+        def context_mask_mod(b, h, q_idx, kv_idx):
+            del h
+            q_block_id = q_idx // block_size
+            anchor_pos = anchor_positions[b, q_block_id]
+            global_kv_idx = torch.where(
+                kv_idx < half_chunk_len,
+                head_start + kv_idx,
+                tail_start + kv_idx - half_chunk_len,
+            )
+            return (
+                (global_kv_idx < int(sequence_length))
+                & (global_kv_idx < anchor_pos)
+                & block_keep_mask[b, q_block_id]
+            )
+
+        return context_mask_mod
+
+    context_masks = tuple(
+        create_block_mask(
+            make_context_mask_mod(source_rank),
+            B=bsz,
+            H=None,
+            Q_LEN=num_blocks * block_size,
+            KV_LEN=context_chunk_len,
+            device=device,
+        )
+        for source_rank in range(context_parallel_size)
+    )
+
+    def draft_mask_mod(b, h, q_idx, kv_idx):
+        del h
+        q_block_id = q_idx // block_size
+        kv_block_id = kv_idx // block_size
+        return (q_block_id == kv_block_id) & block_keep_mask[b, q_block_id]
+
+    draft_mask = create_block_mask(
+        draft_mask_mod,
+        B=bsz,
+        H=None,
+        Q_LEN=num_blocks * block_size,
+        KV_LEN=num_blocks * block_size,
+        device=device,
+    )
+    return DSparkContextParallelAttentionMask(
+        context_masks=context_masks,
+        draft_mask=draft_mask,
     )
 
 
@@ -296,10 +389,12 @@ def create_noise_embed(
 
 __all__ = [
     "DSparkForwardOutput",
+    "DSparkContextParallelAttentionMask",
     "AcceptRatePredictor",
     "extract_context_feature",
     "validate_target_layer_ids",
     "create_dspark_attention_mask",
+    "create_dspark_context_parallel_attention_mask",
     "build_anchor_candidate_mask",
     "sample_anchor_positions",
     "build_eval_mask",

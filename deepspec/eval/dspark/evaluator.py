@@ -4,7 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, DynamicCache
 
 from deepspec.eval.base_evaluator import (
     BaseEvaluator,
@@ -22,6 +22,8 @@ from deepspec.eval.dspark.draft_ops import (
 from deepspec.modeling.dspark.common import extract_context_feature
 from deepspec.modeling.dspark.gemma4 import Gemma4DSparkModel
 from deepspec.modeling.dspark.qwen3 import Qwen3DSparkModel
+from deepspec.modeling.dspark.qwen3_6 import Qwen3_6DSparkModel
+from deepspec.modeling.target_adapter import get_target_adapter
 from deepspec.utils import jsonable
 
 
@@ -80,6 +82,10 @@ class Qwen3DSparkEvaluator(BaseEvaluator):
         assert_no_final_target_layer(target_model, draft_model.target_layer_ids)
         assert 0.0 <= float(self.args.confidence_threshold) <= 1.0
         tokenizer = AutoTokenizer.from_pretrained(self.args.target_name_or_path)
+        self.target_adapter = get_target_adapter(
+            target_model,
+            self.args.target_name_or_path,
+        )
         return target_model, draft_model, tokenizer
 
     def _init_context(
@@ -164,6 +170,7 @@ class Qwen3DSparkEvaluator(BaseEvaluator):
         *,
         input_ids: torch.Tensor,
         stop_token_ids: list[int] | None,
+        model_inputs: dict[str, torch.Tensor] | None = None,
     ) -> SimpleNamespace:
         return generate_decoding_sample(
             target_model=self.target_model,
@@ -176,6 +183,8 @@ class Qwen3DSparkEvaluator(BaseEvaluator):
             propose=self._propose,
             update=self._update,
             post_verify=self._post_verify,
+            model_inputs=model_inputs,
+            target_adapter=self.target_adapter,
         )
 
     def evaluate(self) -> None:
@@ -223,3 +232,34 @@ class Qwen3DSparkEvaluator(BaseEvaluator):
 
 class Gemma4DSparkEvaluator(Qwen3DSparkEvaluator):
     draft_model_cls = Gemma4DSparkModel
+
+
+class Qwen3_6DSparkEvaluator(Qwen3DSparkEvaluator):
+    draft_model_cls = Qwen3_6DSparkModel
+
+    def build_models(self):
+        target_config = AutoConfig.from_pretrained(self.args.target_name_or_path)
+        self.target_adapter = get_target_adapter(
+            target_config,
+            self.args.target_name_or_path,
+        )
+        target_model = self.target_adapter.load_model_with_head(
+            self.args.target_name_or_path,
+            dtype=torch.bfloat16,
+            attn_implementation=self.EVAL_ATTN_IMPLEMENTATION,
+        ).to(device=self.device).eval()
+        draft_model = self.draft_model_cls.from_pretrained(
+            self.args.draft_name_or_path,
+            dtype=torch.bfloat16,
+            attn_implementation=self.EVAL_ATTN_IMPLEMENTATION,
+        ).to(self.device).eval()
+        assert_no_final_target_layer(target_model, draft_model.target_layer_ids)
+        assert 0.0 <= float(self.args.confidence_threshold) <= 1.0
+        self.processor, tokenizer = self.target_adapter.load_processor(
+            self.args.target_name_or_path
+        )
+        if self.processor is None:
+            raise ValueError(
+                "Qwen3_6DSparkEvaluator requires the multimodal Qwen3.6 processor."
+            )
+        return target_model, draft_model, tokenizer

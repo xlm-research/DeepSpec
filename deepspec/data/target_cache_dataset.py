@@ -7,6 +7,7 @@ import queue
 import shutil
 import struct
 import threading
+import warnings
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Dict, List
@@ -14,11 +15,17 @@ from typing import Dict, List
 import numpy as np
 import torch
 
-from deepspec.data.parser import preprocess_record
+from deepspec.data.parser import (
+    MultimodalTruncationError,
+    normalize_media_uri_map,
+    preprocess_multimodal_record,
+    preprocess_record,
+)
 
 
-TARGET_CACHE_VERSION = 2
-INDEX_RECORD_STRUCT = struct.Struct("<QIIQQQQQ")
+TARGET_CACHE_VERSION = 3
+# sample_id, shard_id, full seq_len, local CP context_len, then five offsets.
+INDEX_RECORD_STRUCT = struct.Struct("<QIIIQQQQQ")
 INDEX_RECORD_SIZE = INDEX_RECORD_STRUCT.size
 
 TARGET_CACHE_HIDDEN_DTYPE = "bfloat16"
@@ -42,26 +49,30 @@ def build_target_cache_shard_path(cache_dir: str, file_name: str) -> str:
 def expected_target_cache_tensor_numel(
     *,
     seq_len: int,
+    context_len: int | None = None,
     hidden_size: int,
     num_target_layers: int,
 ):
+    context_len = int(seq_len) if context_len is None else int(context_len)
     return {
         "input_ids": int(seq_len),
         "attention_mask": int(seq_len),
         "loss_mask": int(seq_len),
-        "target_hidden_states": int(seq_len) * int(num_target_layers) * int(hidden_size),
-        "target_last_hidden_states": int(seq_len) * int(hidden_size),
+        "target_hidden_states": context_len * int(num_target_layers) * int(hidden_size),
+        "target_last_hidden_states": context_len * int(hidden_size),
     }
 
 
 def expected_target_cache_tensor_nbytes(
     *,
     seq_len: int,
+    context_len: int | None = None,
     hidden_size: int,
     num_target_layers: int,
 ):
     numel = expected_target_cache_tensor_numel(
         seq_len=seq_len,
+        context_len=context_len,
         hidden_size=hidden_size,
         num_target_layers=num_target_layers,
     )
@@ -79,6 +90,7 @@ def pack_index_record(
     sample_id: int,
     shard_id: int,
     seq_len: int,
+    context_len: int,
     input_ids_offset: int,
     attention_mask_offset: int,
     loss_mask_offset: int,
@@ -89,6 +101,7 @@ def pack_index_record(
         int(sample_id),
         int(shard_id),
         int(seq_len),
+        int(context_len),
         int(input_ids_offset),
         int(attention_mask_offset),
         int(loss_mask_offset),
@@ -102,6 +115,7 @@ def unpack_index_record(buffer, offset: int = 0):
         sample_id,
         shard_id,
         seq_len,
+        context_len,
         input_ids_offset,
         attention_mask_offset,
         loss_mask_offset,
@@ -112,6 +126,7 @@ def unpack_index_record(buffer, offset: int = 0):
         "sample_id": sample_id,
         "shard_id": shard_id,
         "seq_len": seq_len,
+        "context_len": context_len,
         "input_ids_offset": input_ids_offset,
         "attention_mask_offset": attention_mask_offset,
         "loss_mask_offset": loss_mask_offset,
@@ -140,6 +155,9 @@ def validate_target_cache_manifest(*, cache_dir: str, manifest):
         "mask_dtype",
         "index_record_size",
         "hidden_size",
+        "cache_context_parallel_size",
+        "context_layout",
+        "index_files",
         "shards",
     }
     missing = sorted(required_fields - set(manifest))
@@ -186,18 +204,35 @@ def validate_target_cache_manifest(*, cache_dir: str, manifest):
         )
         shard_path = build_target_cache_shard_path(cache_dir, shard["file_name"])
         assert os.path.exists(shard_path), f"Missing target cache shard file: {shard_path}"
-    index_path = os.path.join(cache_dir, "samples.idx")
-    assert os.path.exists(index_path), f"Missing target cache index file: {index_path}"
-    index_size = os.path.getsize(index_path)
-    assert index_size % INDEX_RECORD_SIZE == 0, (
-        "samples.idx size is not a multiple of the canonical record size: "
-        f"{index_size} % {INDEX_RECORD_SIZE} != 0"
+    cache_cp_size = int(manifest["cache_context_parallel_size"])
+    assert cache_cp_size > 0, (
+        "cache_context_parallel_size must be positive, got "
+        f"{cache_cp_size}."
+    )
+    assert manifest["context_layout"] in ("contiguous", "native_head_tail"), (
+        "Unsupported target cache context_layout: "
+        f"{manifest['context_layout']!r}."
+    )
+    index_files = [str(file_name) for file_name in manifest["index_files"]]
+    assert len(index_files) == cache_cp_size, (
+        "Target cache must contain one index per cached CP rank: "
+        f"{len(index_files)} != {cache_cp_size}."
     )
     num_samples = int(manifest["num_samples"])
-    assert index_size == num_samples * INDEX_RECORD_SIZE, (
-        "samples.idx size does not match manifest.num_samples: "
-        f"{index_size} != {num_samples} * {INDEX_RECORD_SIZE}"
-    )
+    for file_name in index_files:
+        index_path = os.path.join(cache_dir, file_name)
+        assert os.path.exists(index_path), (
+            f"Missing target cache index file: {index_path}"
+        )
+        index_size = os.path.getsize(index_path)
+        assert index_size % INDEX_RECORD_SIZE == 0, (
+            f"{file_name} size is not a multiple of the canonical record size: "
+            f"{index_size} % {INDEX_RECORD_SIZE} != 0"
+        )
+        assert index_size == num_samples * INDEX_RECORD_SIZE, (
+            f"{file_name} size does not match manifest.num_samples: "
+            f"{index_size} != {num_samples} * {INDEX_RECORD_SIZE}"
+        )
 
 
 def validate_train_cache(*, train_dataset, draft_model, target_model_name_or_path):
@@ -252,6 +287,7 @@ def prepare_target_cache_output_dir(output_dir: str):
 @dataclass
 class LocalCacheWriteSummary:
     global_rank: int
+    context_parallel_rank: int
     source_sample_start: int
     source_sample_end: int
     num_local_samples: int
@@ -261,6 +297,7 @@ class LocalCacheWriteSummary:
     def to_json(self):
         return {
             "global_rank": self.global_rank,
+            "context_parallel_rank": self.context_parallel_rank,
             "source_sample_start": self.source_sample_start,
             "source_sample_end": self.source_sample_end,
             "num_local_samples": self.num_local_samples,
@@ -273,6 +310,7 @@ class LocalCacheWriteSummary:
 class TargetCacheSampleBytes:
     sample_id: int
     seq_len: int
+    context_len: int
     input_ids: bytes
     attention_mask: bytes
     loss_mask: bytes
@@ -289,9 +327,17 @@ def build_target_cache_sample_bytes(
     target_hidden_states: torch.Tensor,
     target_last_hidden_states: torch.Tensor,
 ):
+    seq_len = int(input_ids.shape[0])
+    context_len = int(target_hidden_states.shape[0])
+    if int(target_last_hidden_states.shape[0]) != context_len:
+        raise ValueError(
+            "Target hidden tensors must have the same local context length: "
+            f"{target_hidden_states.shape} versus {target_last_hidden_states.shape}."
+        )
     return TargetCacheSampleBytes(
         sample_id=int(sample_id),
-        seq_len=int(input_ids.shape[0]),
+        seq_len=seq_len,
+        context_len=context_len,
         input_ids=_tensor_to_bytes(input_ids, torch.int32),
         attention_mask=_tensor_to_bytes(attention_mask, torch.uint8),
         loss_mask=_tensor_to_bytes(loss_mask, torch.uint8),
@@ -377,6 +423,7 @@ class LocalTargetCacheWriter:
                 sample_id=sample.sample_id,
                 shard_id=self.current_shard_id,
                 seq_len=sample.seq_len,
+                context_len=sample.context_len,
                 input_ids_offset=input_ids_offset,
                 attention_mask_offset=attention_mask_offset,
                 loss_mask_offset=loss_mask_offset,
@@ -537,44 +584,77 @@ def rename_local_target_cache_shards(*, output_dir: str, rank_dir: str, summary,
         os.replace(source, target)
 
 
-def finalize_target_cache_index(*, output_dir: str, summaries, shard_map):
-    index_tmp_path = os.path.join(output_dir, "samples.idx.tmp")
-    next_expected_sample_id = 0
-    with open(index_tmp_path, "wb") as output_handle:
-        for summary in sorted(
-            summaries,
-            key=lambda item: int(item["source_sample_start"]),
-        ):
-            rank_dir = os.path.join(
-                output_dir,
-                "_tmp",
-                f"rank_{int(summary['global_rank'])}",
-            )
-            local_index_path = os.path.join(rank_dir, "samples.local.idx")
-            with open(local_index_path, "rb") as local_handle:
-                local_bytes = local_handle.read()
-            assert len(local_bytes) % INDEX_RECORD_SIZE == 0, (
-                "Local target cache index has invalid size: "
-                f"{local_index_path}"
-            )
-            next_local_sample_id = 0
-            for offset in range(0, len(local_bytes), INDEX_RECORD_SIZE):
-                record = unpack_index_record(local_bytes, offset)
-                assert int(record["sample_id"]) == next_local_sample_id, (
-                    "Local target cache index is not ordered by local sample_id: "
-                    f"got {record['sample_id']}, expected {next_local_sample_id}"
+def finalize_target_cache_indices(
+    *, output_dir: str, summaries, shard_map, context_parallel_size: int
+):
+    """Build one dense logical-sample index for every cached CP rank."""
+
+    index_files = []
+    per_cp_sample_counts = []
+    per_cp_seq_lens = []
+    for context_parallel_rank in range(int(context_parallel_size)):
+        file_name = f"samples.cp{context_parallel_rank:03d}.idx"
+        index_files.append(file_name)
+        index_tmp_path = os.path.join(output_dir, f"{file_name}.tmp")
+        next_expected_sample_id = 0
+        cp_seq_lens = []
+        cp_summaries = [
+            summary
+            for summary in summaries
+            if int(summary["context_parallel_rank"]) == context_parallel_rank
+        ]
+        with open(index_tmp_path, "wb") as output_handle:
+            for summary in sorted(
+                cp_summaries,
+                key=lambda item: int(item["source_sample_start"]),
+            ):
+                rank_dir = os.path.join(
+                    output_dir,
+                    "_tmp",
+                    f"rank_{int(summary['global_rank'])}",
                 )
-                record["sample_id"] = next_expected_sample_id
-                record["shard_id"] = shard_map[int(summary["global_rank"])][
-                    int(record["shard_id"])
-                ]
-                output_handle.write(pack_index_record(**record))
-                next_local_sample_id += 1
-                next_expected_sample_id += 1
-        output_handle.flush()
-        os.fsync(output_handle.fileno())
-    os.replace(index_tmp_path, os.path.join(output_dir, "samples.idx"))
-    return next_expected_sample_id
+                local_index_path = os.path.join(rank_dir, "samples.local.idx")
+                with open(local_index_path, "rb") as local_handle:
+                    local_bytes = local_handle.read()
+                assert len(local_bytes) % INDEX_RECORD_SIZE == 0, (
+                    "Local target cache index has invalid size: "
+                    f"{local_index_path}"
+                )
+                next_local_sample_id = 0
+                for offset in range(0, len(local_bytes), INDEX_RECORD_SIZE):
+                    record = unpack_index_record(local_bytes, offset)
+                    assert int(record["sample_id"]) == next_local_sample_id, (
+                        "Local target cache index is not ordered by local sample_id: "
+                        f"got {record['sample_id']}, expected {next_local_sample_id}"
+                    )
+                    record["sample_id"] = next_expected_sample_id
+                    cp_seq_lens.append(int(record["seq_len"]))
+                    record["shard_id"] = shard_map[int(summary["global_rank"])][
+                        int(record["shard_id"])
+                    ]
+                    output_handle.write(pack_index_record(**record))
+                    next_local_sample_id += 1
+                    next_expected_sample_id += 1
+            output_handle.flush()
+            os.fsync(output_handle.fileno())
+        os.replace(index_tmp_path, os.path.join(output_dir, file_name))
+        per_cp_sample_counts.append(next_expected_sample_id)
+        per_cp_seq_lens.append(cp_seq_lens)
+
+    if len(set(per_cp_sample_counts)) != 1:
+        raise RuntimeError(
+            "CP ranks wrote different logical sample counts: "
+            f"{per_cp_sample_counts}."
+        )
+    if any(
+        seq_lens != per_cp_seq_lens[0]
+        for seq_lens in per_cp_seq_lens[1:]
+    ):
+        raise RuntimeError(
+            "CP-rank cache indices are not aligned by logical sample/sequence "
+            "length. Target preprocessing must be identical on every CP rank."
+        )
+    return per_cp_sample_counts[0], index_files
 
 
 def build_target_cache_manifest(
@@ -613,7 +693,13 @@ def cleanup_target_cache_tmp_dir(output_dir: str):
 
 
 class CacheDataset(torch.utils.data.Dataset):
-    def __init__(self, cache_dir: str, max_open_shards: int = 4):
+    def __init__(
+        self,
+        cache_dir: str,
+        max_open_shards: int = 4,
+        context_parallel_size: int = 1,
+        context_parallel_rank: int = 0,
+    ):
         super().__init__()
         self.cache_dir = os.path.abspath(cache_dir)
         self.manifest = load_target_cache_manifest(self.cache_dir)
@@ -621,7 +707,35 @@ class CacheDataset(torch.utils.data.Dataset):
         self.hidden_size = int(self.manifest["hidden_size"])
         self.target_layer_ids = [int(layer_id) for layer_id in self.manifest["target_layer_ids"]]
         self.num_target_layers = len(self.target_layer_ids)
-        self.index_path = os.path.join(self.cache_dir, "samples.idx")
+        self.context_parallel_size = int(context_parallel_size)
+        self.context_parallel_rank = int(context_parallel_rank)
+        if self.context_parallel_size < 1:
+            raise ValueError("context_parallel_size must be positive.")
+        if not 0 <= self.context_parallel_rank < self.context_parallel_size:
+            raise ValueError(
+                "context_parallel_rank must be in [0, context_parallel_size), got "
+                f"{self.context_parallel_rank} and {self.context_parallel_size}."
+            )
+        cache_cp_size = int(self.manifest["cache_context_parallel_size"])
+        if self.context_parallel_size != cache_cp_size:
+            raise ValueError(
+                "Training CP size must match the rank-sharded target cache: "
+                f"{self.context_parallel_size} != {cache_cp_size}. Regenerate "
+                "the target cache for the requested CP size."
+            )
+        self.context_layout = str(self.manifest["context_layout"])
+        expected_layout = (
+            "native_head_tail" if self.context_parallel_size > 1 else "contiguous"
+        )
+        if self.context_layout != expected_layout:
+            raise ValueError(
+                "Target cache context layout is incompatible with training CP: "
+                f"{self.context_layout!r} != {expected_layout!r}."
+            )
+        self.index_path = os.path.join(
+            self.cache_dir,
+            self.manifest["index_files"][self.context_parallel_rank],
+        )
         self.index_file = None
         self.index_mmap = None
         self.max_open_shards = max_open_shards
@@ -755,10 +869,15 @@ class CacheDataset(torch.utils.data.Dataset):
             raise IndexError(index)
         record = self._read_record(int(index))
         seq_len = int(record["seq_len"])
+        context_chunk_len = int(record["context_len"])
         assert seq_len > 0, f"seq_len must be positive, got {seq_len}"
+        assert context_chunk_len > 0, (
+            f"context_len must be positive, got {context_chunk_len}"
+        )
         shard_mmap = self._get_shard_mmap(int(record["shard_id"]))
         nbytes = expected_target_cache_tensor_nbytes(
             seq_len=seq_len,
+            context_len=context_chunk_len,
             hidden_size=self.hidden_size,
             num_target_layers=self.num_target_layers,
         )
@@ -781,13 +900,13 @@ class CacheDataset(torch.utils.data.Dataset):
         target_hidden_states = self._read_bfloat16_tensor_from_shard(
             shard_mmap=shard_mmap,
             offset=record["target_hidden_states_offset"],
-            shape=(seq_len, self.num_target_layers * self.hidden_size),
+            shape=(context_chunk_len, self.num_target_layers * self.hidden_size),
             nbytes=nbytes["target_hidden_states"],
         )
         target_last_hidden_states = self._read_bfloat16_tensor_from_shard(
             shard_mmap=shard_mmap,
             offset=record["target_last_hidden_states_offset"],
-            shape=(seq_len, self.hidden_size),
+            shape=(context_chunk_len, self.hidden_size),
             nbytes=nbytes["target_last_hidden_states"],
         )
         return {
@@ -795,6 +914,8 @@ class CacheDataset(torch.utils.data.Dataset):
             "loss_mask": loss_mask,
             "target_hidden_states": target_hidden_states,
             "target_last_hidden_states": target_last_hidden_states,
+            "context_chunk_len": context_chunk_len,
+            "seq_len": seq_len,
         }
 
 
@@ -856,6 +977,118 @@ class ConversationCollator:
         return batch
 
 
+def _pad_multimodal_sequence_batch(
+    features: List[Dict],
+    key: str,
+    *,
+    padding_side: str,
+    padding_value: int,
+):
+    max_length = max(item[key].shape[0] for item in features)
+    batch_size = len(features)
+    dtype = features[0][key].dtype
+    trailing_shape = tuple(features[0][key].shape[1:])
+    if not all(tuple(item[key].shape[1:]) == trailing_shape for item in features):
+        raise ValueError(
+            f"Processor sequence field {key!r} has inconsistent trailing shapes."
+        )
+    out = torch.full(
+        (batch_size, max_length, *trailing_shape),
+        fill_value=padding_value,
+        dtype=dtype,
+    )
+    for index, item in enumerate(features):
+        seq_len = item[key].shape[0]
+        if padding_side == "left":
+            out[index, max_length - seq_len :] = item[key]
+        else:
+            out[index, :seq_len] = item[key]
+    return out
+
+
+class MultimodalConversationCollator:
+    """Collate arbitrary processor tensors without flattening visual inputs."""
+
+    def __init__(
+        self,
+        processor,
+        chat_template,
+        max_length,
+        min_loss_tokens: int,
+        media_root=None,
+        media_uri_map=None,
+    ):
+        self.processor = processor
+        self.chat_template = chat_template
+        self.max_length = int(max_length)
+        self.min_loss_tokens = int(min_loss_tokens)
+        self.media_root = media_root
+        self.media_uri_map = normalize_media_uri_map(media_uri_map)
+        tokenizer = processor.tokenizer
+        self.padding_side = str(getattr(tokenizer, "padding_side", "right"))
+        if self.padding_side not in ("left", "right"):
+            raise ValueError(f"Unsupported tokenizer padding_side: {self.padding_side}")
+        self.pad_token_id = getattr(tokenizer, "pad_token_id", None)
+        if self.pad_token_id is None:
+            self.pad_token_id = 0
+
+    def _process_feature(self, item):
+        try:
+            processed = preprocess_multimodal_record(
+                record=item,
+                processor=self.processor,
+                chat_template=self.chat_template,
+                max_length=self.max_length,
+                media_root=self.media_root,
+                media_uri_map=self.media_uri_map,
+            )
+        except MultimodalTruncationError as exc:
+            warnings.warn(f"Skipping truncated multimodal sample: {exc}", stacklevel=2)
+            return None
+        if int(processed["loss_mask"].sum().item()) < self.min_loss_tokens:
+            return None
+        return processed
+
+    def __call__(self, features: List[Dict]):
+        features = [self._process_feature(item) for item in features]
+        features = [item for item in features if item is not None]
+        if not features:
+            return None
+
+        batch = {}
+        all_keys = set().union(*(item.keys() for item in features))
+        for key in sorted(all_keys):
+            values = [item[key] for item in features if key in item]
+            if not values or not all(isinstance(value, torch.Tensor) for value in values):
+                continue
+            is_sequence_field = len(values) == len(features) and all(
+                value.ndim >= 1
+                and value.shape[0] == item["input_ids"].shape[0]
+                for item, value in zip(features, values)
+            )
+            if is_sequence_field:
+                padding_value = self.pad_token_id if key == "input_ids" else 0
+                batch[key] = _pad_multimodal_sequence_batch(
+                    features,
+                    key,
+                    padding_side=self.padding_side,
+                    padding_value=padding_value,
+                )
+                continue
+            if any(value.ndim == 0 for value in values):
+                batch[key] = torch.stack(values)
+                continue
+            trailing_shape = tuple(values[0].shape[1:])
+            if not all(tuple(value.shape[1:]) == trailing_shape for value in values):
+                raise ValueError(
+                    f"Cannot collate processor field {key!r} with shapes "
+                    f"{[tuple(value.shape) for value in values]}. Add a thin "
+                    "TargetModelAdapter for this model family."
+                )
+            batch[key] = torch.cat(values, dim=0)
+        return batch
+
+
 class CacheCollator:
     def __call__(self, features: List[Dict]):
         batch = {}
@@ -867,4 +1100,6 @@ class CacheCollator:
         batch["attention_mask"] = attention_mask
         for key in ("target_hidden_states", "target_last_hidden_states"):
             batch[key] = _pad_hidden_batch(features, key)
+        for key in ("context_chunk_len", "seq_len"):
+            batch[key] = torch.tensor([int(item[key]) for item in features])
         return batch
