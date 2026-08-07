@@ -397,7 +397,7 @@ class BaseTrainer:
             pin_memory=True,
             drop_last=True,
             persistent_workers=True,
-            prefetch_factor=4,
+            prefetch_factor=1,
         )
 
     def run_batch(self, batch):
