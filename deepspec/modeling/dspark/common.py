@@ -143,24 +143,44 @@ def create_dspark_context_parallel_attention_mask(
             f"length, got {context_chunk_len}."
         )
     half_chunk_len = context_chunk_len // 2
+    # Keep values that vary by sample or CP source rank as captured tensors.
+    # FlexAttention can reuse one dynamic compiled kernel when these values
+    # change; captured Python integers would become guards and trigger a new
+    # specialization for every rank/sequence length.
+    sequence_length_tensor = torch.tensor(
+        sequence_length,
+        dtype=torch.int64,
+        device=device,
+    )
+    half_chunk_len_tensor = torch.tensor(
+        half_chunk_len,
+        dtype=torch.int64,
+        device=device,
+    )
 
     def make_context_mask_mod(source_rank: int):
-        head_start = source_rank * half_chunk_len
-        tail_start = (
-            2 * context_parallel_size - source_rank - 1
-        ) * half_chunk_len
+        head_start = torch.tensor(
+            source_rank * half_chunk_len,
+            dtype=torch.int64,
+            device=device,
+        )
+        tail_start = torch.tensor(
+            (2 * context_parallel_size - source_rank - 1) * half_chunk_len,
+            dtype=torch.int64,
+            device=device,
+        )
 
         def context_mask_mod(b, h, q_idx, kv_idx):
             del h
             q_block_id = q_idx // block_size
             anchor_pos = anchor_positions[b, q_block_id]
             global_kv_idx = torch.where(
-                kv_idx < half_chunk_len,
+                kv_idx < half_chunk_len_tensor,
                 head_start + kv_idx,
-                tail_start + kv_idx - half_chunk_len,
+                tail_start + kv_idx - half_chunk_len_tensor,
             )
             return (
-                (global_kv_idx < int(sequence_length))
+                (global_kv_idx < sequence_length_tensor)
                 & (global_kv_idx < anchor_pos)
                 & block_keep_mask[b, q_block_id]
             )

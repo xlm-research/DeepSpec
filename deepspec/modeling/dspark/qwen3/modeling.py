@@ -35,7 +35,7 @@ from deepspec.modeling.dspark.markov_head import build_markov_head
 from deepspec.utils.sampling import sample_tokens
 
 
-def _flex_attention_with_lse(
+def _flex_attention_impl(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
@@ -55,12 +55,99 @@ def _flex_attention_with_lse(
     return output, aux.lse
 
 
+def _context_flex_attention_forward(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    block_mask,
+    scale: float,
+    enable_gqa: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return _flex_attention_impl(
+        query,
+        key,
+        value,
+        block_mask,
+        scale,
+        enable_gqa,
+    )
+
+
+def _draft_flex_attention_forward(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    block_mask,
+    scale: float,
+    enable_gqa: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return _flex_attention_impl(
+        query,
+        key,
+        value,
+        block_mask,
+        scale,
+        enable_gqa,
+    )
+
+
+def _context_flex_attention_recompute(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    block_mask,
+    scale: float,
+    enable_gqa: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return _flex_attention_impl(
+        query,
+        key,
+        value,
+        block_mask,
+        scale,
+        enable_gqa,
+    )
+
+
+def _draft_flex_attention_recompute(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    block_mask,
+    scale: float,
+    enable_gqa: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return _flex_attention_impl(
+        query,
+        key,
+        value,
+        block_mask,
+        scale,
+        enable_gqa,
+    )
+
+
 # DSpark CP uses FlexAttention's sparse kernel for each ring shard.  The
 # surrounding model deliberately remains uncompiled in the distributed CP
-# path, so compile this small kernel wrapper explicitly.
-_compiled_flex_attention_with_lse = torch.compile(
-    _flex_attention_with_lse,
-    dynamic=False,
+# path, so compile the small kernel wrappers explicitly.  Keep context/draft
+# and forward/backward-recompute wrappers on distinct Python code objects:
+# Dynamo compile entries are code-object scoped, while their masks and
+# requires_grad signatures are intentionally different.
+_compiled_context_flex_attention_forward = torch.compile(
+    _context_flex_attention_forward,
+    dynamic=True,
+)
+_compiled_draft_flex_attention_forward = torch.compile(
+    _draft_flex_attention_forward,
+    dynamic=True,
+)
+_compiled_context_flex_attention_recompute = torch.compile(
+    _context_flex_attention_recompute,
+    dynamic=True,
+)
+_compiled_draft_flex_attention_recompute = torch.compile(
+    _draft_flex_attention_recompute,
+    dynamic=True,
 )
 
 
@@ -160,13 +247,15 @@ class _RingFlexAttention(torch.autograd.Function):
         current_value = context_value
         for step in range(group_size):
             source_rank = (group_rank - step) % group_size
-            partial_output, partial_lse = _compiled_flex_attention_with_lse(
-                query,
-                current_key,
-                current_value,
-                context_masks[source_rank],
-                scale,
-                enable_gqa,
+            partial_output, partial_lse = (
+                _compiled_context_flex_attention_forward(
+                    query,
+                    current_key,
+                    current_value,
+                    context_masks[source_rank],
+                    scale,
+                    enable_gqa,
+                )
             )
             partial_outputs.append(partial_output)
             partial_lses.append(partial_lse)
@@ -176,7 +265,7 @@ class _RingFlexAttention(torch.autograd.Function):
                     group,
                 )
 
-        draft_output, draft_lse = _compiled_flex_attention_with_lse(
+        draft_output, draft_lse = _compiled_draft_flex_attention_forward(
             query,
             draft_key,
             draft_value,
@@ -233,12 +322,18 @@ class _RingFlexAttention(torch.autograd.Function):
         current_grad_key = torch.zeros_like(context_key)
         current_grad_value = torch.zeros_like(context_value)
 
-        def partial_gradients(key, value, block_mask, partial_lse):
+        def partial_gradients(
+            key,
+            value,
+            block_mask,
+            partial_lse,
+            compiled_attention,
+        ):
             key_for_grad = key.detach().requires_grad_(True)
             value_for_grad = value.detach().requires_grad_(True)
             with torch.enable_grad():
                 partial_output, recomputed_lse = (
-                    _compiled_flex_attention_with_lse(
+                    compiled_attention(
                         query_for_grad,
                         key_for_grad,
                         value_for_grad,
@@ -276,6 +371,7 @@ class _RingFlexAttention(torch.autograd.Function):
                 current_value,
                 ctx.context_masks[source_rank],
                 lse_stack[step],
+                _compiled_context_flex_attention_recompute,
             )
             grad_query.add_(query_grad)
             current_grad_key.add_(key_grad)
@@ -302,6 +398,7 @@ class _RingFlexAttention(torch.autograd.Function):
             draft_value,
             ctx.draft_mask,
             lse_stack[group_size],
+            _compiled_draft_flex_attention_recompute,
         )
         grad_query.add_(query_grad)
         return (
