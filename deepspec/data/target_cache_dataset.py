@@ -808,6 +808,56 @@ class CacheDataset(torch.utils.data.Dataset):
             self.shard_handles.pop(evicted_id).close()
         return self.shard_mmaps[shard_id]
 
+    def _discard_sample_file_cache(
+        self,
+        *,
+        shard_id: int,
+        shard_mmap,
+        start_offset: int,
+        end_offset: int,
+    ):
+        """Release file-backed pages after a cache sample has been copied.
+
+        All tensors returned by ``__getitem__`` own independent NumPy copies,
+        so the corresponding mmap range is no longer needed by this process.
+        Discarding it keeps streaming target-cache reads from filling the
+        worker's cgroup with Linux page cache.
+        """
+
+        page_size = int(mmap.PAGESIZE)
+        aligned_start = (int(start_offset) // page_size) * page_size
+        aligned_end = min(
+            ((int(end_offset) + page_size - 1) // page_size) * page_size,
+            int(shard_mmap.size()),
+        )
+        length = aligned_end - aligned_start
+        if length <= 0:
+            return
+
+        try:
+            if hasattr(shard_mmap, "madvise") and hasattr(mmap, "MADV_DONTNEED"):
+                shard_mmap.madvise(
+                    mmap.MADV_DONTNEED,
+                    aligned_start,
+                    length,
+                )
+            if hasattr(os, "posix_fadvise") and hasattr(
+                os,
+                "POSIX_FADV_DONTNEED",
+            ):
+                os.posix_fadvise(
+                    self.shard_handles[int(shard_id)].fileno(),
+                    aligned_start,
+                    length,
+                    os.POSIX_FADV_DONTNEED,
+                )
+        except OSError as exc:
+            warnings.warn(
+                f"Unable to discard target-cache file pages: {exc}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
     def _read_record(self, index: int):
         self._ensure_index_mmap()
         offset = int(index) * INDEX_RECORD_SIZE
@@ -874,7 +924,8 @@ class CacheDataset(torch.utils.data.Dataset):
         assert context_chunk_len > 0, (
             f"context_len must be positive, got {context_chunk_len}"
         )
-        shard_mmap = self._get_shard_mmap(int(record["shard_id"]))
+        shard_id = int(record["shard_id"])
+        shard_mmap = self._get_shard_mmap(shard_id)
         nbytes = expected_target_cache_tensor_nbytes(
             seq_len=seq_len,
             context_len=context_chunk_len,
@@ -908,6 +959,15 @@ class CacheDataset(torch.utils.data.Dataset):
             offset=record["target_last_hidden_states_offset"],
             shape=(context_chunk_len, self.hidden_size),
             nbytes=nbytes["target_last_hidden_states"],
+        )
+        self._discard_sample_file_cache(
+            shard_id=shard_id,
+            shard_mmap=shard_mmap,
+            start_offset=record["input_ids_offset"],
+            end_offset=(
+                int(record["target_last_hidden_states_offset"])
+                + int(nbytes["target_last_hidden_states"])
+            ),
         )
         return {
             "input_ids": input_ids,
