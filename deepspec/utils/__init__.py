@@ -16,6 +16,12 @@ from .distributed import (
 from .io import ensure_dir, safe_symlink
 from .metrics import add_metric, flush, reset
 from .optim import BF16Optimizer
+from .parallel import (
+    ParallelTopology,
+    build_parallel_topology,
+    compute_context_parallel_range,
+)
+
 
 def seed_all(seed):
     torch.manual_seed(seed)
@@ -66,8 +72,11 @@ def get_git_diff(rev="HEAD"):
 __all__ = [
     "BF16Optimizer",
     "CustomJSONEncoder",
+    "ParallelTopology",
     "StatelessResumableDistributedSampler",
     "add_metric",
+    "build_parallel_topology",
+    "compute_context_parallel_range",
     "ensure_dir",
     "flush",
     "get_git_diff",
