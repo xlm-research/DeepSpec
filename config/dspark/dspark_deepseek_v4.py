@@ -35,21 +35,22 @@ train = dict(
     weight_decay=0.0,
     precision="bf16",
     local_batch_size=1,
-    # The launcher's world size must be divisible by CP * EP * TP * FSDP.
-    # EP shards the 256 routed experts; TP shards heads/intermediate/vocabulary.
-    global_batch_size=504,
+    # Pure EP overlays the base CP * TP * FSDP topology and does not multiply it.
+    # Routed experts are excluded from TP/FSDP parameter shards.
+    global_batch_size=8,
     # Online distillation evaluates the frozen target once immediately before
     # each draft micro-batch.  Keep one epoch so every sample needs one target
     # forward rather than recomputing identical supervision across epochs.
     num_train_epochs=1,
-    max_train_steps=None,
+    max_train_steps=1,
     max_grad_norm=1.0,
     sharding_strategy="full_shard",
-    fsdp_size=9,
+    fsdp_size=4,
     fsdp_layerwise=True,
-    context_parallel_size=8,
-    expert_parallel_size=2,
-    tensor_parallel_size=2,
+    context_parallel_size=2,
+    expert_parallel_size=8,
+    tensor_parallel_size=1,
+    pure_expert_parallel=True,
     # The distributed sliding-window path is shape-dynamic and performs ring
     # P2P collectives; whole-model compile is intentionally disabled.
     torch_compile=False,

@@ -5,7 +5,6 @@ from contextlib import nullcontext
 
 import torch
 import torch.distributed as dist
-from accelerate import init_empty_weights
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import MixedPrecision, ShardingStrategy
 from torch.distributed.fsdp.wrap import ModuleWrapPolicy
@@ -21,9 +20,16 @@ from deepspec.data import (
 )
 from deepspec.data.cuda_prefetcher import CUDAPrefetcher
 from deepspec.data.jsonl_dataset import JsonLineDataset
+from deepspec.modeling.pure_ep import (
+    get_pure_expert_modules,
+    materialize_modules_locally,
+    synchronize_module_gradients,
+)
 from deepspec.trainer.ckpt_manager import (
     discover_latest_checkpoint,
     is_model_parallel_checkpoint,
+    is_rank_local_checkpoint,
+    load_rank_local_draft_model,
     load_resume_draft_model,
     load_training_state,
     save_checkpoint,
@@ -65,6 +71,9 @@ def _load_safetensors_weight(
     checkpoint_dir: str,
     *,
     candidate_names: tuple[str, ...],
+    shard_dim: int | None = None,
+    shard_rank: int = 0,
+    shard_size: int = 1,
 ) -> torch.Tensor:
     """Load one named tensor without constructing a multi-hundred-B model."""
 
@@ -83,7 +92,39 @@ def _load_safetensors_weight(
                 framework="pt",
                 device="cpu",
             ) as handle:
-                return handle.get_tensor(name)
+                if int(shard_size) == 1:
+                    if int(shard_size) == 1:
+                        return handle.get_tensor(name)
+                    tensor_slice = handle.get_slice(name)
+                    shape = tensor_slice.get_shape()
+                    dim = int(shard_dim)
+                    if int(shape[dim]) % int(shard_size) != 0:
+                        raise ValueError(
+                            f"Cannot shard {name} shape={shape} on dim={dim} "
+                            f"across {shard_size} TP ranks."
+                        )
+                    width = int(shape[dim]) // int(shard_size)
+                    slices = [slice(None)] * len(shape)
+                    slices[dim] = slice(
+                        int(shard_rank) * width,
+                        (int(shard_rank) + 1) * width,
+                    )
+                    return tensor_slice[tuple(slices)]
+                tensor_slice = handle.get_slice(name)
+                shape = tensor_slice.get_shape()
+                dim = int(shard_dim)
+                if int(shape[dim]) % int(shard_size) != 0:
+                    raise ValueError(
+                        f"Cannot shard {name} shape={shape} on dim={dim} "
+                        f"across {shard_size} TP ranks."
+                    )
+                width = int(shape[dim]) // int(shard_size)
+                slices = [slice(None)] * len(shape)
+                slices[dim] = slice(
+                    int(shard_rank) * width,
+                    (int(shard_rank) + 1) * width,
+                )
+                return tensor_slice[tuple(slices)]
     else:
         tensor_path = os.path.join(checkpoint_dir, "model.safetensors")
         if os.path.isfile(tensor_path):
@@ -98,7 +139,9 @@ def _load_safetensors_weight(
     )
 
 
-def _load_deepseek_v4_embedding_and_head(checkpoint_dir: str):
+def _load_deepseek_v4_embedding_and_head(
+    checkpoint_dir: str, *, tensor_parallel_rank: int, tensor_parallel_size: int
+):
     embed_weight = _load_safetensors_weight(
         checkpoint_dir,
         candidate_names=(
@@ -106,6 +149,9 @@ def _load_deepseek_v4_embedding_and_head(checkpoint_dir: str):
             "model.language_model.embed_tokens.weight",
             "embed.weight",
         ),
+        shard_dim=0,
+        shard_rank=tensor_parallel_rank,
+        shard_size=tensor_parallel_size,
     )
     lm_head_weight = _load_safetensors_weight(
         checkpoint_dir,
@@ -114,6 +160,9 @@ def _load_deepseek_v4_embedding_and_head(checkpoint_dir: str):
             "model.lm_head.weight",
             "head.weight",
         ),
+        shard_dim=0,
+        shard_rank=tensor_parallel_rank,
+        shard_size=tensor_parallel_size,
     )
     return embed_weight, lm_head_weight
 
@@ -256,6 +305,9 @@ class BaseTrainer:
         self.tensor_parallel_size = int(
             self.args.train.get("tensor_parallel_size", 1)
         )
+        self.pure_expert_parallel = bool(
+            self.args.train.get("pure_expert_parallel", False)
+        )
         if self.context_parallel_size < 1:
             raise ValueError("train.context_parallel_size must be positive.")
         if self.expert_parallel_size < 1 or self.tensor_parallel_size < 1:
@@ -275,8 +327,8 @@ class BaseTrainer:
             self.world_size
             // (
                 self.context_parallel_size
-                * self.expert_parallel_size
                 * self.tensor_parallel_size
+                * (1 if self.pure_expert_parallel else self.expert_parallel_size)
             )
             if configured_fsdp_size is None
             else int(configured_fsdp_size)
@@ -287,6 +339,7 @@ class BaseTrainer:
             tensor_parallel_size=self.tensor_parallel_size,
             fsdp_size=self.fsdp_size,
             create_fsdp_groups=True,
+            pure_expert_parallel=self.pure_expert_parallel,
         )
         self.data_parallel_size = self.parallel.sample_parallel_size
         self.data_parallel_rank = self.parallel.sample_parallel_rank
@@ -299,6 +352,20 @@ class BaseTrainer:
             self.resume_checkpoint_dir is not None
             and is_model_parallel_checkpoint(self.resume_checkpoint_dir)
         )
+        self.resume_is_rank_local = bool(
+            self.resume_checkpoint_dir is not None
+            and is_rank_local_checkpoint(self.resume_checkpoint_dir)
+        )
+        if self.resume_is_rank_local and not is_rank_local_checkpoint(
+            self.resume_checkpoint_dir,
+            global_rank=self.global_rank,
+        ):
+            raise FileNotFoundError(
+                "Rank-local checkpoint is incomplete for global rank "
+                f"{self.global_rank}: {self.resume_checkpoint_dir}."
+            )
+        if self.resume_is_rank_local:
+            self.resume_is_model_parallel = False
         self.suspend_controller = SuspendController(device=self.device)
         self.next_micro_step = 0
         self.online_target_enabled = bool(
@@ -329,6 +396,7 @@ class BaseTrainer:
         self.draft_model, self.tokenizer = self.build_models()
         if (
             self.resume_checkpoint_dir is not None
+            and not self.resume_is_rank_local
             and not self.resume_is_model_parallel
         ):
             self.draft_model = load_resume_draft_model(
@@ -367,6 +435,22 @@ class BaseTrainer:
                 model_parallel_group=self.parallel.model_parallel_group,
                 model_parallel_src_rank=self.parallel.model_parallel_src_rank,
             )
+        if (
+            getattr(self, "_pending_deepseek_v4_embedding_head", None)
+            is not None
+            and self.resume_checkpoint_dir is None
+        ):
+            embed_weight, lm_head_weight = _load_deepseek_v4_embedding_and_head(
+                self._pending_deepseek_v4_embedding_head,
+                tensor_parallel_rank=self.parallel.tensor_parallel_rank,
+                tensor_parallel_size=self.parallel.tensor_parallel_size,
+            )
+            self.draft_model.initialize_embedding_and_head_weights(
+                embed_weight=embed_weight.to(dtype=self.precision_dtype),
+                lm_head_weight=lm_head_weight.to(dtype=self.precision_dtype),
+                freeze=True,
+            )
+            del embed_weight, lm_head_weight
         if self.resume_is_model_parallel:
             self.draft_model = load_resume_draft_model(
                 resume_checkpoint_dir=self.resume_checkpoint_dir,
@@ -391,6 +475,14 @@ class BaseTrainer:
             print_on_local_main("Compiling training model with torch.compile...")
             self.model = torch.compile(self.model, dynamic=True)
         self.model = self._wrap_with_fsdp(self.model)
+        if self.resume_is_rank_local:
+            load_rank_local_draft_model(
+                resume_checkpoint_dir=self.resume_checkpoint_dir,
+                model=self.model,
+                draft_model=self.draft_model,
+                global_rank=self.global_rank,
+                parallel=self.parallel,
+            )
 
         if self.online_target_enabled:
             train_data_paths = self.args.data.get("train_data_path")
@@ -495,6 +587,9 @@ class BaseTrainer:
                 else "offline target cache"
             )
         )
+        print_on_local_main(
+            "  Startup parameter loading = rank-local (no parameter collectives)"
+        )
         print_on_local_main(f"  Num train epochs = {self.args.train.num_train_epochs}")
         print_on_local_main(f"  Samples per epoch = {self.samples_per_epoch}")
         print_on_local_main(f"  Local batch size = {self.args.train.local_batch_size}")
@@ -518,50 +613,22 @@ class BaseTrainer:
             model_args.target_model_name_or_path,
         )
 
-        self._draft_meta_fsdp_init = bool(
-            str(target_config.model_type) == "deepseek_v4"
-            and self.fsdp_size > 1
-            and (
-                self.resume_checkpoint_dir is None
-                or self.resume_is_model_parallel
-            )
+        self._pending_deepseek_v4_embedding_head = None
+        draft_model = self._build_draft_model(
+            target_config=target_config,
+            model_args=model_args,
         )
-        build_on_meta = bool(
-            self._draft_meta_fsdp_init and self.parallel.fsdp_rank != 0
-        )
-        if build_on_meta:
-            with init_empty_weights(include_buffers=True):
-                draft_model = self._build_draft_model(
-                    target_config=target_config,
-                    model_args=model_args,
-                )
-            draft_model = draft_model.to(dtype=self.precision_dtype)
-        else:
-            draft_model = self._build_draft_model(
-                target_config=target_config,
-                model_args=model_args,
-            )
-            # Let FSDP move and shard the model one wrapping unit at a time.
-            draft_model = draft_model.to(
-                device="cpu", dtype=self.precision_dtype
-            )
+        # Every rank initializes the same deterministic parameters, then keeps
+        # only its own EP/TP/FSDP slice. No source rank is involved.
+        draft_model = draft_model.to(device="cpu", dtype=self.precision_dtype)
 
         # Training only needs two target tensors.  Constructing the complete
         # 149-GB V4-Flash model once per local process just to read them would
         # exhaust host memory, so V4 reads the two safetensors entries directly.
         if str(target_config.model_type) == "deepseek_v4":
-            if not build_on_meta:
-                embed_weight, lm_head_weight = (
-                    _load_deepseek_v4_embedding_and_head(
-                        model_args.target_model_name_or_path
-                    )
-                )
-                draft_model.initialize_embedding_and_head_weights(
-                    embed_weight=embed_weight.to(dtype=self.precision_dtype),
-                    lm_head_weight=lm_head_weight.to(dtype=self.precision_dtype),
-                    freeze=True,
-                )
-                del embed_weight, lm_head_weight
+            self._pending_deepseek_v4_embedding_head = str(
+                model_args.target_model_name_or_path
+            )
         else:
             target_model = AutoModelForCausalLM.from_pretrained(
                 model_args.target_model_name_or_path,
@@ -593,20 +660,14 @@ class BaseTrainer:
             parallel=self.parallel,
         )
         fsdp_kwargs["device_id"] = self.device
-        if bool(getattr(self, "_draft_meta_fsdp_init", False)):
-            fsdp_kwargs["sync_module_states"] = True
-
-            def materialize_meta_module(module):
-                if any(
-                    tensor is not None and tensor.is_meta
-                    for tensor in (
-                        *module.parameters(recurse=False),
-                        *module.buffers(recurse=False),
-                    )
-                ):
-                    module.to_empty(device=self.device, recurse=False)
-
-            fsdp_kwargs["param_init_fn"] = materialize_meta_module
+        self._pure_expert_modules = get_pure_expert_modules(model)
+        if self._pure_expert_modules:
+            materialize_modules_locally(
+                self._pure_expert_modules,
+                device=self.device,
+            )
+            fsdp_kwargs["ignored_modules"] = self._pure_expert_modules
+        fsdp_kwargs["sync_module_states"] = False
         if bool(self.args.train.get("fsdp_layerwise", False)):
             uncompiled_model = getattr(model, "_orig_mod", model)
             decoder_layers = list(getattr(uncompiled_model, "layers", []))
@@ -619,6 +680,35 @@ class BaseTrainer:
                 {type(layer) for layer in decoder_layers}
             )
         return FSDP(model, **fsdp_kwargs)
+
+    def _synchronize_pure_expert_gradients(self):
+        modules = getattr(self, "_pure_expert_modules", None)
+        if not modules:
+            return
+        process_groups = [
+            (
+                self.parallel.tensor_parallel_group,
+                self.tensor_parallel_size,
+            ),
+        ]
+        if self.pure_expert_parallel:
+            process_groups.append(
+                (
+                    self.parallel.expert_replica_group,
+                    self.parallel.expert_replica_size,
+                )
+            )
+        else:
+            process_groups.extend(
+                [
+                    (self.parallel.fsdp_group, self.fsdp_size),
+                    (
+                        self.parallel.fsdp_replica_group,
+                        self.parallel.fsdp_replica_size,
+                    ),
+                ]
+            )
+        synchronize_module_gradients(modules, process_groups=process_groups)
 
     def _build_train_dataloader(self, start_offset_samples=0, num_samples=None):
         sampler = StatelessResumableDistributedSampler(
@@ -728,6 +818,7 @@ class BaseTrainer:
                 if not should_sync:
                     continue
 
+                self._synchronize_pure_expert_gradients()
                 grad_norm = FSDP.clip_grad_norm_(
                     self.model,
                     float(self.args.train.max_grad_norm),

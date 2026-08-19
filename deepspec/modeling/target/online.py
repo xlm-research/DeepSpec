@@ -8,18 +8,33 @@ model.  Nothing is gathered to a leader or written to a target-cache file.
 
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.distributed as dist
 from accelerate import init_empty_weights
 from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import MixedPrecision, ShardingStrategy
 from transformers import AutoConfig, AutoModel, FineGrainedFP8Config
+from transformers.distributed.configuration_utils import DistributedConfig
 
 from deepspec.modeling.deepseek_v4_parallel import (
     parallelize_deepseek_v4_model,
 )
+from deepspec.modeling.pure_ep import (
+    get_pure_expert_modules,
+    materialize_modules_locally,
+)
 from deepspec.utils import compute_context_parallel_range
+from deepspec.utils.rank_local_state import (
+    RANK_LOCAL_STATE_FORMAT,
+    load_rank_local_model_state,
+    rank_local_state_path,
+    rank_local_topology_metadata,
+    save_rank_local_model_state,
+)
 
 from .common import TargetForwardResult
 from .deepseek_v4_cp import install_target_context_parallel
@@ -124,27 +139,65 @@ def _normalize_target_parameter_dtype(target_model) -> None:
             parameter.data = parameter.data.to(dtype=torch.bfloat16)
 
 
-def _build_fsdp_target_model(
-    *, model_name_or_path: str, target_config, fsdp_rank: int
+def _build_rank_local_ep_target_model(
+    *, model_name_or_path: str, target_config, topology
 ):
-    """Read one full checkpoint per FSDP group; use Meta Model peers elsewhere."""
+    """Load only the routed experts owned by this EP rank.
 
-    if int(fsdp_rank) == 0:
-        load_kwargs = {
-            "config": target_config,
-            "dtype": torch.bfloat16,
-            "low_cpu_mem_usage": True,
+    Transformers' DeepSeek-V4 conversion pipeline dequantizes each selected
+    expert before fusing w1/w3 into gate_up_proj. GroupedGemmParallel receives
+    the source expert index and returns None for experts outside this rank, so
+    their safetensors payloads are never materialized.
+    """
+
+    load_kwargs = {
+        "config": target_config,
+        "dtype": torch.bfloat16,
+        "low_cpu_mem_usage": True,
+    }
+    quantization_config = _dequantizing_config(target_config)
+    if quantization_config is not None:
+        load_kwargs["quantization_config"] = quantization_config
+
+    ep_size = int(topology.expert_parallel_size)
+    if ep_size > 1:
+        if topology.expert_parallel_group is None:
+            raise RuntimeError("Rank-local EP loading requires an EP process group.")
+        # Only shard routed-expert parameters during checkpoint loading. The
+        # framework's existing pure-EP forward owns token dispatch and routing;
+        # dense modules remain replicated until the layerwise FSDP wrap below.
+        target_config.base_model_ep_plan = {
+            "layers.*.mlp.experts.gate_up_proj": "grouped_gemm",
+            "layers.*.mlp.experts.down_proj": "grouped_gemm",
         }
-        quantization_config = _dequantizing_config(target_config)
-        if quantization_config is not None:
-            load_kwargs["quantization_config"] = quantization_config
-        model = AutoModel.from_pretrained(model_name_or_path, **load_kwargs)
-        _normalize_target_parameter_dtype(model)
-        return model
+        ep_mesh = DeviceMesh.from_group(
+            topology.expert_parallel_group,
+            "cuda",
+            mesh_dim_names=("tp",),
+        )
+        load_kwargs.update(
+            tp_plan="auto",
+            device_mesh=ep_mesh,
+            distributed_config=DistributedConfig(enable_expert_parallel=True),
+        )
 
-    with init_empty_weights(include_buffers=True):
-        model = AutoModel.from_config(target_config, dtype=torch.bfloat16)
+    model = AutoModel.from_pretrained(model_name_or_path, **load_kwargs)
     _normalize_target_parameter_dtype(model)
+
+    if ep_size > 1:
+        expected_local_experts = int(target_config.n_routed_experts) // ep_size
+        backbone = _get_target_backbone(model)
+        for layer_idx, decoder_layer in enumerate(backbone.layers):
+            experts = decoder_layer.mlp.experts
+            local_experts = int(experts.gate_up_proj.shape[0])
+            if local_experts != expected_local_experts:
+                raise RuntimeError(
+                    "Rank-local target loader produced an invalid expert shard: "
+                    f"layer={layer_idx}, local={local_experts}, "
+                    f"expected={expected_local_experts}."
+                )
+            experts.num_experts = local_experts
+            experts._deepspec_expert_parameters_distributed = True
     return model
 
 
@@ -169,8 +222,8 @@ def _materialize_tensor_on_device(
     return materialized
 
 
-def _materialize_and_sync_replicated_target_state(
-    *, target_model, decoder_layers, device, process_group
+def _materialize_replicated_target_state_locally(
+    *, target_model, decoder_layers, device
 ) -> None:
     decoder_parameter_ids = {
         id(parameter)
@@ -182,11 +235,6 @@ def _materialize_and_sync_replicated_target_state(
         for decoder_layer in decoder_layers
         for buffer in decoder_layer.buffers()
     }
-    source_rank = (
-        int(dist.get_global_rank(process_group, 0))
-        if hasattr(dist, "get_global_rank")
-        else int(dist.get_process_group_ranks(process_group)[0])
-    )
     for qualified_name, parameter in list(target_model.named_parameters()):
         if id(parameter) in decoder_parameter_ids:
             continue
@@ -198,7 +246,6 @@ def _materialize_and_sync_replicated_target_state(
             device=device,
             is_parameter=True,
         )
-        dist.broadcast(materialized.data, src=source_rank, group=process_group)
     for qualified_name, buffer in list(target_model.named_buffers()):
         if id(buffer) in decoder_buffer_ids:
             continue
@@ -210,7 +257,6 @@ def _materialize_and_sync_replicated_target_state(
             device=device,
             is_parameter=False,
         )
-        dist.broadcast(materialized, src=source_rank, group=process_group)
 
 
 def _materialize_meta_module(module: nn.Module, *, device) -> None:
@@ -224,19 +270,22 @@ def _materialize_meta_module(module: nn.Module, *, device) -> None:
         module.to_empty(device=device, recurse=False)
 
 
-def _wrap_target_model_with_fsdp(*, target_model, device, process_group):
-    """FULL_SHARD target decoder layers while leaving only small state replicated."""
+def _wrap_target_model_with_fsdp(
+    *, target_model, device, process_group, topology
+):
+    """FULL_SHARD dense target state while keeping routed experts pure-EP."""
 
     backbone = _get_target_backbone(target_model)
     decoder_layers = list(backbone.layers)
     if not decoder_layers:
         raise ValueError("Target model does not expose decoder layers for FSDP.")
-    _materialize_and_sync_replicated_target_state(
+    _materialize_replicated_target_state_locally(
         target_model=target_model,
         decoder_layers=decoder_layers,
         device=device,
-        process_group=process_group,
     )
+    pure_expert_modules = get_pure_expert_modules(target_model)
+    materialize_modules_locally(pure_expert_modules, device=device)
     fsdp_kwargs = {
         "process_group": process_group,
         "device_id": device,
@@ -246,14 +295,18 @@ def _wrap_target_model_with_fsdp(*, target_model, device, process_group):
             buffer_dtype=torch.bfloat16,
         ),
         "sharding_strategy": ShardingStrategy.FULL_SHARD,
-        "sync_module_states": True,
+        "sync_module_states": False,
         "use_orig_params": True,
         "param_init_fn": lambda module: _materialize_meta_module(
             module, device=device
         ),
     }
     for layer_idx, decoder_layer in enumerate(decoder_layers):
-        backbone.layers[layer_idx] = FSDP(decoder_layer, **fsdp_kwargs)
+        layer_fsdp_kwargs = dict(fsdp_kwargs)
+        routed_experts = getattr(getattr(decoder_layer, "mlp", None), "experts", None)
+        if bool(getattr(routed_experts, "_deepspec_pure_expert_parallel", False)):
+            layer_fsdp_kwargs["ignored_modules"] = [routed_experts]
+        backbone.layers[layer_idx] = FSDP(decoder_layer, **layer_fsdp_kwargs)
     return target_model
 
 
@@ -312,23 +365,59 @@ class DeepseekV4OnlineTarget:
         target_layer_ids,
         topology,
         device,
+        rank_local_cache_dir: str,
     ):
         self.model_name_or_path = str(model_name_or_path)
         self.target_layer_ids = [int(layer_id) for layer_id in target_layer_ids]
         self.topology = topology
         self.device = device
+        self.rank_local_cache_dir = str(rank_local_cache_dir)
         target_config = AutoConfig.from_pretrained(self.model_name_or_path)
         if str(target_config.model_type) != "deepseek_v4":
             raise ValueError(
                 "DeepseekV4OnlineTarget requires a deepseek_v4 checkpoint, got "
                 f"{target_config.model_type!r}."
             )
+        decoder_layer_ids = [
+            layer_id for layer_id in self.target_layer_ids if layer_id >= 0
+        ]
+        if not decoder_layer_ids:
+            raise ValueError("Online target requires at least one decoder layer.")
+        retained_layers = max(decoder_layer_ids) + 1
+        original_layers = int(target_config.num_hidden_layers)
+        if retained_layers > original_layers:
+            raise ValueError(
+                f"Requested target layer {retained_layers - 1}, but the checkpoint "
+                f"contains only {original_layers} decoder layers."
+            )
+        target_config.num_hidden_layers = retained_layers
+        self.target_num_hidden_layers = retained_layers
 
-        model = _build_fsdp_target_model(
+        global_rank = int(dist.get_rank())
+        cache_path = rank_local_state_path(
+            self.rank_local_cache_dir,
+            prefix=f"target.{RANK_LOCAL_STATE_FORMAT}",
+            global_rank=global_rank,
+        )
+        cache_metadata = rank_local_topology_metadata(topology)
+        cache_metadata.update(
+            kind="target",
+            global_rank=global_rank,
             model_name_or_path=self.model_name_or_path,
-            target_config=target_config,
-            fsdp_rank=topology.fsdp_rank,
-        ).eval()
+            num_hidden_layers=int(retained_layers),
+        )
+        cache_exists = os.path.isfile(cache_path)
+        if cache_exists:
+            with init_empty_weights(include_buffers=True):
+                model = AutoModel.from_config(target_config)
+            model = model.to(dtype=torch.bfloat16)
+        else:
+            model = _build_rank_local_ep_target_model(
+                model_name_or_path=self.model_name_or_path,
+                target_config=target_config,
+                topology=topology,
+            )
+        model = model.eval()
         model.requires_grad_(False)
         if topology.expert_parallel_size > 1 or topology.tensor_parallel_size > 1:
             model = parallelize_deepseek_v4_model(
@@ -342,7 +431,20 @@ class DeepseekV4OnlineTarget:
             target_model=model,
             device=device,
             process_group=topology.fsdp_group,
+            topology=topology,
         ).eval()
+        if cache_exists:
+            load_rank_local_model_state(
+                self.model,
+                cache_path,
+                expected_metadata=cache_metadata,
+            )
+        else:
+            save_rank_local_model_state(
+                self.model,
+                cache_path,
+                metadata=cache_metadata,
+            )
 
     def forward_training_batch(self, batch) -> dict[str, torch.Tensor]:
         """Run one target forward and return a cache-shaped in-memory batch."""

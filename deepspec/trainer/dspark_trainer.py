@@ -1,3 +1,5 @@
+import os
+
 from deepspec.data import CacheCollator
 from deepspec.modeling.dspark.gemma4 import Gemma4DSparkModel
 from deepspec.modeling.dspark.gemma4.config import (
@@ -78,6 +80,10 @@ class DeepseekV4DSparkTrainer(Qwen3DSparkTrainer):
             target_layer_ids=self.args.model.target_layer_ids,
             topology=self.parallel,
             device=self.device,
+            rank_local_cache_dir=os.path.join(
+                self.checkpoint_dir_root,
+                "target_rank_local",
+            ),
         )
 
     def run_batch(self, batch):

@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 import torch
+import torch.distributed as dist
 from deepspec.utils import (
     CustomJSONEncoder,
     get_git_diff,
@@ -29,13 +30,26 @@ def parse_args():
 
 
 def main(local_rank):
+    os.environ["LOCAL_RANK"] = str(local_rank)
+    os.environ["LOCAL_WORLD_SIZE"] = str(torch.cuda.device_count())
+    torch.cuda.set_device(local_rank)
+
     args = parse_args()
     seed_all(int(args.seed))
     if local_rank == 0:
         print(json.dumps(args, indent=4, cls=CustomJSONEncoder), flush=True)
-    trainer = args.train.trainer_cls(local_rank, args)
-    trainer.train()
-    trainer.clean_up()
+
+    trainer = None
+    try:
+        trainer = args.train.trainer_cls(local_rank, args)
+        trainer.train()
+    finally:
+        try:
+            if trainer is not None:
+                trainer.clean_up()
+        finally:
+            if dist.is_initialized():
+                dist.destroy_process_group()
 
 
 if __name__ == "__main__":

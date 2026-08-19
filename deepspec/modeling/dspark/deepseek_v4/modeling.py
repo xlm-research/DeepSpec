@@ -334,6 +334,7 @@ class DeepseekV4DSparkModel(DeepseekV4PreTrainedModel):
         self.tensor_parallel_size = 1
         self.tensor_parallel_rank = 0
         self.tensor_parallel_group = None
+        self.pure_expert_parallel = False
         self.post_init()
 
     def configure_context_parallel(
@@ -367,6 +368,7 @@ class DeepseekV4DSparkModel(DeepseekV4PreTrainedModel):
         self.tensor_parallel_size = int(topology.tensor_parallel_size)
         self.tensor_parallel_rank = int(topology.tensor_parallel_rank)
         self.tensor_parallel_group = topology.tensor_parallel_group
+        self.pure_expert_parallel = bool(topology.pure_expert_parallel)
         self.configure_context_parallel(
             size=topology.context_parallel_size,
             rank=topology.context_parallel_rank,
@@ -381,10 +383,14 @@ class DeepseekV4DSparkModel(DeepseekV4PreTrainedModel):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Keep stochastic anchor choices identical across EP/TP peers."""
 
-        for size, group in (
-            (self.tensor_parallel_size, self.tensor_parallel_group),
-            (self.expert_parallel_size, self.expert_parallel_group),
-        ):
+        synchronization_groups = [
+            (self.tensor_parallel_size, self.tensor_parallel_group)
+        ]
+        if not self.pure_expert_parallel:
+            synchronization_groups.append(
+                (self.expert_parallel_size, self.expert_parallel_group)
+            )
+        for size, group in synchronization_groups:
             if int(size) == 1:
                 continue
             source_rank = (

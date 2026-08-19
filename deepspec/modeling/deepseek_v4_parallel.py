@@ -1,9 +1,9 @@
 """DeepSeek-V4 tensor/expert parallel parameter and execution adapters.
 
-The adapter is intentionally applied before FSDP.  EP first slices the expert
-axis, TP then slices attention heads, expert intermediate channels, shared MLP
-channels, and vocabulary projections.  FSDP consequently shards only the
-rank-local ``(ep, tp)`` parameter partition.
+The adapter is intentionally applied before FSDP. Routed experts use pure EP:
+EP slices only the expert axis, while TP never slices expert-internal channels
+and FSDP ignores routed-expert containers. TP still slices attention, shared
+MLP channels, and vocabulary projections.
 
 DeepSeek-V4 uses one shared KV head, so the KV/compressor branch stays
 replicated while query heads and grouped output projections are tensor-sharded.
@@ -517,40 +517,52 @@ def _parallelize_shared_mlp(mlp: nn.Module, *, topology) -> None:
 def _parallelize_moe(moe: nn.Module, *, topology) -> None:
     ep_size = int(topology.expert_parallel_size)
     ep_rank = int(topology.expert_parallel_rank)
-    tp_size = int(topology.tensor_parallel_size)
-    tp_rank = int(topology.tensor_parallel_rank)
     ep_group = topology.expert_parallel_group
-    tp_group = topology.tensor_parallel_group
+    ep_over_cp = bool(getattr(topology, "pure_expert_parallel", False))
     experts = moe.experts
-    global_experts = int(experts.num_experts)
-    local_experts = _require_divisible(
-        global_experts, ep_size, "n_routed_experts"
+    parameters_pre_sharded = bool(
+        getattr(experts, "_deepspec_expert_parameters_distributed", False)
     )
+    if parameters_pre_sharded:
+        local_experts = int(experts.gate_up_proj.shape[0])
+        global_experts = local_experts * ep_size
+    else:
+        global_experts = int(experts.num_experts)
+        local_experts = _require_divisible(
+            global_experts, ep_size, "n_routed_experts"
+        )
 
     if ep_size > 1:
         original_experts_forward = experts.forward
-        _slice_parameter(
-            experts, "gate_up_proj", dim=0, rank=ep_rank, size=ep_size
-        )
-        _slice_parameter(
-            experts, "down_proj", dim=0, rank=ep_rank, size=ep_size
-        )
-        experts.num_experts = local_experts
+        if not parameters_pre_sharded:
+            if ep_over_cp:
+                from deepspec.modeling.pure_ep import distribute_expert_parameter
 
-    if tp_size > 1:
-        _slice_packed_gate_up(
-            experts,
-            "gate_up_proj",
-            dim=1,
-            rank=tp_rank,
-            size=tp_size,
-        )
-        _slice_parameter(
-            experts, "down_proj", dim=2, rank=tp_rank, size=tp_size
-        )
-        experts.intermediate_dim = _require_divisible(
-            int(experts.intermediate_dim), tp_size, "moe_intermediate_size"
-        )
+                distribute_expert_parameter(
+                    experts,
+                    "gate_up_proj",
+                    dim=0,
+                    rank=ep_rank,
+                    size=ep_size,
+                    process_group=ep_group,
+                )
+                distribute_expert_parameter(
+                    experts,
+                    "down_proj",
+                    dim=0,
+                    rank=ep_rank,
+                    size=ep_size,
+                    process_group=ep_group,
+                )
+                experts._deepspec_expert_parameters_distributed = True
+            else:
+                _slice_parameter(
+                    experts, "gate_up_proj", dim=0, rank=ep_rank, size=ep_size
+                )
+                _slice_parameter(
+                    experts, "down_proj", dim=0, rank=ep_rank, size=ep_size
+                )
+        experts.num_experts = local_experts
 
     if ep_size > 1:
         configured_chunk = int(
@@ -567,40 +579,53 @@ def _parallelize_moe(moe: nn.Module, *, topology) -> None:
             if int(top_k_index.shape[0]) != total_tokens:
                 raise ValueError("MoE routing indices must align with tokens.")
 
-            # Expert TP ranks own partial intermediate channels.  Their input
-            # gradient contributions must be summed back into the replicated
-            # hidden state.  Router weights are already multiplied after the
-            # TP partial expert outputs have been summed, so they need only the
-            # EP reduction that joins disjoint source-token ranges.
-            hidden_states = _all_reduce_backward(
-                hidden_states, group=tp_group, size=tp_size
-            )
-            top_k_weights = _all_reduce_backward(
-                top_k_weights, group=ep_group, size=ep_size
-            )
+            if not ep_over_cp:
+                top_k_weights = _all_reduce_backward(
+                    top_k_weights, group=ep_group, size=ep_size
+                )
+
+            collective_tokens = total_tokens
+            if ep_over_cp:
+                collective_tokens_tensor = torch.tensor(
+                    total_tokens,
+                    device=hidden_states.device,
+                    dtype=torch.int64,
+                )
+                dist.all_reduce(
+                    collective_tokens_tensor,
+                    op=dist.ReduceOp.MAX,
+                    group=ep_group,
+                )
+                collective_tokens = int(collective_tokens_tensor.item())
 
             output_chunks = []
-            for chunk_start in range(0, total_tokens, token_chunk_size):
+            for chunk_start in range(0, collective_tokens, token_chunk_size):
                 chunk_end = min(chunk_start + token_chunk_size, total_tokens)
                 full_chunk_length = chunk_end - chunk_start
-                source_splits = _balanced_split_sizes(
-                    full_chunk_length, ep_size
-                )
-                source_start = sum(source_splits[:ep_rank])
-                source_length = source_splits[ep_rank]
-
                 full_hidden_chunk = hidden_states[chunk_start:chunk_end]
-                local_hidden = _ReplicatedFirstDimShard.apply(
-                    full_hidden_chunk, ep_group, ep_rank, ep_size
-                )
-                local_indices = top_k_index[
-                    chunk_start + source_start :
-                    chunk_start + source_start + source_length
-                ]
-                local_weights = top_k_weights[
-                    chunk_start + source_start :
-                    chunk_start + source_start + source_length
-                ]
+                if ep_over_cp:
+                    source_splits = None
+                    source_length = full_chunk_length
+                    local_hidden = full_hidden_chunk
+                    local_indices = top_k_index[chunk_start:chunk_end]
+                    local_weights = top_k_weights[chunk_start:chunk_end]
+                else:
+                    source_splits = _balanced_split_sizes(
+                        full_chunk_length, ep_size
+                    )
+                    source_start = sum(source_splits[:ep_rank])
+                    source_length = source_splits[ep_rank]
+                    local_hidden = _ReplicatedFirstDimShard.apply(
+                        full_hidden_chunk, ep_group, ep_rank, ep_size
+                    )
+                    local_indices = top_k_index[
+                        chunk_start + source_start :
+                        chunk_start + source_start + source_length
+                    ]
+                    local_weights = top_k_weights[
+                        chunk_start + source_start :
+                        chunk_start + source_start + source_length
+                    ]
 
                 top_k = int(local_indices.shape[-1])
                 pair_tokens = torch.arange(
@@ -666,9 +691,6 @@ def _parallelize_moe(moe: nn.Module, *, topology) -> None:
                     received_experts.view(-1, 1),
                     unit_weights,
                 )
-                received_output = _all_reduce_forward(
-                    received_output, group=tp_group, size=tp_size
-                )
                 returned_output = _all_to_all_variable(
                     received_output,
                     output_split_sizes=send_counts,
@@ -684,15 +706,18 @@ def _parallelize_moe(moe: nn.Module, *, topology) -> None:
                     returned_output
                     * send_weights.to(returned_output.dtype).unsqueeze(-1),
                 )
-                output_chunks.append(
-                    _GatherFirstDimNoReduce.apply(
-                        local_output,
-                        ep_group,
-                        source_splits,
-                        ep_rank,
-                        ep_size,
+                if ep_over_cp:
+                    output_chunks.append(local_output)
+                else:
+                    output_chunks.append(
+                        _GatherFirstDimNoReduce.apply(
+                            local_output,
+                            ep_group,
+                            source_splits,
+                            ep_rank,
+                            ep_size,
+                        )
                     )
-                )
 
             if not output_chunks:
                 return hidden_states.new_empty(hidden_states.shape)
@@ -701,34 +726,13 @@ def _parallelize_moe(moe: nn.Module, *, topology) -> None:
         experts.forward = MethodType(all_to_all_experts_forward, experts)
         experts._deepspec_expert_dispatch = "all_to_all"
 
-    elif tp_size > 1:
-        def prepare_expert_inputs(_module, inputs):
-            hidden_states, top_k_index, top_k_weights = inputs
-            hidden_states = _all_reduce_backward(
-                hidden_states,
-                group=tp_group,
-                size=tp_size,
-            )
-            top_k_weights = _all_reduce_backward(
-                top_k_weights,
-                group=tp_group,
-                size=tp_size,
-            )
-            return hidden_states, top_k_index, top_k_weights
-
-        def combine_expert_outputs(_module, _inputs, output):
-            return _all_reduce_forward(
-                output, group=tp_group, size=tp_size
-            )
-
-        experts.register_forward_pre_hook(prepare_expert_inputs)
-        experts.register_forward_hook(combine_expert_outputs)
-
     _parallelize_shared_mlp(moe.shared_experts, topology=topology)
     experts._deepspec_expert_parallel_size = ep_size
     experts._deepspec_expert_parallel_rank = ep_rank
-    experts._deepspec_tensor_parallel_size = tp_size
-    experts._deepspec_tensor_parallel_rank = tp_rank
+    experts._deepspec_tensor_parallel_size = 1
+    experts._deepspec_tensor_parallel_rank = 0
+    experts._deepspec_pure_expert_parallel = True
+    experts._deepspec_expert_parallel_over_context = ep_over_cp
 
 
 def _get_backbone(model):
@@ -741,7 +745,7 @@ def _get_backbone(model):
 
 
 def parallelize_deepseek_v4_model(model, *, topology, draft: bool = False):
-    """Apply DeepSeek-V4 EP/TP slicing and autograd-aware collectives in-place."""
+    """Apply pure expert parallelism and dense TP collectives in-place."""
 
     if getattr(model, "_deepspec_ep_tp_installed", False):
         return model

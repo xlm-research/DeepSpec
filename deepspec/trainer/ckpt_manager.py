@@ -18,10 +18,18 @@ from deepspec.utils import (
     print_on_local_main,
     safe_symlink,
 )
+from deepspec.utils.rank_local_state import (
+    RANK_LOCAL_STATE_FORMAT,
+    load_rank_local_model_state,
+    rank_local_state_path,
+    rank_local_topology_metadata,
+    save_rank_local_model_state,
+)
 
 
 TRAIN_CONFIG_FILE_NAME = "train_config.py"
 MODEL_PARALLEL_MANIFEST = "model_parallel_manifest.json"
+RANK_LOCAL_MANIFEST = "rank_local_manifest.json"
 
 
 def discover_latest_checkpoint(checkpoint_dir):
@@ -34,6 +42,22 @@ def discover_latest_checkpoint(checkpoint_dir):
 def is_model_parallel_checkpoint(checkpoint_dir: str) -> bool:
     return os.path.isfile(
         os.path.join(checkpoint_dir, MODEL_PARALLEL_MANIFEST)
+    )
+
+
+def is_rank_local_checkpoint(
+    checkpoint_dir: str, *, global_rank: int | None = None
+) -> bool:
+    if not os.path.isfile(os.path.join(checkpoint_dir, RANK_LOCAL_MANIFEST)):
+        return False
+    if global_rank is None:
+        return True
+    return os.path.isfile(
+        rank_local_state_path(
+            checkpoint_dir,
+            prefix="model",
+            global_rank=global_rank,
+        )
     )
 
 
@@ -97,25 +121,24 @@ def load_resume_draft_model(
                 raise RuntimeError(
                     f"Checkpoint {key}={manifest[key]} does not match {value}."
                 )
-        if int(parallel.fsdp_rank) == 0:
-            from safetensors.torch import load_file
+        from safetensors.torch import load_file
 
-            shard_name = (
-                f"model.ep{int(parallel.expert_parallel_rank):03d}."
-                f"tp{int(parallel.tensor_parallel_rank):03d}.safetensors"
+        shard_name = (
+            f"model.ep{int(parallel.expert_parallel_rank):03d}."
+            f"tp{int(parallel.tensor_parallel_rank):03d}.safetensors"
+        )
+        state_dict = load_file(
+            os.path.join(resume_checkpoint_dir, shard_name),
+            device="cpu",
+        )
+        missing, unexpected = draft_model.load_state_dict(
+            state_dict, strict=False
+        )
+        if missing or unexpected:
+            raise RuntimeError(
+                "Model-parallel checkpoint does not match the draft model: "
+                f"missing={missing}, unexpected={unexpected}."
             )
-            state_dict = load_file(
-                os.path.join(resume_checkpoint_dir, shard_name),
-                device="cpu",
-            )
-            missing, unexpected = draft_model.load_state_dict(
-                state_dict, strict=False
-            )
-            if missing or unexpected:
-                raise RuntimeError(
-                    "Model-parallel checkpoint does not match the draft model: "
-                    f"missing={missing}, unexpected={unexpected}."
-                )
         draft_model.set_embedding_head_trainable(False)
         return draft_model
 
@@ -129,6 +152,28 @@ def load_resume_draft_model(
     resumed_model = resumed_model.to(device="cpu", dtype=precision_dtype)
     resumed_model.set_embedding_head_trainable(False)
     return resumed_model
+
+
+def load_rank_local_draft_model(
+    *,
+    resume_checkpoint_dir: str,
+    model,
+    draft_model,
+    global_rank: int,
+    parallel,
+) -> None:
+    metadata = rank_local_topology_metadata(parallel)
+    metadata.update(kind="draft", global_rank=int(global_rank))
+    load_rank_local_model_state(
+        model,
+        rank_local_state_path(
+            resume_checkpoint_dir,
+            prefix="model",
+            global_rank=global_rank,
+        ),
+        expected_metadata=metadata,
+    )
+    draft_model.set_embedding_head_trainable(False)
 
 
 def load_training_state(
@@ -213,6 +258,8 @@ def save_checkpoint(
         draft_model=draft_model,
         checkpoint_dir=checkpoint_dir,
         parallel=parallel,
+        global_rank=global_rank,
+        world_size=world_size,
     )
     training_state = _serialize_training_state(
         optimizer=optimizer,
@@ -358,18 +405,63 @@ def _save_model_parallel_checkpoint(
     dist.barrier()
 
 
-def _save_model_checkpoint(
-    *, model, draft_model, checkpoint_dir: str, parallel=None
+def _save_rank_local_checkpoint(
+    *,
+    model,
+    draft_model,
+    checkpoint_dir: str,
+    parallel,
+    global_rank: int,
+    world_size: int,
 ):
-    if parallel is not None and (
-        int(parallel.expert_parallel_size) > 1
-        or int(parallel.tensor_parallel_size) > 1
-    ):
-        _save_model_parallel_checkpoint(
+    metadata = rank_local_topology_metadata(parallel)
+    metadata.update(kind="draft", global_rank=int(global_rank))
+    save_rank_local_model_state(
+        model,
+        rank_local_state_path(
+            checkpoint_dir,
+            prefix="model",
+            global_rank=global_rank,
+        ),
+        metadata=metadata,
+    )
+    dist.barrier()
+    if is_global_main_process():
+        draft_model.config.save_pretrained(checkpoint_dir)
+        manifest = {
+            "format": RANK_LOCAL_STATE_FORMAT,
+            "world_size": int(world_size),
+            **rank_local_topology_metadata(parallel),
+            "files": [
+                f"model.rank{rank:05d}.pt" for rank in range(int(world_size))
+            ],
+        }
+        with open(
+            os.path.join(checkpoint_dir, RANK_LOCAL_MANIFEST),
+            "w",
+            encoding="utf-8",
+        ) as handle:
+            json.dump(manifest, handle, indent=2)
+    dist.barrier()
+
+
+def _save_model_checkpoint(
+    *,
+    model,
+    draft_model,
+    checkpoint_dir: str,
+    parallel=None,
+    global_rank: int = 0,
+    world_size: int = 1,
+):
+    if parallel is not None:
+        _save_rank_local_checkpoint(
             model=model,
             draft_model=draft_model,
             checkpoint_dir=checkpoint_dir,
             parallel=parallel,
+            global_rank=global_rank,
+            world_size=world_size,
         )
         return
 

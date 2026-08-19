@@ -190,21 +190,10 @@ def _test_draft_forward_backward(topology):
     parallel_experts = parallel.layers[0].mlp.experts
     reference_experts = reference.layers[0].mlp.experts
     assert parallel_experts._deepspec_expert_dispatch == "all_to_all"
+    assert parallel_experts._deepspec_pure_expert_parallel
     expected_gate_up = reference_experts.gate_up_proj.grad.chunk(
         topology.expert_parallel_size, dim=0
     )[topology.expert_parallel_rank]
-    gate_half, up_half = expected_gate_up.chunk(2, dim=1)
-    expected_gate_up = torch.cat(
-        [
-            gate_half.chunk(topology.tensor_parallel_size, dim=1)[
-                topology.tensor_parallel_rank
-            ],
-            up_half.chunk(topology.tensor_parallel_size, dim=1)[
-                topology.tensor_parallel_rank
-            ],
-        ],
-        dim=1,
-    )
     torch.testing.assert_close(
         parallel_experts.gate_up_proj.grad,
         expected_gate_up,
@@ -213,9 +202,7 @@ def _test_draft_forward_backward(topology):
     )
     expected_down = reference_experts.down_proj.grad.chunk(
         topology.expert_parallel_size, dim=0
-    )[topology.expert_parallel_rank].chunk(
-        topology.tensor_parallel_size, dim=2
-    )[topology.tensor_parallel_rank]
+    )[topology.expert_parallel_rank]
     torch.testing.assert_close(
         parallel_experts.down_proj.grad,
         expected_down,

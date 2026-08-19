@@ -9,6 +9,11 @@ from torch.utils.data import Sampler
 
 
 def init_dist(local_rank: int, timeout_minutes: int = 60):
+    timeout_minutes = int(
+        os.environ.get("DEEPSPEC_DIST_TIMEOUT_MINUTES", timeout_minutes)
+    )
+    if timeout_minutes < 1:
+        raise ValueError("DEEPSPEC_DIST_TIMEOUT_MINUTES must be positive.")
     local_world_size = torch.cuda.device_count()
     node_rank = int(os.environ.get("RANK", "0"))
     node_world_size = int(os.environ.get("WORLD_SIZE", "1"))
