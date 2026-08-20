@@ -1,6 +1,7 @@
 import json
 import math
 import os
+import time
 from contextlib import nullcontext
 
 import torch
@@ -51,6 +52,23 @@ _PRECISION_DTYPES = {
     "fp16": torch.float16,
     "fp32": torch.float32,
 }
+
+
+def _debug_progress(message):
+    if os.environ.get("DEEPSPEC_DEBUG_PROGRESS", "false").lower() not in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        return
+    rank = os.environ.get("RANK", "?")
+    local_rank = os.environ.get("LOCAL_RANK", "?")
+    print(
+        time.strftime("%Y-%m-%d %H:%M:%S"),
+        f"[rank={rank} local_rank={local_rank}] {message}",
+        flush=True,
+    )
 
 _SHARDING_STRATEGIES = {
     "full_shard": ShardingStrategy.FULL_SHARD,
@@ -521,6 +539,20 @@ class BaseTrainer:
             collator_cls = self.data_collator_cls or CacheCollator
             self.data_collator = collator_cls()
 
+        self.length_bucket_size = int(
+            self.args.data.get("length_bucket_size", 0) or 0
+        )
+        if self.length_bucket_size < 0:
+            raise ValueError("data.length_bucket_size must be non-negative.")
+        self.length_fn = None
+        if self.length_bucket_size:
+            self.length_fn = getattr(self.train_dataset, "get_length_hint", None)
+            if self.length_fn is None:
+                raise ValueError(
+                    "data.length_bucket_size requires a dataset with "
+                    "get_length_hint(index)."
+                )
+
         (
             self.gradient_accumulation_steps,
             self.samples_per_epoch,
@@ -599,6 +631,14 @@ class BaseTrainer:
         print_on_local_main(
             "  Gradient accumulation steps = "
             f"{self.gradient_accumulation_steps}"
+        )
+        print_on_local_main(
+            "  Length-grouped sampling = "
+            + (
+                f"enabled (window {self.length_bucket_size} global samples)"
+                if self.length_bucket_size
+                else "disabled"
+            )
         )
         print_on_local_main(f"  Steps per epoch = {self.steps_per_epoch}")
         print_on_local_main(f"  Max train steps = {self.max_train_steps}")
@@ -718,6 +758,8 @@ class BaseTrainer:
             total_size=self.samples_per_epoch,
             start_global_offset_samples=start_offset_samples,
             num_samples=num_samples,
+            length_fn=self.length_fn,
+            length_bucket_size=self.length_bucket_size,
         )
         num_workers = int(self.args.data.num_workers)
         loader_kwargs = dict(
@@ -801,29 +843,53 @@ class BaseTrainer:
             start_offset_samples=self.next_micro_step * local_batch_size,
             num_samples=remaining_samples,
         )
+        _debug_progress(
+            "train: DataLoader constructed "
+            f"remaining_micro_steps={remaining_micro_steps} "
+            f"remaining_samples={remaining_samples} num_workers={self.args.data.num_workers}"
+        )
         prefetcher = CUDAPrefetcher(dataloader, self.device)
+        _debug_progress("train: CUDAPrefetcher constructed")
         training_logger.start_session(global_step=self.global_step)
+        _debug_progress(f"train: logger session started global_step={self.global_step}")
 
         with self.suspend_controller.monitoring():
             for batch in prefetcher:
+                _debug_progress(
+                    "train: received GPU batch "
+                    + ", ".join(
+                        f"{key}=shape{tuple(value.shape)} dtype={value.dtype}"
+                        for key, value in batch.items()
+                    )
+                )
                 should_sync = (
                     (self.next_micro_step + 1) % self.gradient_accumulation_steps == 0
                 )
                 sync_context = nullcontext() if should_sync else self.model.no_sync()
                 with sync_context:
+                    _debug_progress("train: run_batch start")
                     loss = self.run_batch(batch) / self.gradient_accumulation_steps
+                    _debug_progress(f"train: run_batch done loss={loss.detach().float().item()}")
+                    _debug_progress("train: backward start")
                     loss.backward()
+                    _debug_progress("train: backward done")
                 self.next_micro_step += 1
 
                 if not should_sync:
                     continue
 
+                _debug_progress("train: synchronize pure expert gradients start")
                 self._synchronize_pure_expert_gradients()
+                _debug_progress("train: synchronize pure expert gradients done")
+                _debug_progress("train: clip_grad_norm start")
                 grad_norm = FSDP.clip_grad_norm_(
                     self.model,
                     float(self.args.train.max_grad_norm),
                 )
+                _debug_progress(f"train: clip_grad_norm done grad_norm={grad_norm.item()}")
+                _debug_progress("train: optimizer step start")
                 self.optimizer.step()
+                _debug_progress("train: optimizer step done")
                 training_logger.on_optimizer_step(
                     global_step=self.global_step,
                     next_micro_step=self.next_micro_step,
@@ -842,7 +908,7 @@ class BaseTrainer:
 
         self.save_and_eval_checkpoint()
 
-    def clean_up(self):
+    def clean_up(self, *, synchronize: bool = True):
         if self.online_target is not None:
             self.online_target.close()
             self.online_target = None
@@ -850,5 +916,6 @@ class BaseTrainer:
         if close_dataset is not None:
             close_dataset()
         training_logger.close()
-        dist.barrier()
+        if synchronize:
+            dist.barrier()
         dist.destroy_process_group()

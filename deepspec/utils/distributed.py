@@ -76,6 +76,13 @@ class StatelessResumableDistributedSampler(Sampler):
     When ``num_samples`` is *None* (default) the sampler yields the remaining
     samples in the current epoch — this preserves backward compatibility with
     code that rebuilds the dataloader at every epoch boundary.
+
+    When ``length_bucket_size`` is positive, every global window of that many
+    samples is sorted by ``length_fn`` and split into one sample per replica.
+    The resulting replica-sized groups and their rank assignments are shuffled
+    deterministically.  This keeps epoch-level randomness while ensuring that
+    ranks which synchronize during one micro-step receive similarly sized
+    samples instead of all waiting for an unrelated long-sequence straggler.
     """
 
     def __init__(
@@ -87,6 +94,8 @@ class StatelessResumableDistributedSampler(Sampler):
         seed: int = 42,
         start_global_offset_samples: int = 0,
         num_samples: int | None = None,
+        length_fn=None,
+        length_bucket_size: int = 0,
     ):
         assert start_global_offset_samples >= 0, "start_global_offset_samples must be >= 0"
         self.dataset = dataset
@@ -105,6 +114,22 @@ class StatelessResumableDistributedSampler(Sampler):
         )
         assert num_samples is None or num_samples >= 0, "num_samples must be >= 0"
 
+        self.length_fn = length_fn
+        self.length_bucket_size = int(length_bucket_size or 0)
+        assert self.length_bucket_size >= 0, "length_bucket_size must be >= 0"
+        if self.length_bucket_size:
+            assert callable(self.length_fn), (
+                "length_fn must be callable when length_bucket_size is enabled"
+            )
+            assert self.length_bucket_size >= self.num_replicas, (
+                "length_bucket_size must be at least num_replicas: "
+                f"{self.length_bucket_size} < {self.num_replicas}"
+            )
+            assert self.length_bucket_size % self.num_replicas == 0, (
+                "length_bucket_size must be divisible by num_replicas: "
+                f"{self.length_bucket_size} % {self.num_replicas} != 0"
+            )
+
         self.per_rank_len_per_epoch = self.total_size // self.num_replicas
         self._global_offset = int(start_global_offset_samples)
         self._num_samples = num_samples
@@ -118,7 +143,36 @@ class StatelessResumableDistributedSampler(Sampler):
     def _epoch_perm(self, epoch_idx: int):
         g = torch.Generator()
         g.manual_seed(self.seed + epoch_idx)
-        return torch.randperm(self.dataset_size, generator=g).tolist()[: self.total_size]
+        perm = torch.randperm(self.dataset_size, generator=g).tolist()[: self.total_size]
+        if not self.length_bucket_size:
+            return perm
+        return self._group_by_length(perm, generator=g)
+
+    def _group_by_length(self, perm, *, generator):
+        grouped_perm = []
+        for bucket_start in range(0, len(perm), self.length_bucket_size):
+            bucket = perm[bucket_start : bucket_start + self.length_bucket_size]
+            assert len(bucket) % self.num_replicas == 0
+            bucket.sort(key=self.length_fn)
+            groups = [
+                bucket[start : start + self.num_replicas]
+                for start in range(0, len(bucket), self.num_replicas)
+            ]
+
+            # Shuffle group order to avoid a short-to-long curriculum.  Shuffle
+            # rank assignment independently so no replica systematically gets
+            # the shortest or longest item in every group.
+            group_order = torch.randperm(len(groups), generator=generator).tolist()
+            rank_orders = torch.rand(
+                (len(groups), self.num_replicas), generator=generator
+            ).argsort(dim=1)
+            for group_idx in group_order:
+                group = groups[group_idx]
+                grouped_perm.extend(
+                    group[rank_idx]
+                    for rank_idx in rank_orders[group_idx].tolist()
+                )
+        return grouped_perm
 
     def _epoch_slice_for_rank(self, perm):
         return perm[self.rank : self.total_size : self.num_replicas]

@@ -60,8 +60,14 @@ def _worker(rank: int, world_size: int, rendezvous: str):
         hc_sinkhorn_iters=2,
     )
     model = DeepseekV4Model(config).eval()
-    input_ids = torch.arange(17).view(1, -1) % config.vocab_size
-    attention_mask = torch.ones_like(input_ids)
+    valid_sequence_length = 17
+    padded_sequence_length = 128 * world_size
+    input_ids = torch.zeros((1, padded_sequence_length), dtype=torch.long)
+    input_ids[:, :valid_sequence_length] = (
+        torch.arange(valid_sequence_length).view(1, -1) % config.vocab_size
+    )
+    attention_mask = torch.zeros_like(input_ids)
+    attention_mask[:, :valid_sequence_length] = 1
     captured = {}
     handles = []
     for layer_idx, layer in enumerate(model.layers):
@@ -95,25 +101,31 @@ def _worker(rank: int, world_size: int, rendezvous: str):
             device=torch.device("cpu"),
         )
     start = result.context_start
-    expected = reference[:, start : start + result.target_last_hidden_states.shape[1]]
-    torch.testing.assert_close(
-        result.target_last_hidden_states,
-        expected,
-        rtol=2.0e-4,
-        atol=2.0e-4,
+    local_length = 128
+    valid_local_length = max(
+        min(valid_sequence_length, start + local_length) - start,
+        0,
     )
-    local_length = 9 if rank == 0 else 8
+    if valid_local_length:
+        expected = reference[:, start : start + valid_local_length]
+        torch.testing.assert_close(
+            result.target_last_hidden_states[:, :valid_local_length],
+            expected,
+            rtol=2.0e-4,
+            atol=2.0e-4,
+        )
     assert result.target_hidden_states.shape == (
         1,
         local_length,
         3 * config.hidden_size,
     )
-    torch.testing.assert_close(
-        result.target_hidden_states,
-        reference_hidden[:, start : start + local_length],
-        rtol=2.0e-4,
-        atol=2.0e-4,
-    )
+    if valid_local_length:
+        torch.testing.assert_close(
+            result.target_hidden_states[:, :valid_local_length],
+            reference_hidden[:, start : start + valid_local_length],
+            rtol=2.0e-4,
+            atol=2.0e-4,
+        )
 
     from deepspec.modeling.dspark.deepseek_v4.modeling import (
         DeepseekV4DSparkModel,

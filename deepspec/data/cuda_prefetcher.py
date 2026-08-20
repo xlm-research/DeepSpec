@@ -1,6 +1,25 @@
+import os
+import time
 from threading import Thread
 
 import torch
+
+
+def _debug_progress(message):
+    if os.environ.get("DEEPSPEC_DEBUG_PROGRESS", "false").lower() not in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        return
+    rank = os.environ.get("RANK", "?")
+    local_rank = os.environ.get("LOCAL_RANK", "?")
+    print(
+        time.strftime("%Y-%m-%d %H:%M:%S"),
+        f"[rank={rank} local_rank={local_rank}] {message}",
+        flush=True,
+    )
 
 
 def move_batch_to_device(batch, device):
@@ -30,22 +49,36 @@ class CUDAPrefetcher:
         self._gpu_batch = None
         self._thread = None
         # First batch: fetch synchronously so __next__ has something to return.
+        _debug_progress("prefetcher: begin synchronous first DataLoader fetch")
         self._fetch_and_transfer()
+        if not self._done:
+            _debug_progress("prefetcher: first batch fetched and H2D queued")
         return self
 
     def _fetch_and_transfer(self):
         """Pop the next CPU batch from the DataLoader and queue H2D on the side stream."""
         try:
+            _debug_progress("prefetcher: waiting for next CPU batch")
             cpu_batch = next(self._iter)
         except StopIteration:
             self._done = True
+            _debug_progress("prefetcher: DataLoader exhausted")
             return
+        _debug_progress(
+            "prefetcher: CPU batch ready "
+            + ", ".join(
+                f"{key}=shape{tuple(value.shape)} dtype={value.dtype}"
+                for key, value in cpu_batch.items()
+            )
+        )
         with torch.cuda.stream(self.stream):
             self._gpu_batch = move_batch_to_device(cpu_batch, self.device)
+        _debug_progress("prefetcher: H2D transfer enqueued")
 
     def __next__(self):
         # Join the background thread kicked off in the previous __next__.
         if self._thread is not None:
+            _debug_progress("prefetcher: waiting for background fetch thread")
             self._thread.join()
             self._thread = None
 
@@ -56,6 +89,7 @@ class CUDAPrefetcher:
         current = torch.cuda.current_stream(self.device)
         current.wait_stream(self.stream)
         batch = self._gpu_batch
+        _debug_progress("prefetcher: yielding GPU batch to training loop")
 
         # Prevent the caching allocator from recycling these tensors before
         # the compute stream is done with them.
@@ -66,6 +100,7 @@ class CUDAPrefetcher:
         # overlaps with compute on the batch we are about to return.
         self._thread = Thread(target=self._fetch_and_transfer, daemon=True)
         self._thread.start()
+        _debug_progress("prefetcher: started background fetch for next batch")
 
         return batch
 

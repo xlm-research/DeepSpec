@@ -12,6 +12,7 @@ import os
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from accelerate import init_empty_weights
 from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -38,6 +39,20 @@ from deepspec.utils.rank_local_state import (
 
 from .common import TargetForwardResult
 from .deepseek_v4_cp import install_target_context_parallel
+
+
+_DEEPSEEK_V4_CP_SHARD_ALIGNMENT = 128
+
+
+def _context_parallel_padded_length(sequence_length: int, cp_size: int) -> int:
+    sequence_length = int(sequence_length)
+    cp_size = int(cp_size)
+    if sequence_length < 1:
+        raise ValueError("sequence_length must be positive.")
+    if cp_size < 1:
+        raise ValueError("context_parallel_size must be positive.")
+    alignment = _DEEPSEEK_V4_CP_SHARD_ALIGNMENT * cp_size
+    return ((sequence_length + alignment - 1) // alignment) * alignment
 
 
 def _get_target_backbone(target_model):
@@ -133,10 +148,41 @@ def _dequantizing_config(target_config):
     return FineGrainedFP8Config(**quantization_config)
 
 
-def _normalize_target_parameter_dtype(target_model) -> None:
+def _normalize_target_tensor_dtypes(target_model) -> None:
+    """Mirror the source loader's dtype policy for rank-local target state.
+
+    Parameters are intentionally normalized to BF16 for the frozen FSDP target,
+    while numerically sensitive persistent buffers follow the model's strict-FP32
+    policy used by ``from_pretrained``.
+    """
+
     for parameter in target_model.parameters():
         if parameter.is_floating_point() and parameter.dtype != torch.bfloat16:
             parameter.data = parameter.data.to(dtype=torch.bfloat16)
+
+    strict_fp32_patterns = getattr(
+        target_model,
+        "_keep_in_fp32_modules_strict",
+        (),
+    ) or ()
+    for name, buffer in target_model.named_buffers():
+        if (
+            buffer.is_floating_point()
+            and any(
+                str(pattern) in name for pattern in strict_fp32_patterns
+            )
+            and buffer.dtype != torch.float32
+        ):
+            buffer.data = buffer.data.to(dtype=torch.float32)
+
+
+def _build_rank_local_cache_model(target_config):
+    """Build a meta model whose tensor dtypes match the cached source model."""
+
+    with init_empty_weights(include_buffers=True):
+        model = AutoModel.from_config(target_config)
+    _normalize_target_tensor_dtypes(model)
+    return model
 
 
 def _build_rank_local_ep_target_model(
@@ -182,7 +228,7 @@ def _build_rank_local_ep_target_model(
         )
 
     model = AutoModel.from_pretrained(model_name_or_path, **load_kwargs)
-    _normalize_target_parameter_dtype(model)
+    _normalize_target_tensor_dtypes(model)
 
     if ep_size > 1:
         expected_local_experts = int(target_config.n_routed_experts) // ep_size
@@ -313,6 +359,19 @@ def _wrap_target_model_with_fsdp(
 def _run_target_forward_context_parallel(
     *, target_model, model_inputs, target_layer_ids, topology, device
 ):
+    padded_sequence_length = int(model_inputs["input_ids"].shape[1])
+    if model_inputs["attention_mask"].shape != model_inputs["input_ids"].shape:
+        raise ValueError("Online target input IDs and attention mask must align.")
+    expected_padded_length = _context_parallel_padded_length(
+        int(model_inputs["attention_mask"].sum(dim=1)[0].item()),
+        int(topology.context_parallel_size),
+    )
+    if padded_sequence_length != expected_padded_length:
+        raise ValueError(
+            "Online target CP input must be right-padded to a multiple of "
+            f"{_DEEPSEEK_V4_CP_SHARD_ALIGNMENT} * CP: expected "
+            f"{expected_padded_length}, got {padded_sequence_length}."
+        )
     cp_forward = getattr(target_model, "forward_context_parallel", None)
     if cp_forward is None:
         raise NotImplementedError(
@@ -334,9 +393,8 @@ def _run_target_forward_context_parallel(
             "forward_context_parallel() must return TargetForwardResult, got "
             f"{type(result)!r}."
         )
-    sequence_length = int(model_inputs["attention_mask"].sum(dim=1)[0].item())
     expected_start, expected_end = compute_context_parallel_range(
-        sequence_length=sequence_length,
+        sequence_length=padded_sequence_length,
         context_parallel_rank=topology.context_parallel_rank,
         context_parallel_size=topology.context_parallel_size,
     )
@@ -408,9 +466,7 @@ class DeepseekV4OnlineTarget:
         )
         cache_exists = os.path.isfile(cache_path)
         if cache_exists:
-            with init_empty_weights(include_buffers=True):
-                model = AutoModel.from_config(target_config)
-            model = model.to(dtype=torch.bfloat16)
+            model = _build_rank_local_cache_model(target_config)
         else:
             model = _build_rank_local_ep_target_model(
                 model_name_or_path=self.model_name_or_path,
@@ -459,9 +515,31 @@ class DeepseekV4OnlineTarget:
             attention_mask[0, sequence_length:].any()
         ):
             raise ValueError("Online target requires a right-padded attention mask.")
+        input_ids = batch["input_ids"][:, :sequence_length]
+        model_attention_mask = attention_mask[:, :sequence_length]
+        loss_mask = batch["loss_mask"][:, :sequence_length]
+        padded_sequence_length = sequence_length
+        if int(self.topology.context_parallel_size) > 1:
+            padded_sequence_length = _context_parallel_padded_length(
+                sequence_length,
+                int(self.topology.context_parallel_size),
+            )
+            padding = padded_sequence_length - sequence_length
+            pad_token_id = getattr(
+                getattr(self.model, "config", None), "pad_token_id", 0
+            )
+            if pad_token_id is None:
+                pad_token_id = 0
+            input_ids = F.pad(
+                input_ids, (0, padding), value=int(pad_token_id)
+            )
+            model_attention_mask = F.pad(
+                model_attention_mask, (0, padding), value=0
+            )
+            loss_mask = F.pad(loss_mask, (0, padding), value=0)
         model_inputs = {
-            "input_ids": batch["input_ids"][:, :sequence_length],
-            "attention_mask": attention_mask[:, :sequence_length],
+            "input_ids": input_ids,
+            "attention_mask": model_attention_mask,
         }
         with torch.no_grad():
             if self.topology.context_parallel_size > 1:
@@ -492,12 +570,12 @@ class DeepseekV4OnlineTarget:
 
         return {
             "input_ids": model_inputs["input_ids"],
-            "loss_mask": batch["loss_mask"][:, :sequence_length],
+            "loss_mask": loss_mask,
             "target_hidden_states": result.target_hidden_states,
             "target_last_hidden_states": result.target_last_hidden_states,
             "context_start": metadata(context_start),
             "context_len": metadata(context_len),
-            "seq_len": metadata(sequence_length),
+            "seq_len": metadata(padded_sequence_length),
         }
 
     def close(self) -> None:

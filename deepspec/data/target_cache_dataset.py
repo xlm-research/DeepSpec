@@ -7,6 +7,7 @@ import queue
 import shutil
 import struct
 import threading
+import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Dict, List
@@ -15,6 +16,23 @@ import numpy as np
 import torch
 
 from deepspec.data.parser import preprocess_record
+
+
+def _debug_progress(message):
+    if os.environ.get("DEEPSPEC_DEBUG_PROGRESS", "false").lower() not in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        return
+    rank = os.environ.get("RANK", "?")
+    local_rank = os.environ.get("LOCAL_RANK", "?")
+    print(
+        time.strftime("%Y-%m-%d %H:%M:%S"),
+        f"[rank={rank} local_rank={local_rank}] {message}",
+        flush=True,
+    )
 
 
 TARGET_CACHE_VERSION = 3
@@ -795,6 +813,13 @@ class CacheDataset(torch.utils.data.Dataset):
     def __len__(self):
         return self.num_samples
 
+    def get_length_hint(self, index: int):
+        """Return the cached sequence length without reading tensor payloads."""
+
+        if not (0 <= int(index) < self.num_samples):
+            raise IndexError(index)
+        return int(self._read_record(int(index))["seq_len"])
+
     def close(self):
         for shard_mmap in getattr(self, "shard_mmaps", {}).values():
             shard_mmap.close()
@@ -1003,24 +1028,44 @@ class ConversationCollator:
         self.min_loss_tokens = int(min_loss_tokens)
 
     def _process_feature(self, item):
+        _debug_progress("collator: preprocess_record start")
         processed = preprocess_record(
             record=item,
             tokenizer=self.tokenizer,
             chat_template=self.chat_template,
             max_length=self.max_length,
         )
-        if int(processed["loss_mask"].sum().item()) < self.min_loss_tokens:
+        loss_tokens = int(processed["loss_mask"].sum().item())
+        _debug_progress(
+            "collator: preprocess_record done "
+            f"seq_len={processed['input_ids'].shape[0]} loss_tokens={loss_tokens}"
+        )
+        if loss_tokens < self.min_loss_tokens:
+            _debug_progress(
+                "collator: dropping sample with too few loss tokens "
+                f"loss_tokens={loss_tokens} min_loss_tokens={self.min_loss_tokens}"
+            )
             return None
         return processed
 
     def __call__(self, features: List[Dict]):
+        _debug_progress(f"collator: received {len(features)} raw feature(s)")
         features = [self._process_feature(item) for item in features]
         features = [item for item in features if item is not None]
+        _debug_progress(f"collator: kept {len(features)} feature(s) after filtering")
         if not features:
+            _debug_progress("collator: returning None because all features were filtered")
             return None
         batch = {}
         for key in ("input_ids", "attention_mask", "loss_mask"):
             batch[key] = _pad_1d_batch(features, key)
+        _debug_progress(
+            "collator: built CPU batch "
+            + ", ".join(
+                f"{key}=shape{tuple(value.shape)} dtype={value.dtype}"
+                for key, value in batch.items()
+            )
+        )
         return batch
 
 
