@@ -10,7 +10,7 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import MixedPrecision, ShardingStrategy
 from torch.distributed.fsdp.wrap import ModuleWrapPolicy
 from torch.utils.data import DataLoader
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoTokenizer
 
 import deepspec.utils.training_logger as training_logger
 from deepspec.data import (
@@ -25,6 +25,10 @@ from deepspec.modeling.pure_ep import (
     get_pure_expert_modules,
     materialize_modules_locally,
     synchronize_module_gradients,
+)
+from deepspec.modeling.target_adapter import (
+    get_target_embeddings,
+    load_target_model_with_head,
 )
 from deepspec.trainer.ckpt_manager import (
     discover_latest_checkpoint,
@@ -670,13 +674,13 @@ class BaseTrainer:
                 model_args.target_model_name_or_path
             )
         else:
-            target_model = AutoModelForCausalLM.from_pretrained(
+            target_model = load_target_model_with_head(
                 model_args.target_model_name_or_path,
                 dtype=self.precision_dtype,
             ).to(device="cpu").eval()
-            target_embed_tokens = target_model.get_input_embeddings()
-            target_lm_head = target_model.get_output_embeddings()
-            assert (target_lm_head is not None) and (target_embed_tokens is not None)
+            target_embed_tokens, target_lm_head = get_target_embeddings(
+                target_model
+            )
             draft_model.initialize_embeddings_and_head(
                 embed_tokens=target_embed_tokens,
                 lm_head=target_lm_head,

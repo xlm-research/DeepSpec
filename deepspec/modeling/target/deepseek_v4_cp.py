@@ -832,6 +832,7 @@ def install_deepseek_v4_ring_context_parallel(target_model):
     target_model.forward_context_parallel = MethodType(
         _deepseek_v4_forward_context_parallel, target_model
     )
+    target_model._deepspec_context_layout = "contiguous"
     target_model._deepspec_ring_cp_installed = True
     return target_model
 
@@ -840,6 +841,10 @@ def install_target_context_parallel(target_model):
     model_type = str(target_model.config.model_type)
     if model_type == "deepseek_v4":
         return install_deepseek_v4_ring_context_parallel(target_model)
+    if model_type.lower() in ("qwen3_5", "qwen3_5_text"):
+        from .qwen3_6_cp import install_qwen3_6_ring_context_parallel
+
+        return install_qwen3_6_ring_context_parallel(target_model)
     raise NotImplementedError(
         f"No model-native target Context Parallel adapter for {model_type!r}."
     )

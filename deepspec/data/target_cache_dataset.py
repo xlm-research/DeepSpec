@@ -8,6 +8,7 @@ import shutil
 import struct
 import threading
 import time
+import warnings
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Dict, List
@@ -15,7 +16,12 @@ from typing import Dict, List
 import numpy as np
 import torch
 
-from deepspec.data.parser import preprocess_record
+from deepspec.data.parser import (
+    MultimodalTruncationError,
+    normalize_media_uri_map,
+    preprocess_multimodal_record,
+    preprocess_record,
+)
 
 
 def _debug_progress(message):
@@ -225,9 +231,10 @@ def validate_target_cache_manifest(*, cache_dir: str, manifest):
         "cache_context_parallel_size must be positive, got "
         f"{cache_cp_size}."
     )
-    assert manifest["context_layout"] == "contiguous", (
-        "Only contiguous ring-CP cache shards are supported, got "
-        f"{manifest['context_layout']!r}."
+    context_layout = str(manifest["context_layout"])
+    assert context_layout in ("contiguous", "native_head_tail"), (
+        "Unsupported target-cache context layout: "
+        f"{context_layout!r}."
     )
     index_files = [str(file_name) for file_name in manifest["index_files"]]
     assert len(index_files) == cache_cp_size, (
@@ -267,6 +274,16 @@ def validate_train_cache(*, train_dataset, draft_model, target_model_name_or_pat
         "Target cache target_model_name_or_path does not match training config: "
         f"{cache_target_model_name} != {target_model_name_or_path}"
     )
+    expected_layout = getattr(
+        draft_model.config,
+        "target_context_layout",
+        None,
+    )
+    if expected_layout is not None and train_dataset.context_parallel_size > 1:
+        assert str(manifest["context_layout"]) == str(expected_layout), (
+            "Target cache context_layout does not match the draft model: "
+            f"{manifest['context_layout']!r} != {expected_layout!r}."
+        )
 
 
 def _tensor_to_bytes(tensor: torch.Tensor, dtype: torch.dtype):
@@ -339,6 +356,7 @@ def build_target_cache_sample_bytes(
     *,
     sample_id: int,
     context_start: int,
+    context_layout: str = "contiguous",
     input_ids: torch.Tensor,
     attention_mask: torch.Tensor,
     loss_mask: torch.Tensor,
@@ -348,6 +366,9 @@ def build_target_cache_sample_bytes(
     seq_len = int(input_ids.shape[0])
     context_start = int(context_start)
     context_len = int(target_hidden_states.shape[0])
+    context_layout = str(context_layout)
+    if context_layout not in ("contiguous", "native_head_tail"):
+        raise ValueError(f"Unsupported context layout: {context_layout!r}.")
     if int(target_last_hidden_states.shape[0]) != context_len:
         raise ValueError(
             "Target hidden tensors must have the same local context length: "
@@ -359,10 +380,17 @@ def build_target_cache_sample_bytes(
             "A cache context shard must have a non-negative start and positive "
             f"length, got start={context_start}, length={context_len}."
         )
-    if context_start + context_len > seq_len:
+    if context_layout == "contiguous" and context_start + context_len > seq_len:
         raise ValueError(
             "A cache context shard extends beyond the source sequence: "
             f"{context_start} + {context_len} > {seq_len}."
+        )
+    if context_layout == "native_head_tail" and (
+        context_start != 0 or context_len % 2 != 0
+    ):
+        raise ValueError(
+            "Native head/tail cache shards use context_start=0 and an even "
+            f"local length, got start={context_start}, length={context_len}."
         )
     return TargetCacheSampleBytes(
         sample_id=int(sample_id),
@@ -380,7 +408,13 @@ def build_target_cache_sample_bytes(
 
 
 class LocalTargetCacheWriter:
-    def __init__(self, *, rank_dir: str, max_shard_bytes: int):
+    def __init__(
+        self,
+        *,
+        rank_dir: str,
+        max_shard_bytes: int,
+        context_layout: str = "contiguous",
+    ):
         self.rank_dir = rank_dir
         self.max_shard_bytes = int(max_shard_bytes)
         self.local_index_path = os.path.join(rank_dir, "samples.local.idx")
@@ -390,6 +424,7 @@ class LocalTargetCacheWriter:
         self.current_shard_size = 0
         self.local_shard_files = []
         self.num_local_samples = 0
+        self.context_layout = str(context_layout)
 
     def close(self):
         if self.current_shard_handle is not None:
@@ -479,6 +514,7 @@ class LocalTargetCacheWriter:
         sample = build_target_cache_sample_bytes(
             sample_id=sample_id,
             context_start=context_start,
+            context_layout=self.context_layout,
             input_ids=input_ids,
             attention_mask=attention_mask,
             loss_mask=loss_mask,
@@ -495,10 +531,12 @@ class AsyncTargetCacheWriter:
         rank_dir: str,
         max_shard_bytes: int,
         max_queue_size: int = 128,
+        context_layout: str = "contiguous",
     ):
         self.writer = LocalTargetCacheWriter(
             rank_dir=rank_dir,
             max_shard_bytes=max_shard_bytes,
+            context_layout=context_layout,
         )
         # Queue CPU byte records only; never hold CUDA tensor references here.
         self.queue = queue.Queue(maxsize=int(max_queue_size))
@@ -561,6 +599,7 @@ class AsyncTargetCacheWriter:
         sample = build_target_cache_sample_bytes(
             sample_id=self.num_local_samples,
             context_start=context_start,
+            context_layout=self.writer.context_layout,
             input_ids=input_ids,
             attention_mask=attention_mask,
             loss_mask=loss_mask,
@@ -625,7 +664,12 @@ def rename_local_target_cache_shards(*, output_dir: str, rank_dir: str, summary,
 
 
 def finalize_target_cache_indices(
-    *, output_dir: str, summaries, shard_map, context_parallel_size: int
+    *,
+    output_dir: str,
+    summaries,
+    shard_map,
+    context_parallel_size: int,
+    context_layout: str = "contiguous",
 ):
     """Build one dense logical-sample index for every cached CP rank."""
 
@@ -693,6 +737,9 @@ def finalize_target_cache_indices(
             f"{sample_counts}."
         )
     num_samples = sample_counts[0]
+    context_layout = str(context_layout)
+    if context_layout not in ("contiguous", "native_head_tail"):
+        raise ValueError(f"Unsupported context layout: {context_layout!r}.")
     for sample_id in range(num_samples):
         seq_lens = [records[sample_id][0] for records in per_cp_records]
         if len(set(seq_lens)) != 1:
@@ -700,22 +747,44 @@ def finalize_target_cache_indices(
                 f"CP cache sample {sample_id} has inconsistent sequence "
                 f"lengths: {seq_lens}."
             )
-        intervals = sorted(
-            (records[sample_id][1], records[sample_id][2])
-            for records in per_cp_records
-        )
-        next_start = 0
-        for context_start, context_len in intervals:
-            if context_start != next_start:
+        if context_layout == "contiguous":
+            intervals = sorted(
+                (records[sample_id][1], records[sample_id][2])
+                for records in per_cp_records
+            )
+            next_start = 0
+            for context_start, context_len in intervals:
+                if context_start != next_start:
+                    raise RuntimeError(
+                        f"CP cache sample {sample_id} has a gap or overlap at "
+                        f"token {next_start}: intervals={intervals}."
+                    )
+                next_start += context_len
+            if next_start != seq_lens[0]:
                 raise RuntimeError(
-                    f"CP cache sample {sample_id} has a gap or overlap at "
-                    f"token {next_start}: intervals={intervals}."
+                    f"CP cache sample {sample_id} covers {next_start} tokens but "
+                    f"the sequence contains {seq_lens[0]}."
                 )
-            next_start += context_len
-        if next_start != seq_lens[0]:
+            continue
+
+        starts = [records[sample_id][1] for records in per_cp_records]
+        local_lengths = [records[sample_id][2] for records in per_cp_records]
+        if any(start != 0 for start in starts):
             raise RuntimeError(
-                f"CP cache sample {sample_id} covers {next_start} tokens but "
-                f"the sequence contains {seq_lens[0]}."
+                f"Native head/tail sample {sample_id} must store zero context "
+                f"starts, got {starts}."
+            )
+        if len(set(local_lengths)) != 1 or local_lengths[0] % 2 != 0:
+            raise RuntimeError(
+                f"Native head/tail sample {sample_id} requires equal even local "
+                f"lengths, got {local_lengths}."
+            )
+        padded_length = local_lengths[0] * int(context_parallel_size)
+        padding = padded_length - seq_lens[0]
+        if padding < 0 or padding >= 2 * int(context_parallel_size):
+            raise RuntimeError(
+                f"Native head/tail sample {sample_id} has invalid padded "
+                f"length {padded_length} for sequence length {seq_lens[0]}."
             )
     return num_samples, index_files
 
@@ -788,9 +857,9 @@ class CacheDataset(torch.utils.data.Dataset):
                 "the target cache for the requested CP size."
             )
         self.context_layout = str(self.manifest["context_layout"])
-        if self.context_layout != "contiguous":
+        if self.context_layout not in ("contiguous", "native_head_tail"):
             raise ValueError(
-                "Training requires contiguous ring-CP cache shards, got "
+                "Training received an unsupported target-cache layout: "
                 f"{self.context_layout!r}."
             )
         self.index_path = os.path.join(
@@ -944,7 +1013,11 @@ class CacheDataset(torch.utils.data.Dataset):
             "Invalid context shard: "
             f"start={context_start}, length={context_len}."
         )
-        assert context_start + context_len <= seq_len
+        if self.context_layout == "contiguous":
+            assert context_start + context_len <= seq_len
+        else:
+            assert context_start == 0 and context_len % 2 == 0
+            assert context_len * self.context_parallel_size >= seq_len
         shard_mmap = self._get_shard_mmap(int(record["shard_id"]))
         nbytes = expected_target_cache_tensor_nbytes(
             seq_len=seq_len,
@@ -1066,6 +1139,127 @@ class ConversationCollator:
                 for key, value in batch.items()
             )
         )
+        return batch
+
+
+def _pad_multimodal_sequence_batch(
+    features: List[Dict],
+    key: str,
+    *,
+    padding_side: str,
+    padding_value: int,
+):
+    max_length = max(item[key].shape[0] for item in features)
+    batch_size = len(features)
+    dtype = features[0][key].dtype
+    trailing_shape = tuple(features[0][key].shape[1:])
+    if not all(tuple(item[key].shape[1:]) == trailing_shape for item in features):
+        raise ValueError(
+            f"Processor sequence field {key!r} has inconsistent trailing shapes."
+        )
+    out = torch.full(
+        (batch_size, max_length, *trailing_shape),
+        fill_value=padding_value,
+        dtype=dtype,
+    )
+    for index, item in enumerate(features):
+        seq_len = item[key].shape[0]
+        if padding_side == "left":
+            out[index, max_length - seq_len :] = item[key]
+        else:
+            out[index, :seq_len] = item[key]
+    return out
+
+
+class MultimodalConversationCollator:
+    """Collate processor tensors without flattening visual inputs."""
+
+    def __init__(
+        self,
+        processor,
+        chat_template,
+        max_length,
+        min_loss_tokens: int,
+        media_root=None,
+        media_uri_map=None,
+    ):
+        self.processor = processor
+        self.chat_template = chat_template
+        self.max_length = int(max_length)
+        self.min_loss_tokens = int(min_loss_tokens)
+        self.media_root = media_root
+        self.media_uri_map = normalize_media_uri_map(media_uri_map)
+        tokenizer = processor.tokenizer
+        self.padding_side = str(getattr(tokenizer, "padding_side", "right"))
+        if self.padding_side not in ("left", "right"):
+            raise ValueError(
+                f"Unsupported tokenizer padding_side: {self.padding_side}"
+            )
+        self.pad_token_id = getattr(tokenizer, "pad_token_id", None)
+        if self.pad_token_id is None:
+            self.pad_token_id = 0
+
+    def _process_feature(self, item):
+        try:
+            processed = preprocess_multimodal_record(
+                record=item,
+                processor=self.processor,
+                chat_template=self.chat_template,
+                max_length=self.max_length,
+                media_root=self.media_root,
+                media_uri_map=self.media_uri_map,
+            )
+        except MultimodalTruncationError as exc:
+            warnings.warn(
+                f"Skipping truncated multimodal sample: {exc}",
+                stacklevel=2,
+            )
+            return None
+        if int(processed["loss_mask"].sum().item()) < self.min_loss_tokens:
+            return None
+        return processed
+
+    def __call__(self, features: List[Dict]):
+        features = [self._process_feature(item) for item in features]
+        features = [item for item in features if item is not None]
+        if not features:
+            return None
+
+        batch = {}
+        all_keys = set().union(*(item.keys() for item in features))
+        for key in sorted(all_keys):
+            values = [item[key] for item in features if key in item]
+            if not values or not all(
+                isinstance(value, torch.Tensor) for value in values
+            ):
+                continue
+            is_sequence_field = len(values) == len(features) and all(
+                value.ndim >= 1
+                and value.shape[0] == item["input_ids"].shape[0]
+                for item, value in zip(features, values)
+            )
+            if is_sequence_field:
+                padding_value = self.pad_token_id if key == "input_ids" else 0
+                batch[key] = _pad_multimodal_sequence_batch(
+                    features,
+                    key,
+                    padding_side=self.padding_side,
+                    padding_value=padding_value,
+                )
+                continue
+            if any(value.ndim == 0 for value in values):
+                batch[key] = torch.stack(values)
+                continue
+            trailing_shape = tuple(values[0].shape[1:])
+            if not all(
+                tuple(value.shape[1:]) == trailing_shape for value in values
+            ):
+                raise ValueError(
+                    f"Cannot collate processor field {key!r} with shapes "
+                    f"{[tuple(value.shape) for value in values]}. Add a thin "
+                    "TargetModelAdapter for this model family."
+                )
+            batch[key] = torch.cat(values, dim=0)
         return batch
 
 

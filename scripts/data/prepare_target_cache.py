@@ -5,7 +5,11 @@ import os
 import torch
 import torch.distributed as dist
 from accelerate import init_empty_weights
-from deepspec.data import ConversationCollator
+from deepspec.data import (
+    ConversationCollator,
+    MultimodalConversationCollator,
+)
+from deepspec.data.parser import parse_media_uri_map_entries
 from deepspec.data.jsonl_dataset import JsonLineDataset
 from deepspec.data.target_cache_dataset import (
     AsyncTargetCacheWriter,
@@ -24,6 +28,12 @@ from deepspec.data.target_cache_dataset import (
 from deepspec.modeling.target import (
     TargetForwardResult,
     install_target_context_parallel,
+)
+from deepspec.modeling.target_adapter import (
+    get_final_norm,
+    get_language_backbone,
+    get_target_hidden_size,
+    is_multimodal_config,
 )
 from deepspec.modeling.deepseek_v4_parallel import (
     parallelize_deepseek_v4_model,
@@ -47,7 +57,13 @@ from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import MixedPrecision, ShardingStrategy
 from torch.utils.data import DataLoader, Subset
-from transformers import AutoConfig, AutoModel, AutoTokenizer, FineGrainedFP8Config
+from transformers import (
+    AutoConfig,
+    AutoModel,
+    AutoProcessor,
+    AutoTokenizer,
+    FineGrainedFP8Config,
+)
 
 os.environ["USE_TORCH"] = "true"
 os.environ["WANDB_DISABLED"] = "true"
@@ -58,23 +74,11 @@ torch.set_float32_matmul_precision("high")
 
 
 def _get_target_backbone(target_model):
-    model_type = str(target_model.config.model_type)
-    if model_type in ("gemma4", "gemma4_unified"):
-        if hasattr(target_model, "language_model"):
-            return target_model.language_model
-        if hasattr(target_model, "model") and hasattr(
-            target_model.model, "language_model"
-        ):
-            return target_model.model.language_model
-        assert False, "Gemma4 target model must expose a text language_model."
-    return getattr(target_model, "model", target_model)
+    return get_language_backbone(target_model)
 
 
 def _get_target_hidden_size(target_model) -> int:
-    model_type = str(target_model.config.model_type)
-    if model_type in ("gemma4", "gemma4_unified"):
-        return int(target_model.config.text_config.hidden_size)
-    return int(target_model.config.hidden_size)
+    return get_target_hidden_size(target_model)
 
 
 def _get_hook_tensor(output):
@@ -90,14 +94,15 @@ def _get_hook_tensor(output):
 def run_target_forward_with_hooks(
     *,
     target_model,
-    input_ids: torch.Tensor,
-    attention_mask: torch.Tensor,
+    model_inputs,
     target_layer_ids,
 ):
     backbone = _get_target_backbone(target_model)
     layer_modules = backbone.layers
+    final_norm = get_final_norm(target_model)
     target_layer_ids = [int(layer_id) for layer_id in target_layer_ids]
     captured_hidden_states = {}
+    captured_last_hidden_state = []
     handles = []
 
     def capture_layer(layer_id: int):
@@ -106,26 +111,53 @@ def run_target_forward_with_hooks(
 
         return hook
 
+    def capture_decoder_input(_module, inputs):
+        if not inputs:
+            raise ValueError("Decoder pre-hook did not receive hidden states.")
+        captured_hidden_states[-1] = _get_hook_tensor(inputs).detach()
+
+    def capture_last_hidden_state(_module, _inputs, output):
+        captured_last_hidden_state.append(_get_hook_tensor(output).detach())
+
     try:
         if -1 in target_layer_ids:
             handles.append(
-                backbone.embed_tokens.register_forward_hook(capture_layer(-1))
+                layer_modules[0].register_forward_pre_hook(capture_decoder_input)
             )
         for layer_id in target_layer_ids:
             if layer_id < 0:
                 continue
+            if layer_id >= len(layer_modules):
+                raise ValueError(
+                    f"target_layer_id {layer_id} is out of range for "
+                    f"{len(layer_modules)} decoder layers."
+                )
             handles.append(
                 layer_modules[layer_id].register_forward_hook(capture_layer(layer_id))
             )
+        handles.append(
+            final_norm.register_forward_hook(capture_last_hidden_state)
+        )
 
         with torch.no_grad():
             target_output = target_model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
+                **model_inputs,
                 output_hidden_states=False,
                 use_cache=False,
+                return_dict=True,
             )
-            target_last_hidden_states = target_output.last_hidden_state.detach()
+            target_last_hidden_states = (
+                captured_last_hidden_state[-1]
+                if captured_last_hidden_state
+                else target_output.last_hidden_state.detach()
+            )
+            missing = [
+                layer_id
+                for layer_id in target_layer_ids
+                if layer_id not in captured_hidden_states
+            ]
+            if missing:
+                raise RuntimeError(f"Failed to capture target layers: {missing}.")
             target_hidden_states = torch.cat(
                 [captured_hidden_states[layer_id] for layer_id in target_layer_ids],
                 dim=-1,
@@ -134,6 +166,7 @@ def run_target_forward_with_hooks(
         for handle in handles:
             handle.remove()
         captured_hidden_states.clear()
+        captured_last_hidden_state.clear()
 
     return TargetForwardResult(
         target_hidden_states=target_hidden_states,
@@ -187,6 +220,11 @@ def _build_fsdp_target_model(
             "dtype": torch.bfloat16,
             "low_cpu_mem_usage": True,
         }
+        if str(target_config.model_type).lower() in (
+            "qwen3_5",
+            "qwen3_5_text",
+        ):
+            load_kwargs["attn_implementation"] = "sdpa"
         if quantization_config is not None:
             load_kwargs["quantization_config"] = quantization_config
         target_model = AutoModel.from_pretrained(
@@ -197,10 +235,13 @@ def _build_fsdp_target_model(
         return target_model
 
     with init_empty_weights(include_buffers=True):
-        target_model = AutoModel.from_config(
-            target_config,
-            dtype=torch.bfloat16,
-        )
+        config_kwargs = {"dtype": torch.bfloat16}
+        if str(target_config.model_type).lower() in (
+            "qwen3_5",
+            "qwen3_5_text",
+        ):
+            config_kwargs["attn_implementation"] = "sdpa"
+        target_model = AutoModel.from_config(target_config, **config_kwargs)
     _normalize_target_parameter_dtype(target_model)
     return target_model
 
@@ -345,8 +386,8 @@ def _run_target_forward_context_parallel(
     """Dispatch to a model family's exact ring-context implementation.
 
     The parallel plumbing intentionally does not reconstruct the full sequence
-    or gather hidden states on a leader.  A model adapter must return only the
-    contiguous token shard owned by this CP rank.
+    or gather hidden states on a leader. A model adapter returns only the token
+    shard consumed by the matching draft CP rank.
     """
 
     cp_forward = getattr(target_model, "forward_context_parallel", None)
@@ -374,20 +415,40 @@ def _run_target_forward_context_parallel(
             f"{type(result)!r}."
         )
     sequence_length = int(model_inputs["attention_mask"].sum(dim=1)[0].item())
-    expected_start, expected_end = compute_context_parallel_range(
-        sequence_length=sequence_length,
-        context_parallel_rank=topology.context_parallel_rank,
-        context_parallel_size=topology.context_parallel_size,
-    )
     local_length = int(result.target_hidden_states.shape[1])
-    if (
-        result.context_start != expected_start
-        or local_length != expected_end - expected_start
-    ):
+    context_layout = str(
+        getattr(target_model, "_deepspec_context_layout", "contiguous")
+    )
+    if context_layout == "contiguous":
+        expected_start, expected_end = compute_context_parallel_range(
+            sequence_length=sequence_length,
+            context_parallel_rank=topology.context_parallel_rank,
+            context_parallel_size=topology.context_parallel_size,
+        )
+        if (
+            result.context_start != expected_start
+            or local_length != expected_end - expected_start
+        ):
+            raise RuntimeError(
+                "Target CP adapter returned the wrong contiguous shard: "
+                f"expected [{expected_start}, {expected_end}), got "
+                f"start={result.context_start}, length={local_length}."
+            )
+    elif context_layout == "native_head_tail":
+        alignment = 2 * int(topology.context_parallel_size)
+        padded_length = (
+            (sequence_length + alignment - 1) // alignment
+        ) * alignment
+        expected_length = padded_length // int(topology.context_parallel_size)
+        if result.context_start != 0 or local_length != expected_length:
+            raise RuntimeError(
+                "Qwen3.6 target CP returned the wrong native head/tail shard: "
+                f"expected start=0, length={expected_length}; got "
+                f"start={result.context_start}, length={local_length}."
+            )
+    else:
         raise RuntimeError(
-            "Target CP adapter returned the wrong contiguous shard: expected "
-            f"[{expected_start}, {expected_end}), got start={result.context_start}, "
-            f"length={local_length}."
+            f"Target CP adapter declared unsupported layout {context_layout!r}."
         )
     if int(result.target_last_hidden_states.shape[1]) != local_length:
         raise RuntimeError("Target CP hidden-state tensors have different lengths.")
@@ -469,7 +530,28 @@ def parse_args():
             "train.tensor_parallel_size, then 1."
         ),
     )
+    parser.add_argument(
+        "--media-root",
+        default=None,
+        help="Optional root used to resolve relative image and video paths.",
+    )
+    parser.add_argument(
+        "--media-uri-map",
+        action="append",
+        default=[],
+        metavar="SOURCE_PREFIX=REPLACEMENT_PREFIX",
+        help=(
+            "Rewrite image/video URI prefixes before loading media. Repeat "
+            "for multiple mappings; the longest matching prefix wins."
+        ),
+    )
     cli_args = parser.parse_args()
+    try:
+        cli_args.media_uri_map = parse_media_uri_map_entries(
+            cli_args.media_uri_map
+        )
+    except (TypeError, ValueError) as exc:
+        parser.error(str(exc))
     config = parse_opts_to_config(cli_args.opts, load_config(cli_args.config))
     return cli_args, config
 
@@ -484,7 +566,12 @@ def _write_manifest(
     target_layer_ids,
     hidden_size: int,
     min_loss_tokens: int,
+    multimodal: bool,
+    processor_class: str | None,
+    media_root: str | None,
+    media_uri_map,
     context_parallel_size: int,
+    context_layout: str,
     expert_parallel_size: int,
     tensor_parallel_size: int,
     fsdp_size: int,
@@ -501,8 +588,12 @@ def _write_manifest(
             "chat_template": str(config.data.chat_template),
             "max_length": int(config.data.max_length),
             "min_loss_tokens": int(min_loss_tokens),
+            "multimodal": bool(multimodal),
+            "processor_class": processor_class,
+            "media_root": media_root,
+            "media_uri_map": media_uri_map,
             "cache_context_parallel_size": int(context_parallel_size),
-            "context_layout": "contiguous",
+            "context_layout": str(context_layout),
             "index_files": [str(file_name) for file_name in index_files],
             "target_context_parallel_implementation": (
                 "model_native_ring" if context_parallel_size > 1 else "disabled"
@@ -543,6 +634,25 @@ def main(local_rank: int):
     train_data_paths = list(cli_args.train_data_path)
     target_layer_ids = [int(layer_id) for layer_id in config.model.target_layer_ids]
     min_loss_tokens = int(cli_args.min_loss_tokens)
+    target_config = AutoConfig.from_pretrained(
+        config.model.target_model_name_or_path,
+    )
+    configured_multimodal = config.data.get("multimodal")
+    multimodal = (
+        (
+            str(target_config.model_type).lower()
+            in ("qwen3_5", "qwen3_5_text")
+            and is_multimodal_config(target_config)
+        )
+        if configured_multimodal is None
+        else bool(configured_multimodal)
+    )
+    media_root = (
+        os.path.abspath(cli_args.media_root)
+        if cli_args.media_root is not None
+        else None
+    )
+    media_uri_map = cli_args.media_uri_map
     seed_all(int(config.seed))
     device, global_rank, world_size = init_dist(local_rank)
     configured_context_parallel_size = cli_args.context_parallel_size
@@ -567,6 +677,13 @@ def main(local_rank: int):
     tensor_parallel_size = int(configured_tensor_parallel_size)
     if expert_parallel_size < 1 or tensor_parallel_size < 1:
         raise ValueError("EP and TP sizes must both be positive.")
+    if str(target_config.model_type).lower() in ("qwen3_5", "qwen3_5_text") and (
+        expert_parallel_size > 1 or tensor_parallel_size > 1
+    ):
+        raise ValueError(
+            "Qwen3.6 target-cache generation supports CP and FSDP; set "
+            "expert_parallel_size=1 and tensor_parallel_size=1."
+        )
     if context_parallel_size > 1 and not cli_args.fsdp:
         raise ValueError("Target Context Parallel currently requires --fsdp.")
     if cli_args.fsdp:
@@ -628,6 +745,9 @@ def main(local_rank: int):
                     else "disabled"
                 ),
                 "sample_parallel_size": topology.sample_parallel_size,
+                "multimodal": multimodal,
+                "media_root": media_root,
+                "media_uri_map": media_uri_map,
             },
             indent=4,
         ),
@@ -666,12 +786,29 @@ def main(local_rank: int):
         padding_steps = 0
 
     local_subset = Subset(dataset, local_indices)
-    tokenizer = AutoTokenizer.from_pretrained(
-        config.model.target_model_name_or_path,
-    )
-    target_config = AutoConfig.from_pretrained(
-        config.model.target_model_name_or_path,
-    )
+    processor = None
+    if multimodal:
+        processor = AutoProcessor.from_pretrained(
+            config.model.target_model_name_or_path,
+        )
+        train_collator = MultimodalConversationCollator(
+            processor=processor,
+            chat_template=config.data.chat_template,
+            max_length=config.data.max_length,
+            min_loss_tokens=min_loss_tokens,
+            media_root=media_root,
+            media_uri_map=media_uri_map,
+        )
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(
+            config.model.target_model_name_or_path,
+        )
+        train_collator = ConversationCollator(
+            tokenizer=tokenizer,
+            chat_template=config.data.chat_template,
+            max_length=config.data.max_length,
+            min_loss_tokens=min_loss_tokens,
+        )
     if cli_args.fsdp:
         target_model = _build_fsdp_target_model(
             model_name_or_path=config.model.target_model_name_or_path,
@@ -679,10 +816,18 @@ def main(local_rank: int):
             fsdp_rank=topology.fsdp_rank,
         ).eval()
     else:
+        load_kwargs = {
+            "config": target_config,
+            "dtype": torch.bfloat16,
+        }
+        if str(target_config.model_type).lower() in (
+            "qwen3_5",
+            "qwen3_5_text",
+        ):
+            load_kwargs["attn_implementation"] = "sdpa"
         target_model = AutoModel.from_pretrained(
             config.model.target_model_name_or_path,
-            config=target_config,
-            dtype=torch.bfloat16,
+            **load_kwargs,
         ).eval()
     target_model.requires_grad_(False)
     if expert_parallel_size > 1 or tensor_parallel_size > 1:
@@ -693,6 +838,9 @@ def main(local_rank: int):
         )
     if context_parallel_size > 1:
         target_model = install_target_context_parallel(target_model)
+    context_layout = str(
+        getattr(target_model, "_deepspec_context_layout", "contiguous")
+    )
     target_hidden_size = _get_target_hidden_size(target_model)
     if cli_args.fsdp:
         target_model = _wrap_target_model_with_fsdp(
@@ -702,12 +850,6 @@ def main(local_rank: int):
         ).eval()
     else:
         target_model = target_model.to(device=device)
-    train_collator = ConversationCollator(
-        tokenizer=tokenizer,
-        chat_template=config.data.chat_template,
-        max_length=config.data.max_length,
-        min_loss_tokens=min_loss_tokens,
-    )
     dataloader = DataLoader(
         local_subset,
         batch_size=int(cli_args.local_batch_size),
@@ -720,6 +862,7 @@ def main(local_rank: int):
         rank_dir=rank_dir,
         max_shard_bytes=int(cli_args.max_shard_bytes),
         max_queue_size=int(cli_args.local_batch_size) * 4,
+        context_layout=context_layout,
     )
 
     processed_local_samples = 0
@@ -762,9 +905,8 @@ def main(local_rank: int):
                     key: value.to(device, non_blocking=True)
                     for key, value in batch.items()
                 }
-                model_inputs = {
-                    key: value for key, value in batch.items() if key != "loss_mask"
-                }
+                loss_mask = batch.pop("loss_mask")
+                model_inputs = batch
                 if context_parallel_size > 1:
                     target_result = _run_target_forward_context_parallel(
                         target_model=target_model,
@@ -776,8 +918,7 @@ def main(local_rank: int):
                 else:
                     target_result = run_target_forward_with_hooks(
                         target_model=target_model,
-                        input_ids=model_inputs["input_ids"],
-                        attention_mask=model_inputs["attention_mask"],
+                        model_inputs=model_inputs,
                         target_layer_ids=target_layer_ids,
                     )
                 if not should_write_batch:
@@ -788,7 +929,7 @@ def main(local_rank: int):
                             total_samples=local_total_samples,
                         )
                         last_progress_printed = processed_local_samples
-                    del target_result, model_inputs, batch
+                    del target_result, model_inputs, batch, loss_mask
                     continue
                 for sample_idx_in_batch in range(batch["input_ids"].shape[0]):
                     valid_tokens = batch["attention_mask"][sample_idx_in_batch].bool()
@@ -819,11 +960,11 @@ def main(local_rank: int):
                         attention_mask=batch["attention_mask"][sample_idx_in_batch][
                             valid_tokens
                         ],
-                        loss_mask=batch["loss_mask"][sample_idx_in_batch][valid_tokens],
+                        loss_mask=loss_mask[sample_idx_in_batch][valid_tokens],
                         target_hidden_states=local_hidden_states,
                         target_last_hidden_states=local_last_hidden_states,
                     )
-                del target_result, model_inputs, batch
+                del target_result, model_inputs, batch, loss_mask
                 if should_print_progress:
                     _print_prepare_progress(
                         global_rank=global_rank,
@@ -877,6 +1018,7 @@ def main(local_rank: int):
             summaries=summaries,
             shard_map=shard_map,
             context_parallel_size=context_parallel_size,
+            context_layout=context_layout,
         )
         _write_manifest(
             output_dir=output_dir,
@@ -887,7 +1029,14 @@ def main(local_rank: int):
             target_layer_ids=target_layer_ids,
             hidden_size=target_hidden_size,
             min_loss_tokens=min_loss_tokens,
+            multimodal=multimodal,
+            processor_class=(
+                type(processor).__name__ if processor is not None else None
+            ),
+            media_root=media_root,
+            media_uri_map=media_uri_map,
             context_parallel_size=context_parallel_size,
+            context_layout=context_layout,
             expert_parallel_size=expert_parallel_size,
             tensor_parallel_size=tensor_parallel_size,
             fsdp_size=fsdp_size,
