@@ -109,6 +109,57 @@ def _test_target_forward(topology):
     )
 
 
+def _test_pure_expert_parallel_variable_lengths(topology):
+    from deepspec.modeling.deepseek_v4_parallel import (
+        parallelize_deepseek_v4_model,
+    )
+    from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
+        DeepseekV4Model,
+    )
+
+    torch.manual_seed(4321)
+    config = _tiny_config(
+        num_hidden_layers=1,
+        layer_types=["sliding_attention"],
+    )
+    reference = DeepseekV4Model(config).eval()
+    parallel = copy.deepcopy(reference).eval()
+
+    # Each rank owns a different logical sample. The shorter ranks must enter
+    # zero-length trailing chunks while longer ranks continue dispatching.
+    sequence_length = (2, 6, 9, 13)[topology.global_rank]
+    input_ids = torch.arange(sequence_length).view(1, -1) % config.vocab_size
+    attention_mask = torch.ones_like(input_ids)
+    with torch.no_grad():
+        expected = reference(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            use_cache=False,
+        ).last_hidden_state
+
+    previous_chunk_size = os.environ.get("DEEPSPEC_V4_EP_TOKEN_CHUNK")
+    os.environ["DEEPSPEC_V4_EP_TOKEN_CHUNK"] = "4"
+    try:
+        parallelize_deepseek_v4_model(
+            parallel,
+            topology=topology,
+            draft=False,
+        )
+    finally:
+        if previous_chunk_size is None:
+            os.environ.pop("DEEPSPEC_V4_EP_TOKEN_CHUNK", None)
+        else:
+            os.environ["DEEPSPEC_V4_EP_TOKEN_CHUNK"] = previous_chunk_size
+
+    with torch.no_grad():
+        actual = parallel(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            use_cache=False,
+        ).last_hidden_state
+    torch.testing.assert_close(actual, expected, rtol=2.0e-4, atol=2.0e-4)
+
+
 def _test_draft_forward_backward(topology):
     from deepspec.modeling.dspark.deepseek_v4.modeling import (
         DeepseekV4DSparkModel,
@@ -414,6 +465,20 @@ def _worker(rank: int, world_size: int, rendezvous: str):
         )
         expected_expert_sum = 2.0 if rank % 2 == 0 else 4.0
         assert expert_axis_sum.item() == expected_expert_sum
+
+        pure_ep_topology = build_parallel_topology(
+            context_parallel_size=1,
+            expert_parallel_size=4,
+            tensor_parallel_size=1,
+            fsdp_size=1,
+            create_fsdp_groups=False,
+            pure_expert_parallel=True,
+        )
+        assert pure_ep_topology.pure_expert_parallel
+        assert pure_ep_topology.data_parallel_size == world_size
+        assert pure_ep_topology.expert_parallel_size == world_size
+        assert pure_ep_topology.expert_parallel_rank == rank
+        _test_pure_expert_parallel_variable_lengths(pure_ep_topology)
     finally:
         dist.destroy_process_group()
 

@@ -1,4 +1,5 @@
 import os
+import time
 
 from deepspec.data import CacheCollator
 from deepspec.modeling.dspark.gemma4 import Gemma4DSparkModel
@@ -11,6 +12,23 @@ from deepspec.modeling.dspark.qwen3.config import (
     build_draft_config as build_qwen3_draft_config,
 )
 from deepspec.trainer.base_trainer import BaseTrainer
+
+
+def _debug_progress(message):
+    if os.environ.get("DEEPSPEC_DEBUG_PROGRESS", "false").lower() not in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        return
+    rank = os.environ.get("RANK", "?")
+    local_rank = os.environ.get("LOCAL_RANK", "?")
+    print(
+        time.strftime("%Y-%m-%d %H:%M:%S"),
+        f"[rank={rank} local_rank={local_rank}] {message}",
+        flush=True,
+    )
 
 
 class Qwen3DSparkTrainer(BaseTrainer):
@@ -90,5 +108,17 @@ class DeepseekV4DSparkTrainer(Qwen3DSparkTrainer):
         if self.online_target_enabled:
             if self.online_target is None:
                 raise RuntimeError("Online DeepSeek-V4 target is not initialized.")
+            _debug_progress("dspark: online target forward start")
             batch = self.online_target.forward_training_batch(batch)
-        return super().run_batch(batch)
+            _debug_progress(
+                "dspark: online target forward done "
+                + ", ".join(
+                    f"{key}=shape{tuple(value.shape)} dtype={value.dtype}"
+                    for key, value in batch.items()
+                    if hasattr(value, "shape")
+                )
+            )
+        _debug_progress("dspark: draft loss forward start")
+        loss = super().run_batch(batch)
+        _debug_progress(f"dspark: draft loss forward done loss={loss.detach().float().item()}")
+        return loss

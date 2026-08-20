@@ -11,9 +11,9 @@ model = dict(
     target_model_name_or_path=(
         "/mnt/afs_agents/share_models/deepseek-ai/DeepSeek-V4-Flash"
     ),
-    block_size=7,
+    block_size=5,
     num_draft_layers=3,
-    target_layer_ids=[1, 21, 42],
+    target_layer_ids=[40, 41, 42],
     # V4 has no tokenizer mask token.  This checkpoint reserves embedding rows
     # above the tokenizer's 128000 entries; use the final reserved row.
     mask_token_id=129279,
@@ -45,9 +45,9 @@ train = dict(
     max_train_steps=1,
     max_grad_norm=1.0,
     sharding_strategy="full_shard",
-    fsdp_size=4,
+    fsdp_size=8,
     fsdp_layerwise=True,
-    context_parallel_size=2,
+    context_parallel_size=1,
     expert_parallel_size=8,
     tensor_parallel_size=1,
     pure_expert_parallel=True,
@@ -68,6 +68,9 @@ data = dict(
     chat_template="deepseek_v4",
     max_length=131072,
     min_loss_tokens=14,
+    # Group similarly sized records across synchronized sample ranks.  Raw
+    # JSONL byte length is used as a zero-tokenization-cost sequence proxy.
+    length_bucket_size=512,
     num_workers=1,
     prefetch_factor=1,
 )

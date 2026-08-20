@@ -12,6 +12,7 @@ class JsonLineDataset(torch.utils.data.Dataset):
     def __init__(self, data_paths):
         super().__init__()
         self.data_paths = sorted(data_paths)
+        self.file_sizes = [os.path.getsize(path) for path in self.data_paths]
         self.cache_dir = os.path.abspath(CACHE_DIR)
         os.makedirs(self.cache_dir, exist_ok=True)
         self.num_data_per_file = []
@@ -39,6 +40,20 @@ class JsonLineDataset(torch.utils.data.Dataset):
         mm.seek(starts[local_idx])
         line = mm.readline().decode("utf-8")
         return json.loads(line)
+
+    def get_length_hint(self, idx):
+        """Return record bytes as a cheap proxy for tokenized sequence length."""
+
+        if not (0 <= idx < self.num_data):
+            raise IndexError(idx)
+        file_idx, local_idx = self._map_global_to_local(idx)
+        starts = self.line_starts_per_file[file_idx]
+        start = starts[local_idx]
+        if local_idx + 1 < len(starts):
+            end = starts[local_idx + 1]
+        else:
+            end = self.file_sizes[file_idx]
+        return end - start
 
     def close(self):
         for idx, mm in enumerate(self.mmaps):

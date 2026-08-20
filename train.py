@@ -40,13 +40,15 @@ def main(local_rank):
         print(json.dumps(args, indent=4, cls=CustomJSONEncoder), flush=True)
 
     trainer = None
+    completed = False
     try:
         trainer = args.train.trainer_cls(local_rank, args)
         trainer.train()
+        completed = True
     finally:
         try:
             if trainer is not None:
-                trainer.clean_up()
+                trainer.clean_up(synchronize=completed)
         finally:
             if dist.is_initialized():
                 dist.destroy_process_group()
