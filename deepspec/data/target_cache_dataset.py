@@ -1,5 +1,6 @@
 """Target-cache storage protocol, writers, dataset, collator, and validation."""
 
+import hashlib
 import json
 import mmap
 import os
@@ -41,7 +42,12 @@ def _debug_progress(message):
     )
 
 
-TARGET_CACHE_VERSION = 3
+LEGACY_TARGET_CACHE_VERSION = 3
+TARGET_CACHE_VERSION = 4
+SUPPORTED_TARGET_CACHE_VERSIONS = (
+    LEGACY_TARGET_CACHE_VERSION,
+    TARGET_CACHE_VERSION,
+)
 # sample id, shard id, full sequence length, local context start/length, offsets.
 INDEX_RECORD_STRUCT = struct.Struct("<QIIIIQQQQQ")
 INDEX_RECORD_SIZE = INDEX_RECORD_STRUCT.size
@@ -60,6 +66,25 @@ def atomic_json_dump(payload, path: str):
     os.replace(tmp_path, path)
 
 
+def compute_file_fingerprint(path: str, *, chunk_size: int = 8 * 1024 * 1024):
+    """Return a stable content identity for a source JSONL file."""
+
+    resolved_path = os.path.abspath(os.path.expanduser(str(path)))
+    digest = hashlib.sha256()
+    with open(resolved_path, "rb") as handle:
+        while chunk := handle.read(int(chunk_size)):
+            digest.update(chunk)
+    return {
+        "path": resolved_path,
+        "size": os.path.getsize(resolved_path),
+        "sha256": digest.hexdigest(),
+    }
+
+
+def build_source_jsonl_fingerprints(paths):
+    return [compute_file_fingerprint(path) for path in paths]
+
+
 def build_target_cache_shard_path(cache_dir: str, file_name: str) -> str:
     return os.path.join(cache_dir, file_name)
 
@@ -70,6 +95,7 @@ def expected_target_cache_tensor_numel(
     context_len: int | None = None,
     hidden_size: int,
     num_target_layers: int,
+    stores_target_last_hidden_states: bool = True,
 ):
     context_len = int(seq_len) if context_len is None else int(context_len)
     return {
@@ -77,7 +103,11 @@ def expected_target_cache_tensor_numel(
         "attention_mask": int(seq_len),
         "loss_mask": int(seq_len),
         "target_hidden_states": context_len * int(num_target_layers) * int(hidden_size),
-        "target_last_hidden_states": context_len * int(hidden_size),
+        "target_last_hidden_states": (
+            context_len * int(hidden_size)
+            if bool(stores_target_last_hidden_states)
+            else 0
+        ),
     }
 
 
@@ -87,12 +117,14 @@ def expected_target_cache_tensor_nbytes(
     context_len: int | None = None,
     hidden_size: int,
     num_target_layers: int,
+    stores_target_last_hidden_states: bool = True,
 ):
     numel = expected_target_cache_tensor_numel(
         seq_len=seq_len,
         context_len=context_len,
         hidden_size=hidden_size,
         num_target_layers=num_target_layers,
+        stores_target_last_hidden_states=stores_target_last_hidden_states,
     )
     return {
         "input_ids": numel["input_ids"] * 4,
@@ -187,10 +219,34 @@ def validate_target_cache_manifest(*, cache_dir: str, manifest):
         f"Target cache manifest is missing required fields {missing}: "
         f"{os.path.join(cache_dir, 'manifest.json')}"
     )
-    assert int(manifest["version"]) == TARGET_CACHE_VERSION, (
+    version = int(manifest["version"])
+    assert version in SUPPORTED_TARGET_CACHE_VERSIONS, (
         "Unsupported target cache manifest version: "
-        f"{manifest['version']} != {TARGET_CACHE_VERSION}"
+        f"{manifest['version']} not in {SUPPORTED_TARGET_CACHE_VERSIONS}"
     )
+    if version >= TARGET_CACHE_VERSION:
+        required_v4_fields = {
+            "source_jsonl_fingerprints",
+            "stores_target_last_hidden_states",
+        }
+        missing = sorted(required_v4_fields - set(manifest))
+        assert not missing, (
+            f"Target cache v{version} manifest is missing required fields "
+            f"{missing}: {os.path.join(cache_dir, 'manifest.json')}"
+        )
+        assert isinstance(manifest["stores_target_last_hidden_states"], bool), (
+            "stores_target_last_hidden_states must be a JSON boolean."
+        )
+        fingerprints = manifest["source_jsonl_fingerprints"]
+        assert isinstance(fingerprints, list) and fingerprints, (
+            "source_jsonl_fingerprints must be a non-empty list."
+        )
+        for fingerprint in fingerprints:
+            assert {"path", "size", "sha256"}.issubset(fingerprint), (
+                f"Invalid source fingerprint: {fingerprint!r}"
+            )
+            assert int(fingerprint["size"]) >= 0
+            assert len(str(fingerprint["sha256"])) == 64
     assert manifest["hidden_dtype"] == TARGET_CACHE_HIDDEN_DTYPE, (
         "Unsupported hidden_dtype in target cache manifest: "
         f"{manifest['hidden_dtype']}"
@@ -286,6 +342,56 @@ def validate_train_cache(*, train_dataset, draft_model, target_model_name_or_pat
         )
 
 
+def validate_target_cache_identity(
+    *,
+    cache_dir: str,
+    source_jsonl_paths,
+    target_model_name_or_path: str,
+    target_layer_ids,
+    chat_template: str,
+    max_length: int,
+    context_parallel_size: int,
+    stores_target_last_hidden_states: bool,
+):
+    """Validate every input that makes a prepared cache reusable."""
+
+    manifest = load_target_cache_manifest(cache_dir)
+    assert str(manifest.get("target_model_name_or_path")) == str(
+        target_model_name_or_path
+    ), "Target model does not match cache identity."
+    assert [int(value) for value in manifest["target_layer_ids"]] == [
+        int(value) for value in target_layer_ids
+    ], "Target layer ids do not match cache identity."
+    assert str(manifest.get("chat_template")) == str(chat_template), (
+        "Chat template does not match cache identity."
+    )
+    assert int(manifest.get("max_length", -1)) == int(max_length), (
+        "Maximum sequence length does not match cache identity."
+    )
+    assert int(manifest["cache_context_parallel_size"]) == int(
+        context_parallel_size
+    ), "Context-parallel size does not match cache identity."
+    assert bool(manifest.get("stores_target_last_hidden_states", True)) == bool(
+        stores_target_last_hidden_states
+    ), "Final-hidden-state storage mode does not match cache identity."
+    cached_fingerprints = manifest.get("source_jsonl_fingerprints")
+    assert cached_fingerprints, (
+        "Cache predates source fingerprints and must be regenerated."
+    )
+    current_fingerprints = build_source_jsonl_fingerprints(source_jsonl_paths)
+    assert len(cached_fingerprints) == len(current_fingerprints), (
+        "Source file count does not match cache identity."
+    )
+    for cached, current in zip(cached_fingerprints, current_fingerprints):
+        assert int(cached["size"]) == int(current["size"]) and str(
+            cached["sha256"]
+        ) == str(current["sha256"]), (
+            "Source JSONL content does not match cache identity: "
+            f"cached={cached}, current={current}"
+        )
+    return manifest
+
+
 def _tensor_to_bytes(tensor: torch.Tensor, dtype: torch.dtype):
     cpu_tensor = tensor.detach().to(device="cpu", dtype=dtype).contiguous()
     return cpu_tensor.numpy().tobytes()
@@ -361,7 +467,7 @@ def build_target_cache_sample_bytes(
     attention_mask: torch.Tensor,
     loss_mask: torch.Tensor,
     target_hidden_states: torch.Tensor,
-    target_last_hidden_states: torch.Tensor,
+    target_last_hidden_states: torch.Tensor | None,
 ):
     seq_len = int(input_ids.shape[0])
     context_start = int(context_start)
@@ -369,7 +475,10 @@ def build_target_cache_sample_bytes(
     context_layout = str(context_layout)
     if context_layout not in ("contiguous", "native_head_tail"):
         raise ValueError(f"Unsupported context layout: {context_layout!r}.")
-    if int(target_last_hidden_states.shape[0]) != context_len:
+    if (
+        target_last_hidden_states is not None
+        and int(target_last_hidden_states.shape[0]) != context_len
+    ):
         raise ValueError(
             "Target hidden tensors must have the same local context length: "
             f"{target_hidden_states.shape} versus "
@@ -401,8 +510,10 @@ def build_target_cache_sample_bytes(
         attention_mask=_tensor_to_bytes(attention_mask, torch.uint8),
         loss_mask=_tensor_to_bytes(loss_mask, torch.uint8),
         target_hidden_states=_tensor_to_bfloat16_bytes(target_hidden_states),
-        target_last_hidden_states=_tensor_to_bfloat16_bytes(
-            target_last_hidden_states
+        target_last_hidden_states=(
+            _tensor_to_bfloat16_bytes(target_last_hidden_states)
+            if target_last_hidden_states is not None
+            else b""
         ),
     )
 
@@ -509,7 +620,7 @@ class LocalTargetCacheWriter:
         attention_mask: torch.Tensor,
         loss_mask: torch.Tensor,
         target_hidden_states: torch.Tensor,
-        target_last_hidden_states: torch.Tensor,
+        target_last_hidden_states: torch.Tensor | None,
     ):
         sample = build_target_cache_sample_bytes(
             sample_id=sample_id,
@@ -594,7 +705,7 @@ class AsyncTargetCacheWriter:
         attention_mask: torch.Tensor,
         loss_mask: torch.Tensor,
         target_hidden_states: torch.Tensor,
-        target_last_hidden_states: torch.Tensor,
+        target_last_hidden_states: torch.Tensor | None,
     ):
         sample = build_target_cache_sample_bytes(
             sample_id=self.num_local_samples,
@@ -797,8 +908,16 @@ def build_target_cache_manifest(
     hidden_size: int,
     extra_fields=None,
 ):
+    extra_fields = dict(extra_fields or {})
+    # ponytail-lite: legacy callers stay on v3; explicit storage metadata
+    # opts newly prepared caches into v4 without changing old callers.
+    version = (
+        TARGET_CACHE_VERSION
+        if "stores_target_last_hidden_states" in extra_fields
+        else LEGACY_TARGET_CACHE_VERSION
+    )
     manifest = {
-        "version": TARGET_CACHE_VERSION,
+        "version": version,
         "num_samples": int(num_samples),
         "num_shards": len(shards),
         "target_layer_ids": [int(layer_id) for layer_id in target_layer_ids],
@@ -809,8 +928,7 @@ def build_target_cache_manifest(
         "hidden_size": int(hidden_size),
         "shards": shards,
     }
-    if extra_fields:
-        manifest.update(extra_fields)
+    manifest.update(extra_fields)
     return manifest
 
 
@@ -839,6 +957,11 @@ class CacheDataset(torch.utils.data.Dataset):
         self.hidden_size = int(self.manifest["hidden_size"])
         self.target_layer_ids = [int(layer_id) for layer_id in self.manifest["target_layer_ids"]]
         self.num_target_layers = len(self.target_layer_ids)
+        # Version 3 caches always stored this tensor. Version 4 can omit
+        # it for CE-only methods such as DFlash2.
+        self.stores_target_last_hidden_states = bool(
+            self.manifest.get("stores_target_last_hidden_states", True)
+        )
         self.context_parallel_size = int(context_parallel_size)
         self.context_parallel_rank = int(context_parallel_rank)
         if self.context_parallel_size < 1:
@@ -1024,6 +1147,9 @@ class CacheDataset(torch.utils.data.Dataset):
             context_len=context_len,
             hidden_size=self.hidden_size,
             num_target_layers=self.num_target_layers,
+            stores_target_last_hidden_states=(
+                self.stores_target_last_hidden_states
+            ),
         )
         input_ids = self._read_tensor_from_shard(
             shard_mmap=shard_mmap,
@@ -1047,21 +1173,25 @@ class CacheDataset(torch.utils.data.Dataset):
             shape=(context_len, self.num_target_layers * self.hidden_size),
             nbytes=nbytes["target_hidden_states"],
         )
-        target_last_hidden_states = self._read_bfloat16_tensor_from_shard(
-            shard_mmap=shard_mmap,
-            offset=record["target_last_hidden_states_offset"],
-            shape=(context_len, self.hidden_size),
-            nbytes=nbytes["target_last_hidden_states"],
-        )
-        return {
+        target_last_hidden_states = None
+        if self.stores_target_last_hidden_states:
+            target_last_hidden_states = self._read_bfloat16_tensor_from_shard(
+                shard_mmap=shard_mmap,
+                offset=record["target_last_hidden_states_offset"],
+                shape=(context_len, self.hidden_size),
+                nbytes=nbytes["target_last_hidden_states"],
+            )
+        sample = {
             "input_ids": input_ids,
             "loss_mask": loss_mask,
             "target_hidden_states": target_hidden_states,
-            "target_last_hidden_states": target_last_hidden_states,
             "context_start": context_start,
             "context_len": context_len,
             "seq_len": seq_len,
         }
+        if target_last_hidden_states is not None:
+            sample["target_last_hidden_states"] = target_last_hidden_states
+        return sample
 
 
 def _pad_1d_batch(features: List[Dict], key: str):
@@ -1100,14 +1230,47 @@ class ConversationCollator:
         self.max_length = int(max_length)
         self.min_loss_tokens = int(min_loss_tokens)
 
+    def _process_packed_feature(self, item):
+        conversations = item.get("packed_conversations")
+        if not isinstance(conversations, list) or not conversations:
+            raise ValueError(
+                "packed_conversations must be a non-empty list of "
+                "conversation message lists."
+            )
+        pieces = []
+        remaining_length = self.max_length
+        for conversation in conversations:
+            if not isinstance(conversation, list) or not conversation:
+                raise ValueError(
+                    "Each packed_conversations entry must be a non-empty "
+                    "message list."
+                )
+            piece = preprocess_record(
+                record={"conversations": conversation},
+                tokenizer=self.tokenizer,
+                chat_template=self.chat_template,
+                max_length=remaining_length,
+            )
+            pieces.append(piece)
+            remaining_length -= int(piece["input_ids"].shape[0])
+            if remaining_length <= 0:
+                break
+        return {
+            key: torch.cat([piece[key] for piece in pieces], dim=0)
+            for key in ("input_ids", "attention_mask", "loss_mask")
+        }
+
     def _process_feature(self, item):
         _debug_progress("collator: preprocess_record start")
-        processed = preprocess_record(
-            record=item,
-            tokenizer=self.tokenizer,
-            chat_template=self.chat_template,
-            max_length=self.max_length,
-        )
+        if "packed_conversations" in item:
+            processed = self._process_packed_feature(item)
+        else:
+            processed = preprocess_record(
+                record=item,
+                tokenizer=self.tokenizer,
+                chat_template=self.chat_template,
+                max_length=self.max_length,
+            )
         loss_tokens = int(processed["loss_mask"].sum().item())
         _debug_progress(
             "collator: preprocess_record done "
@@ -1272,8 +1435,21 @@ class CacheCollator:
         for i, item in enumerate(features):
             attention_mask[i, : item["input_ids"].shape[0]] = 1
         batch["attention_mask"] = attention_mask
-        for key in ("target_hidden_states", "target_last_hidden_states"):
-            batch[key] = _pad_hidden_batch(features, key)
+        batch["target_hidden_states"] = _pad_hidden_batch(
+            features, "target_hidden_states"
+        )
+        has_target_last = [
+            "target_last_hidden_states" in feature for feature in features
+        ]
+        if any(has_target_last) and not all(has_target_last):
+            raise ValueError(
+                "A cache batch cannot mix samples with and without target "
+                "final hidden states."
+            )
+        if all(has_target_last):
+            batch["target_last_hidden_states"] = _pad_hidden_batch(
+                features, "target_last_hidden_states"
+            )
         for key in ("context_start", "context_len", "seq_len"):
             batch[key] = torch.tensor([int(item[key]) for item in features])
         return batch

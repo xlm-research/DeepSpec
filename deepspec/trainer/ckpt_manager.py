@@ -147,6 +147,12 @@ def load_resume_draft_model(
         dtype=precision_dtype,
         attn_implementation=str(draft_model.config._attn_implementation),
     )
+    if bool(getattr(draft_model, "checkpoint_excludes_embedding_head", False)):
+        resumed_model.initialize_embeddings_and_head(
+            embed_tokens=draft_model.embed_tokens,
+            lm_head=draft_model.lm_head,
+            freeze=True,
+        )
     # BaseTrainer wraps the resumed model with FSDP after this function.  Keep
     # it on CPU so no rank transiently materializes the full model on its GPU.
     resumed_model = resumed_model.to(device="cpu", dtype=precision_dtype)

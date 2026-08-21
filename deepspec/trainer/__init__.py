@@ -1,4 +1,5 @@
 from .base_trainer import BaseTrainer
+from .dflash2_trainer import Qwen3_8DFlash2Trainer
 from .dspark_trainer import (
     DeepseekV4DSparkTrainer,
     Gemma4DSparkTrainer,
@@ -15,4 +16,5 @@ __all__ = [
     "Qwen3Eagle3Trainer",
     "Qwen3DSparkTrainer",
     "Qwen3_6DSparkTrainer",
+    "Qwen3_8DFlash2Trainer",
 ]

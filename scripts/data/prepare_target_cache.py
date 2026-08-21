@@ -16,6 +16,7 @@ from deepspec.data.target_cache_dataset import (
     LocalCacheWriteSummary,
     atomic_json_dump,
     build_global_target_cache_shard_map,
+    build_source_jsonl_fingerprints,
     build_target_cache_manifest,
     cleanup_target_cache_tmp_dir,
     compute_local_sample_range,
@@ -242,6 +243,10 @@ def _build_fsdp_target_model(
         ):
             config_kwargs["attn_implementation"] = "sdpa"
         target_model = AutoModel.from_config(target_config, **config_kwargs)
+    # Some custom modules allocate parameters on the current CUDA device even
+    # inside init_empty_weights(). FSDP rejects a mixed CUDA/meta layer before
+    # invoking param_init_fn, so normalize every non-source tensor to meta.
+    target_model.to_empty(device=torch.device("meta"), recurse=True)
     _normalize_target_parameter_dtype(target_model)
     return target_model
 
@@ -398,6 +403,10 @@ def _run_target_forward_context_parallel(
             "forward_context_parallel(). Add that model-specific ring "
             "attention adapter before running with --context-parallel-size > 1."
         )
+    # Native CP may shard aligned input buffers in place. Retain the global
+    # mask for validation and for the cache writer that follows this call.
+    global_attention_mask = model_inputs["attention_mask"].clone()
+    sequence_length = int(global_attention_mask.sum(dim=1)[0].item())
     result = cp_forward(
         model_inputs=model_inputs,
         target_layer_ids=target_layer_ids,
@@ -409,12 +418,12 @@ def _run_target_forward_context_parallel(
         tensor_parallel_size=topology.tensor_parallel_size,
         device=device,
     )
+    model_inputs["attention_mask"] = global_attention_mask
     if not isinstance(result, TargetForwardResult):
         raise TypeError(
             "forward_context_parallel() must return TargetForwardResult, got "
             f"{type(result)!r}."
         )
-    sequence_length = int(model_inputs["attention_mask"].sum(dim=1)[0].item())
     local_length = int(result.target_hidden_states.shape[1])
     context_layout = str(
         getattr(target_model, "_deepspec_context_layout", "contiguous")
@@ -575,6 +584,7 @@ def _write_manifest(
     expert_parallel_size: int,
     tensor_parallel_size: int,
     fsdp_size: int,
+    stores_target_last_hidden_states: bool,
     shards,
 ):
     manifest = build_target_cache_manifest(
@@ -585,6 +595,9 @@ def _write_manifest(
         extra_fields={
             "target_model_name_or_path": str(config.model.target_model_name_or_path),
             "source_jsonl_paths": [str(path) for path in train_data_paths],
+            "source_jsonl_fingerprints": build_source_jsonl_fingerprints(
+                train_data_paths
+            ),
             "chat_template": str(config.data.chat_template),
             "max_length": int(config.data.max_length),
             "min_loss_tokens": int(min_loss_tokens),
@@ -599,6 +612,9 @@ def _write_manifest(
                 "model_native_ring" if context_parallel_size > 1 else "disabled"
             ),
             "target_fsdp_size": int(fsdp_size),
+            "stores_target_last_hidden_states": bool(
+                stores_target_last_hidden_states
+            ),
             "target_expert_parallel_size": int(expert_parallel_size),
             "target_expert_parallel_implementation": (
                 "token_all_to_all" if expert_parallel_size > 1 else "disabled"
@@ -634,6 +650,9 @@ def main(local_rank: int):
     train_data_paths = list(cli_args.train_data_path)
     target_layer_ids = [int(layer_id) for layer_id in config.model.target_layer_ids]
     min_loss_tokens = int(cli_args.min_loss_tokens)
+    stores_target_last_hidden_states = bool(
+        config.data.get("store_target_last_hidden_states", True)
+    )
     target_config = AutoConfig.from_pretrained(
         config.model.target_model_name_or_path,
     )
@@ -739,6 +758,9 @@ def main(local_rank: int):
                 "context_parallel_size": context_parallel_size,
                 "expert_parallel_size": expert_parallel_size,
                 "tensor_parallel_size": tensor_parallel_size,
+                "stores_target_last_hidden_states": (
+                    stores_target_last_hidden_states
+                ),
                 "context_parallel_implementation": (
                     "model_native_ring"
                     if context_parallel_size > 1
@@ -908,6 +930,27 @@ def main(local_rank: int):
                 loss_mask = batch.pop("loss_mask")
                 model_inputs = batch
                 if context_parallel_size > 1:
+                    if int(batch["input_ids"].shape[0]) != 1:
+                        raise ValueError("Target CP only supports batch size 1.")
+                    attention_mask = batch["attention_mask"]
+                    sequence_length = int(attention_mask.sum(dim=1)[0].item())
+                    if sequence_length < 1:
+                        raise ValueError("Target CP received an empty sequence.")
+                    if (
+                        not bool(attention_mask[0, :sequence_length].all())
+                        or bool(attention_mask[0, sequence_length:].any())
+                    ):
+                        raise ValueError("Target CP requires right-padded inputs.")
+                    padded_length = int(batch["input_ids"].shape[1])
+                    for key in ("input_ids", "attention_mask", "mm_token_type_ids"):
+                        tensor = batch.get(key)
+                        if (
+                            tensor is not None
+                            and tensor.ndim >= 2
+                            and int(tensor.shape[-1]) == padded_length
+                        ):
+                            batch[key] = tensor[..., :sequence_length]
+                    loss_mask = loss_mask[..., :sequence_length]
                     target_result = _run_target_forward_context_parallel(
                         target_model=target_model,
                         model_inputs=model_inputs,
@@ -939,6 +982,8 @@ def main(local_rank: int):
                         local_hidden_states = target_result.target_hidden_states[0]
                         local_last_hidden_states = (
                             target_result.target_last_hidden_states[0]
+                            if stores_target_last_hidden_states
+                            else None
                         )
                         context_start = int(target_result.context_start)
                     else:
@@ -952,6 +997,8 @@ def main(local_rank: int):
                             target_result.target_last_hidden_states[
                                 sample_idx_in_batch
                             ][output_valid_tokens]
+                            if stores_target_last_hidden_states
+                            else None
                         )
                         context_start = 0
                     writer.write_sample(
@@ -1040,6 +1087,9 @@ def main(local_rank: int):
             expert_parallel_size=expert_parallel_size,
             tensor_parallel_size=tensor_parallel_size,
             fsdp_size=fsdp_size,
+            stores_target_last_hidden_states=(
+                stores_target_last_hidden_states
+            ),
             shards=shards,
         )
         cleanup_target_cache_tmp_dir(output_dir)

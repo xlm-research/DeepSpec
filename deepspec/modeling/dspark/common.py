@@ -38,6 +38,14 @@ class DSparkForwardOutput:
     confidence_pred: Optional[torch.Tensor] = None
     # [batch_size, num_anchors, block_size, vocab_size]
     aligned_target_logits: Optional[torch.Tensor] = None
+    # DFlash2 candidate-path selector outputs.  Scores are restricted to the
+    # draft model's top-k vocabulary candidates at each position.
+    # [batch_size, num_anchors, block_size, selector_top_k]
+    selector_scores: Optional[torch.Tensor] = None
+    # [batch_size, num_anchors, block_size]
+    selector_target_indices: Optional[torch.Tensor] = None
+    selector_loss_mask: Optional[torch.Tensor] = None
+    selector_recall_mask: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -90,6 +98,7 @@ def create_dspark_attention_mask(
     seq_len: int,
     block_size: int,
     device: torch.device,
+    sliding_window: int | None = None,
 ):
     def dspark_mask_mod(b, h, q_idx, kv_idx):
         del h
@@ -97,6 +106,11 @@ def create_dspark_attention_mask(
         anchor_pos = anchor_positions[b, q_block_id]
         is_context = kv_idx < seq_len
         mask_context = is_context & (kv_idx < anchor_pos)
+        if sliding_window is not None:
+            query_position = anchor_pos + (q_idx % block_size)
+            mask_context = mask_context & (
+                kv_idx > query_position - int(sliding_window)
+            )
         is_draft = kv_idx >= seq_len
         kv_block_id = (kv_idx - seq_len) // block_size
         mask_draft = is_draft & (q_block_id == kv_block_id)
@@ -123,6 +137,7 @@ def create_dspark_context_parallel_attention_mask(
     context_parallel_size: int,
     block_size: int,
     device: torch.device,
+    sliding_window: int | None = None,
 ):
     """Build masks for local anchor queries and ring-rotated CP context.
 
@@ -179,11 +194,17 @@ def create_dspark_context_parallel_attention_mask(
                 head_start + kv_idx,
                 tail_start + kv_idx - half_chunk_len_tensor,
             )
-            return (
+            visible = (
                 (global_kv_idx < sequence_length_tensor)
                 & (global_kv_idx < anchor_pos)
                 & block_keep_mask[b, q_block_id]
             )
+            if sliding_window is not None:
+                query_position = anchor_pos + (q_idx % block_size)
+                visible = visible & (
+                    global_kv_idx > query_position - int(sliding_window)
+                )
+            return visible
 
         return context_mask_mod
 
