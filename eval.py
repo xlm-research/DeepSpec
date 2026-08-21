@@ -7,6 +7,7 @@ from deepspec.eval.dspark import (
     Gemma4DSparkEvaluator,
     Qwen3DSparkEvaluator,
     Qwen3_6DSparkEvaluator,
+    Qwen3_8DFlash2Evaluator,
 )
 from deepspec.eval.eagle3 import Gemma4Eagle3Evaluator, Qwen3Eagle3Evaluator
 from deepspec.data.parser import parse_media_uri_map_entries
@@ -15,6 +16,8 @@ from deepspec.utils import CustomJSONEncoder
 EVALUATORS = {
     "Qwen3DSparkModel": Qwen3DSparkEvaluator,
     "Qwen3_6DSparkModel": Qwen3_6DSparkEvaluator,
+    "DFlash2DraftModel": Qwen3_8DFlash2Evaluator,
+    "Qwen3_8DFlash2Model": Qwen3_8DFlash2Evaluator,
     "Gemma4DSparkModel": Gemma4DSparkEvaluator,
     "Qwen3Eagle3Model": Qwen3Eagle3Evaluator,
     "Gemma4Eagle3Model": Gemma4Eagle3Evaluator,
@@ -46,6 +49,12 @@ def parse_args():
         help=("Confidence-head early-stop threshold. Confidence calibration metrics are collected only when this is 0.0."),
     )
     parser.add_argument("--tensorboard-dir", type=str, default=None)
+    parser.add_argument(
+        "--results-json",
+        type=str,
+        default=None,
+        help="Optional path for machine-readable acceptance metrics.",
+    )
     parser.add_argument("--step", type=int, default=None,help=("step for tensorboard logging"),)
     parser.add_argument("--seed", type=int, default=980406)
     parser.add_argument("--dataset-root", type=str, default="./eval_datasets")

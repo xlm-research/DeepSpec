@@ -203,7 +203,8 @@ class BaseTrainer:
         self.suspend_controller = SuspendController(device=self.device)
         self.next_micro_step = 0
 
-        if is_global_main_process(): ensure_dir(self.checkpoint_dir_root)
+        if is_global_main_process():
+            ensure_dir(self.checkpoint_dir_root)
         training_logger.init(
             logging_steps=int(self.args.logging.logging_steps),
             tensorboard_dir=self.args.logging.tensorboard_dir,
@@ -253,11 +254,36 @@ class BaseTrainer:
             context_parallel_size=self.context_parallel_size,
             context_parallel_rank=self.parallel.context_parallel_rank,
         )
-        validate_train_cache(
-            train_dataset=self.train_dataset,
-            draft_model=self.draft_model,
-            target_model_name_or_path=self.args.model.target_model_name_or_path,
-        )
+        # Hashing a 256K packed source on every worker creates needless shared
+        # filesystem traffic. Validate the complete cache identity once, then
+        # broadcast any error so all ranks fail together before training.
+        cache_validation_error = [None]
+        if is_global_main_process():
+            source_jsonl_path = self.args.data.get("source_jsonl_path")
+            try:
+                validate_train_cache(
+                    train_dataset=self.train_dataset,
+                    draft_model=self.draft_model,
+                    target_model_name_or_path=(
+                        self.args.model.target_model_name_or_path
+                    ),
+                    source_jsonl_paths=(
+                        [source_jsonl_path] if source_jsonl_path else None
+                    ),
+                    chat_template=self.args.data.get("chat_template"),
+                    max_length=self.args.data.get("max_length"),
+                    stores_target_last_hidden_states=self.args.data.get(
+                        "store_target_last_hidden_states"
+                    ),
+                )
+            except (AssertionError, OSError, ValueError) as exc:
+                cache_validation_error[0] = f"{type(exc).__name__}: {exc}"
+        dist.broadcast_object_list(cache_validation_error, src=0)
+        if cache_validation_error[0] is not None:
+            raise ValueError(
+                "Target cache identity validation failed: "
+                f"{cache_validation_error[0]}"
+            )
 
         (
             self.gradient_accumulation_steps,
@@ -465,6 +491,14 @@ class BaseTrainer:
                 with sync_context:
                     loss = self.run_batch(batch) / self.gradient_accumulation_steps
                     loss.backward()
+                # Target activations are immutable offline supervision.  Once
+                # backward has consumed them, drop the last Python references
+                # immediately so their CUDA storage can be reused by the next
+                # micro-batch instead of keeping it alive through optimizer and
+                # checkpoint work.
+                del loss
+                batch.pop("target_hidden_states", None)
+                batch.pop("target_last_hidden_states", None)
                 self.next_micro_step += 1
 
                 if not should_sync:
@@ -494,6 +528,9 @@ class BaseTrainer:
         self.save_and_eval_checkpoint()
 
     def clean_up(self):
+        close_dataset = getattr(self.train_dataset, "close", None)
+        if close_dataset is not None:
+            close_dataset()
         training_logger.close()
         dist.barrier()
         dist.destroy_process_group()

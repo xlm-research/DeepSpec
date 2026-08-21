@@ -1,3 +1,5 @@
+# ruff: noqa: E402
+
 import argparse
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -35,6 +37,7 @@ from deepspec.data.target_cache_dataset import (
     LocalCacheWriteSummary,
     atomic_json_dump,
     build_global_target_cache_shard_map,
+    build_source_jsonl_fingerprints,
     build_target_cache_manifest,
     cleanup_target_cache_tmp_dir,
     compute_local_sample_range,
@@ -1070,6 +1073,7 @@ def _write_manifest(
     fsdp_size: int,
     target_micro_chunk_size: int,
     target_cache_cpu_offload: bool,
+    stores_target_last_hidden_states: bool,
     shards,
 ):
     manifest = build_target_cache_manifest(
@@ -1080,6 +1084,9 @@ def _write_manifest(
         extra_fields={
             "target_model_name_or_path": str(config.model.target_model_name_or_path),
             "source_jsonl_paths": [str(path) for path in train_data_paths],
+            "source_jsonl_fingerprints": build_source_jsonl_fingerprints(
+                train_data_paths
+            ),
             "chat_template": str(config.data.chat_template),
             "max_length": int(config.data.max_length),
             "min_loss_tokens": int(min_loss_tokens),
@@ -1099,6 +1106,9 @@ def _write_manifest(
             "target_fsdp_size": int(fsdp_size),
             "target_micro_chunk_size": int(target_micro_chunk_size),
             "target_cache_cpu_offload": bool(target_cache_cpu_offload),
+            "stores_target_last_hidden_states": bool(
+                stores_target_last_hidden_states
+            ),
             "project_name": (
                 str(config.get("project_name"))
                 if config.get("project_name") is not None
@@ -1145,6 +1155,9 @@ def main(local_rank: int):
     context_parallel_size = int(cli_args.context_parallel_size)
     target_micro_chunk_size = int(cli_args.target_micro_chunk_size)
     target_cache_cpu_offload = cli_args.target_cache_cpu_offload == "true"
+    stores_target_last_hidden_states = bool(
+        config.data.get("store_target_last_hidden_states", True)
+    )
     if target_micro_chunk_size < 0:
         raise ValueError("--target-micro-chunk-size cannot be negative.")
     if context_parallel_size > 1 and not cli_args.fsdp:
@@ -1199,6 +1212,9 @@ def main(local_rank: int):
                 ),
                 "target_micro_chunk_size": target_micro_chunk_size,
                 "target_cache_cpu_offload": target_cache_cpu_offload,
+                "stores_target_last_hidden_states": (
+                    stores_target_last_hidden_states
+                ),
                 "sample_parallel_size": topology.sample_parallel_size,
                 "multimodal": multimodal,
                 "media_root": media_root,
@@ -1384,6 +1400,8 @@ def main(local_rank: int):
                             target_result.target_last_hidden_states[
                                 sample_idx_in_batch
                             ]
+                            if stores_target_last_hidden_states
+                            else None
                         )
                     else:
                         output_valid_tokens = valid_tokens.to(
@@ -1398,6 +1416,8 @@ def main(local_rank: int):
                             target_result.target_last_hidden_states[
                                 sample_idx_in_batch
                             ][output_valid_tokens]
+                            if stores_target_last_hidden_states
+                            else None
                         )
                     writer.write_sample(
                         input_ids=batch["input_ids"][sample_idx_in_batch][valid_tokens],
@@ -1479,6 +1499,7 @@ def main(local_rank: int):
             fsdp_size=fsdp_size,
             target_micro_chunk_size=target_micro_chunk_size,
             target_cache_cpu_offload=target_cache_cpu_offload,
+            stores_target_last_hidden_states=stores_target_last_hidden_states,
             shards=shards,
         )
         cleanup_target_cache_tmp_dir(output_dir)

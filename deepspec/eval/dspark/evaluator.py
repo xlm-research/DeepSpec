@@ -23,7 +23,11 @@ from deepspec.modeling.dspark.common import extract_context_feature
 from deepspec.modeling.dspark.gemma4 import Gemma4DSparkModel
 from deepspec.modeling.dspark.qwen3 import Qwen3DSparkModel
 from deepspec.modeling.dspark.qwen3_6 import Qwen3_6DSparkModel
-from deepspec.modeling.target_adapter import get_target_adapter
+from deepspec.modeling.dflash2 import Qwen3_8DFlash2Model
+from deepspec.modeling.target_adapter import (
+    get_target_adapter,
+    get_target_embeddings,
+)
 from deepspec.utils import jsonable
 
 
@@ -112,8 +116,11 @@ class Qwen3DSparkEvaluator(BaseEvaluator):
         stop_token_ids: list[int] | None = None,
     ) -> DraftProposal:
         model = self.draft_model
+        verification_block_size = int(
+            getattr(model, "verification_block_size", self.max_proposal_tokens)
+        )
         draft_input_ids = torch.full(
-            (output_ids.size(0), self.max_proposal_tokens),
+            (output_ids.size(0), verification_block_size),
             int(model.mask_token_id),
             dtype=torch.long,
             device=output_ids.device,
@@ -126,7 +133,7 @@ class Qwen3DSparkEvaluator(BaseEvaluator):
             past_key_values_draft=context.past_key_values_draft,
             target_hidden_states=context.target_hidden_states,
             start=start,
-            block_size=self.max_proposal_tokens,
+            block_size=verification_block_size,
         )
         return build_dspark_proposal(
             model=model,
@@ -262,4 +269,18 @@ class Qwen3_6DSparkEvaluator(Qwen3DSparkEvaluator):
             raise ValueError(
                 "Qwen3_6DSparkEvaluator requires the multimodal Qwen3.6 processor."
             )
+        return target_model, draft_model, tokenizer
+
+
+class Qwen3_8DFlash2Evaluator(Qwen3_6DSparkEvaluator):
+    draft_model_cls = Qwen3_8DFlash2Model
+
+    def build_models(self):
+        target_model, draft_model, tokenizer = super().build_models()
+        target_embed_tokens, target_lm_head = get_target_embeddings(target_model)
+        draft_model.initialize_embeddings_and_head(
+            embed_tokens=target_embed_tokens,
+            lm_head=target_lm_head,
+            freeze=True,
+        )
         return target_model, draft_model, tokenizer

@@ -223,7 +223,6 @@ def verify_draft_tokens(
         )
 
     draft_token_count = int(proposal.draft_token_count)
-    verify_length = draft_token_count + 1
     target_adapter = target_adapter or get_target_adapter(target_model)
     target_output = target_model(
         **target_adapter.build_verify_inputs(
@@ -729,6 +728,25 @@ class BaseEvaluator:
             flush=True,
         )
 
+    def write_results_json(self) -> None:
+        results_json = getattr(self.args, "results_json", None)
+        if dist.get_rank() != 0 or results_json is None:
+            return
+        output_path = Path(results_json).expanduser().resolve()
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "target_model": self.args.target_name_or_path,
+            "draft_model": self.args.draft_name_or_path,
+            "temperature": float(self.args.temperature),
+            "metrics": self.metrics_rows,
+        }
+        tmp_path = output_path.with_name(f"{output_path.name}.tmp")
+        with tmp_path.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, output_path)
+
     def print_dataset_result(self, metrics_row: dict[str, object]) -> None:
         if dist.get_rank() != 0:
             return
@@ -763,6 +781,7 @@ class BaseEvaluator:
             if self.args.tensorboard_dir is not None:
                 self.log_tensorboard()
         self.print_results()
+        self.write_results_json()
 
     def evaluate(self) -> None:
         for dataset_name, max_samples in self.tasks:

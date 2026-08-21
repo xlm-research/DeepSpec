@@ -76,6 +76,12 @@ def load_resume_draft_model(
         dtype=precision_dtype,
         attn_implementation=str(draft_model.config._attn_implementation),
     )
+    if bool(getattr(draft_model, "checkpoint_excludes_embedding_head", False)):
+        resumed_model.initialize_embeddings_and_head(
+            embed_tokens=draft_model.embed_tokens,
+            lm_head=draft_model.lm_head,
+            freeze=True,
+        )
     resumed_model = resumed_model.to(device=device, dtype=precision_dtype)
     resumed_model.set_embedding_head_trainable(False)
     return resumed_model
@@ -239,5 +245,22 @@ def _save_model_checkpoint(*, model, draft_model, checkpoint_dir: str):
             if normalized_key.startswith("_orig_mod."):
                 normalized_key = normalized_key[len("_orig_mod.") :]
             draft_state_dict[normalized_key] = value
+        filter_state_dict = getattr(
+            draft_model,
+            "filter_checkpoint_state_dict",
+            None,
+        )
+        if filter_state_dict is not None:
+            draft_state_dict = filter_state_dict(draft_state_dict)
         assert draft_state_dict, "Failed to extract draft model state_dict from checkpoint."
         draft_model.save_pretrained(checkpoint_dir, state_dict=draft_state_dict)
+        checkpoint_architecture_name = getattr(
+            draft_model,
+            "checkpoint_architecture_name",
+            None,
+        )
+        if checkpoint_architecture_name is not None:
+            draft_model.config.architectures = [
+                str(checkpoint_architecture_name)
+            ]
+            draft_model.config.save_pretrained(checkpoint_dir)

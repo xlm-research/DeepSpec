@@ -2,6 +2,7 @@ from .evaluator import (
     Gemma4DSparkEvaluator,
     Qwen3DSparkEvaluator,
     Qwen3_6DSparkEvaluator,
+    Qwen3_8DFlash2Evaluator,
 )
 from .draft_ops import (
     DSparkDraftProposal,
@@ -14,6 +15,7 @@ __all__ = [
     "Gemma4DSparkEvaluator",
     "Qwen3DSparkEvaluator",
     "Qwen3_6DSparkEvaluator",
+    "Qwen3_8DFlash2Evaluator",
     "DSparkDraftProposal",
     "build_dspark_proposal",
     "forward_dspark_draft_block",

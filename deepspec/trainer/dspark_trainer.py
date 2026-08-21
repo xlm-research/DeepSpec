@@ -27,11 +27,22 @@ class Qwen3DSparkTrainer(BaseTrainer):
 
     # Training step.
     def run_batch(self, batch):
+        needs_target_logits = (
+            float(self.args.model.l1_loss_alpha) > 0.0
+            or float(self.args.model.confidence_head_alpha) > 0.0
+        )
+        if needs_target_logits:
+            target_last_hidden_states = batch["target_last_hidden_states"]
+        else:
+            # DFlash is CE-only, so the target model's final-layer feature is
+            # unused.  Release it before the draft forward starts.
+            batch.pop("target_last_hidden_states", None)
+            target_last_hidden_states = None
         outputs = self.model(
             input_ids=batch["input_ids"],
             target_hidden_states=batch["target_hidden_states"],
             loss_mask=batch["loss_mask"],
-            target_last_hidden_states=batch["target_last_hidden_states"],
+            target_last_hidden_states=target_last_hidden_states,
             context_chunk_len=batch["context_chunk_len"],
             seq_len=batch["seq_len"],
         )

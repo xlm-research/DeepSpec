@@ -103,14 +103,31 @@ def build_dspark_proposal(
     confidence_threshold: float,
 ) -> DSparkDraftProposal:
     assert draft_input_ids.size(0) == 1, "build_dspark_proposal requires batch_size=1"
-    proposal_hidden_states = block_hidden[:, :block_size, :]
+    proposal_hidden_offset = int(getattr(model, "proposal_hidden_offset", 0))
+    proposal_hidden_states = block_hidden[
+        :,
+        proposal_hidden_offset : proposal_hidden_offset + block_size,
+        :,
+    ]
     base_draft_logits = model.compute_logits(proposal_hidden_states)
-    sampled_tokens, draft_logits = model.sample_draft_tokens(
-        base_draft_logits,
-        first_prev_token_ids=draft_input_ids[:, 0],
-        temperature=temperature,
-        hidden_states=proposal_hidden_states,
-    )
+    select_draft_tokens = getattr(model, "select_draft_tokens", None)
+    selector_probs = None
+    selector_candidates = None
+    if select_draft_tokens is not None:
+        sampled_tokens, selector_candidates, selector_probs = select_draft_tokens(
+            hidden_states=proposal_hidden_states,
+            draft_logits=base_draft_logits,
+            anchor_ids=draft_input_ids[:, 0],
+            temperature=temperature,
+        )
+        draft_logits = base_draft_logits
+    else:
+        sampled_tokens, draft_logits = model.sample_draft_tokens(
+            base_draft_logits,
+            first_prev_token_ids=draft_input_ids[:, 0],
+            temperature=temperature,
+            hidden_states=proposal_hidden_states,
+        )
 
     proposal_draft_tokens = int(block_size)
     confidence_logits = None
@@ -137,10 +154,24 @@ def build_dspark_proposal(
         [draft_input_ids[:, :1], sampled_tokens[:, :proposal_draft_tokens]],
         dim=1,
     )
-    draft_probs = logits_to_probs(
-        draft_logits[:, :proposal_draft_tokens, :],
-        temperature,
-    )
+    if selector_candidates is None:
+        draft_probs = logits_to_probs(
+            draft_logits[:, :proposal_draft_tokens, :],
+            temperature,
+        )
+    else:
+        candidate_ids = selector_candidates[:, :proposal_draft_tokens, :]
+        if selector_probs is None:
+            selected = sampled_tokens[:, :proposal_draft_tokens]
+            candidate_probs = candidate_ids.eq(selected.unsqueeze(-1)).to(
+                torch.float32
+            )
+        else:
+            candidate_probs = selector_probs[:, :proposal_draft_tokens, :]
+        draft_probs = torch.zeros_like(
+            draft_logits[:, :proposal_draft_tokens, :],
+            dtype=candidate_probs.dtype,
+        ).scatter_add(-1, candidate_ids, candidate_probs)
     return DSparkDraftProposal(
         draft_token_count=proposal_draft_tokens,
         verify_input_ids=verify_input_ids,
