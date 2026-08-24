@@ -7,6 +7,18 @@ import torch.distributed as dist
 _REDUCTION_PATTERN = re.compile(r"^(dp_)?(mean|sum|max|min|last)$")
 _DEFAULT_RATIO_REDUCTION = "dp_sum"
 _metrics = {}
+_reduction_group = None
+
+
+def configure_reduction_group(group) -> None:
+    global _reduction_group
+    _reduction_group = group
+
+
+def _group_world_size() -> int:
+    if not dist.is_available() or not dist.is_initialized():
+        return 1
+    return dist.get_world_size(_reduction_group)
 
 
 def _detach_scalar(value):
@@ -26,19 +38,19 @@ def _clone_to_reduce_device(value: torch.Tensor) -> torch.Tensor:
 
 def _reduce_dp_value(value: torch.Tensor, op_name: str) -> torch.Tensor:
     if op_name == "sum" or op_name == "mean":
-        dist.all_reduce(value, op=dist.ReduceOp.SUM)
+        dist.all_reduce(value, op=dist.ReduceOp.SUM, group=_reduction_group)
         if op_name == "mean":
-            value = value / dist.get_world_size()
+            value = value / _group_world_size()
         return value
     if op_name == "max":
-        dist.all_reduce(value, op=dist.ReduceOp.MAX)
+        dist.all_reduce(value, op=dist.ReduceOp.MAX, group=_reduction_group)
         return value
     if op_name == "min":
-        dist.all_reduce(value, op=dist.ReduceOp.MIN)
+        dist.all_reduce(value, op=dist.ReduceOp.MIN, group=_reduction_group)
         return value
     if op_name == "last":
-        gathered = [torch.empty_like(value) for _ in range(dist.get_world_size())]
-        dist.all_gather(gathered, value)
+        gathered = [torch.empty_like(value) for _ in range(_group_world_size())]
+        dist.all_gather(gathered, value, group=_reduction_group)
         return gathered[-1]
     raise AssertionError(f"unsupported reduction: {op_name}")
 
@@ -71,8 +83,10 @@ def _schema():
 
 def _assert_schema_consistent():
     local_schema = _schema()
-    gathered = [None for _ in range(dist.get_world_size())]
-    dist.all_gather_object(gathered, local_schema)
+    if _group_world_size() == 1:
+        return
+    gathered = [None for _ in range(_group_world_size())]
+    dist.all_gather_object(gathered, local_schema, group=_reduction_group)
     reference = gathered[0]
     for rank, schema in enumerate(gathered[1:], start=1):
         assert schema == reference, (
@@ -170,4 +184,4 @@ def reset() -> None:
     _metrics.clear()
 
 
-__all__ = ["add_metric", "flush", "reset"]
+__all__ = ["add_metric", "configure_reduction_group", "flush", "reset"]

@@ -15,6 +15,7 @@ class ChatTemplate:
     system_prompt: str | None
     end_of_turn_token: str | None
     assistant_loss_prefix: str | None = None
+    tokenizer_chat_template: str | None = None
 
 
 class TemplateRegistry:
@@ -38,6 +39,24 @@ TEMPLATE_REGISTRY.register(
         user_header="<|im_start|>user\n",
         system_prompt="You are a helpful assistant.",
         end_of_turn_token="<|im_end|>\n",
+    ),
+)
+
+TEMPLATE_REGISTRY.register(
+    "deepseek_v4",
+    ChatTemplate(
+        assistant_header="<｜Assistant｜></think>",
+        user_header="<｜User｜>",
+        system_prompt="You are a helpful assistant.",
+        end_of_turn_token="<｜end▁of▁sentence｜>",
+        tokenizer_chat_template=(
+            "{% for message in messages %}"
+            "{% if loop.first %}{{ bos_token }}{% endif %}"
+            "{% if message['role'] == 'system' %}{{ message['content'] }}"
+            "{% elif message['role'] == 'user' %}<｜User｜>{{ message['content'] }}"
+            "{% elif message['role'] == 'assistant' %}<｜Assistant｜></think>"
+            "{{ message['content'] }}{{ eos_token }}{% endif %}{% endfor %}"
+        ),
     ),
 )
 
@@ -217,6 +236,7 @@ class GeneralParser:
             self.tokenizer,
             render_messages,
             add_generation_prompt=False,
+            chat_template=self.chat_template.tokenizer_chat_template,
         )
 
         encoding = self.tokenizer(
@@ -289,6 +309,7 @@ def render_chat_messages(
     *,
     add_generation_prompt: bool,
     enable_thinking: bool | None = None,
+    chat_template: str | None = None,
 ) -> str:
     chat_kwargs = {
         "tokenize": False,
@@ -296,6 +317,8 @@ def render_chat_messages(
     }
     if enable_thinking is not None:
         chat_kwargs["enable_thinking"] = enable_thinking
+    if chat_template is not None:
+        chat_kwargs["chat_template"] = chat_template
     return tokenizer.apply_chat_template(messages, **chat_kwargs)
 
 

@@ -16,6 +16,7 @@ from .distributed import (
 from .io import ensure_dir, safe_symlink
 from .metrics import add_metric, flush, reset
 from .optim import BF16Optimizer
+from .parallel import compute_context_parallel_range
 
 def seed_all(seed):
     torch.manual_seed(seed)
@@ -69,6 +70,7 @@ __all__ = [
     "StatelessResumableDistributedSampler",
     "add_metric",
     "ensure_dir",
+    "compute_context_parallel_range",
     "flush",
     "get_git_diff",
     "get_git_sha",

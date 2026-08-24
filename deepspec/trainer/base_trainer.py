@@ -1,31 +1,46 @@
-from contextlib import nullcontext
 import math
 import os
+import json
 
 import torch
 import torch.distributed as dist
-from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp import MixedPrecision, ShardingStrategy
-from torch.distributed.fsdp.wrap import ModuleWrapPolicy
 from torch.utils.data import DataLoader
 from transformers import AutoConfig, AutoProcessor, AutoTokenizer
 
-from deepspec.data import CacheDataset, validate_train_cache
+from deepspec.data import (
+    CacheCollator,
+    CacheDataset,
+    ConversationCollator,
+    validate_train_cache,
+)
 from deepspec.data.cuda_prefetcher import CUDAPrefetcher
+from deepspec.data.jsonl_dataset import JsonLineDataset
 from deepspec.modeling.target_adapter import (
     get_target_embeddings,
     is_multimodal_config,
     load_target_model_with_head,
 )
 from deepspec.utils import (
-    BF16Optimizer,
     StatelessResumableDistributedSampler,
     ensure_dir,
     init_dist,
     is_global_main_process,
     print_on_global_main,
     print_on_local_main,
+)
+from deepspec.training import BF16Optimizer
+from deepspec.training.loss import configure_loss_reduction_group
+from deepspec.distributed import ParallelConfig, ParallelContext, apply_parallelism
+from deepspec.distributed.context_parallel import FixedContextParallel
+from deepspec.distributed.distributed_checkpoint import (
+    TrainingProgress as DistributedTrainingProgress,
+    has_distributed_checkpoint,
+    load_training_checkpoint as load_distributed_training_checkpoint,
+)
+from deepspec.distributed.fsdp import clip_grad_norm_, gradient_sync_context
+from deepspec.modeling.pure_ep import (
+    get_pure_expert_modules,
+    synchronize_pure_expert_gradients,
 )
 from deepspec.trainer.ckpt_manager import (
     discover_latest_checkpoint,
@@ -35,7 +50,7 @@ from deepspec.trainer.ckpt_manager import (
 )
 import deepspec.utils.training_logger as training_logger
 from deepspec.utils.hfai_suspend import SuspendController
-from deepspec.utils.parallel import build_parallel_topology
+from deepspec.utils.metrics import configure_reduction_group
 
 
 _PRECISION_DTYPES = {
@@ -44,56 +59,33 @@ _PRECISION_DTYPES = {
     "fp32": torch.float32,
 }
 
-_SHARDING_STRATEGIES = {
-    "full_shard": ShardingStrategy.FULL_SHARD,
-    "shard_grad_op": ShardingStrategy.SHARD_GRAD_OP,
-    "no_shard": ShardingStrategy.NO_SHARD,
-    "hybrid_shard": ShardingStrategy.HYBRID_SHARD,
-    "hybrid_shard_zero2": ShardingStrategy._HYBRID_SHARD_ZERO2,
-    "_hybrid_shard_zero2": ShardingStrategy._HYBRID_SHARD_ZERO2,
-}
 
-_HYBRID_STRATEGIES = (
-    ShardingStrategy.HYBRID_SHARD,
-    ShardingStrategy._HYBRID_SHARD_ZERO2,
-)
+def _load_checkpoint_tensor(checkpoint_dir: str, names: tuple[str, ...]):
+    """Load one safetensors entry without constructing the full target model."""
 
+    from safetensors import safe_open
 
-def _build_fsdp_kwargs(
-    *,
-    sharding_strategy_name: str,
-    precision_dtype,
-    world_size: int,
-    fsdp_size: int,
-) -> dict:
-    sharding_strategy = _SHARDING_STRATEGIES[sharding_strategy_name]
-    replicate_size = world_size // int(fsdp_size)
-    if replicate_size > 1:
-        if sharding_strategy == ShardingStrategy.FULL_SHARD:
-            sharding_strategy = ShardingStrategy.HYBRID_SHARD
-        elif sharding_strategy == ShardingStrategy.SHARD_GRAD_OP:
-            sharding_strategy = ShardingStrategy._HYBRID_SHARD_ZERO2
-        elif sharding_strategy not in _HYBRID_STRATEGIES:
-            raise ValueError(
-                "train.fsdp_size < world_size requires full_shard, "
-                "shard_grad_op, or a hybrid sharding strategy."
-            )
-    fsdp_kwargs = dict(
-        use_orig_params=True,
-        mixed_precision=MixedPrecision(
-            param_dtype=precision_dtype,
-            buffer_dtype=precision_dtype,
-        ),
-        sharding_strategy=sharding_strategy,
-    )
-    if sharding_strategy in _HYBRID_STRATEGIES:
-        fsdp_kwargs["device_mesh"] = init_device_mesh(
-            "cuda",
-            (replicate_size, int(fsdp_size)),
-            mesh_dim_names=("replicate", "shard"),
-        )
-    return fsdp_kwargs
-
+    index_path = os.path.join(checkpoint_dir, "model.safetensors.index.json")
+    if os.path.isfile(index_path):
+        with open(index_path, "r", encoding="utf-8") as handle:
+            weight_map = json.load(handle)["weight_map"]
+        for name in names:
+            shard = weight_map.get(name)
+            if shard is not None:
+                with safe_open(
+                    os.path.join(checkpoint_dir, shard),
+                    framework="pt",
+                    device="cpu",
+                ) as handle:
+                    return handle.get_tensor(name)
+    tensor_path = os.path.join(checkpoint_dir, "model.safetensors")
+    if os.path.isfile(tensor_path):
+        with safe_open(tensor_path, framework="pt", device="cpu") as handle:
+            available = set(handle.keys())
+            for name in names:
+                if name in available:
+                    return handle.get_tensor(name)
+    raise KeyError(f"None of {names} exists in {checkpoint_dir}.")
 
 def _compute_gradient_accumulation_steps(
     *, world_size: int, local_batch_size: int, global_batch_size: int
@@ -179,22 +171,62 @@ class BaseTrainer:
     def __init__(self, local_rank, args):
         self.args = args
         self.device, self.global_rank, self.world_size = init_dist(local_rank)
-        self.context_parallel_size = int(
-            self.args.train.get("context_parallel_size", 1)
+        self.parallel_config = ParallelConfig.from_mapping(
+            self.args.train,
+            world_size=self.world_size,
         )
-        configured_fsdp_size = self.args.train.get("fsdp_size")
-        self.fsdp_size = (
-            self.world_size // self.context_parallel_size
-            if configured_fsdp_size is None
-            else int(configured_fsdp_size)
+        self.parallel = ParallelContext.build(
+            self.parallel_config,
+            device_type=self.device.type,
         )
-        self.parallel = build_parallel_topology(
-            context_parallel_size=self.context_parallel_size,
-            fsdp_size=self.fsdp_size,
-            create_fsdp_groups=False,
+        # The frozen online teacher may use a different sparse expert view
+        # from the trainable draft while retaining the exact same dense rank
+        # layout and CP partition. This lets a DeepSeek teacher route its 128K
+        # token volume with EP without forcing sparse all-to-all into the
+        # anchor-sized draft model.
+        self.target_parallel_config = self.parallel_config
+        self.target_parallel = self.parallel
+        target_parallel_overrides = self.args.train.get("target_parallel")
+        if target_parallel_overrides is not None:
+            merged_target_parallel = self.parallel_config.to_dict()
+            merged_target_parallel.update(dict(target_parallel_overrides))
+            self.target_parallel_config = ParallelConfig.from_mapping(
+                {"parallel": merged_target_parallel},
+                world_size=self.world_size,
+            )
+            dense_dimensions = (
+                "dp_replicate",
+                "dp_shard",
+                "cp",
+                "tp",
+                "pp",
+            )
+            changed_dense = [
+                name
+                for name in dense_dimensions
+                if getattr(self.target_parallel_config, name)
+                != getattr(self.parallel_config, name)
+            ]
+            if changed_dense:
+                raise ValueError(
+                    "train.target_parallel may override sparse target settings "
+                    f"but not the shared dense layout; changed={changed_dense}."
+                )
+            self.target_parallel = ParallelContext.build(
+                self.target_parallel_config,
+                device_type=self.device.type,
+            )
+        self.context_parallel_size = self.parallel_config.cp
+        self.fsdp_size = self.parallel_config.fsdp_shard_size
+        self.data_parallel_size = self.parallel.data_parallel_size
+        self.data_parallel_rank = self.parallel.data_parallel_rank
+        reduction_group = self.parallel.loss_mesh.get_group()
+        configure_loss_reduction_group(reduction_group)
+        configure_reduction_group(reduction_group)
+        self.fixed_context_parallel = FixedContextParallel(
+            self.parallel,
+            backend=self.parallel_config.context_parallel_backend,
         )
-        self.data_parallel_size = self.parallel.sample_parallel_size
-        self.data_parallel_rank = self.parallel.sample_parallel_rank
         self.precision_dtype = _PRECISION_DTYPES[self.args.train.precision]
         self.checkpoint_dir_root = self.args.logging.checkpoint_dir
         self.resume_checkpoint_dir = discover_latest_checkpoint(
@@ -202,6 +234,10 @@ class BaseTrainer:
         )
         self.suspend_controller = SuspendController(device=self.device)
         self.next_micro_step = 0
+        self.online_target_enabled = bool(self.args.data.get("online_target", False))
+        self.online_target = None
+        if self.online_target_enabled and int(self.args.train.local_batch_size) != 1:
+            raise ValueError("Online target training requires local_batch_size=1.")
 
         if is_global_main_process():
             ensure_dir(self.checkpoint_dir_root)
@@ -211,7 +247,11 @@ class BaseTrainer:
         )
 
         self.draft_model, self.tokenizer = self.build_models()
-        if self.resume_checkpoint_dir is not None:
+        resume_is_distributed = bool(
+            self.resume_checkpoint_dir is not None
+            and has_distributed_checkpoint(self.resume_checkpoint_dir)
+        )
+        if self.resume_checkpoint_dir is not None and not resume_is_distributed:
             self.draft_model = load_resume_draft_model(
                 resume_checkpoint_dir=self.resume_checkpoint_dir,
                 draft_model=self.draft_model,
@@ -231,34 +271,43 @@ class BaseTrainer:
             configure_cp(
                 size=self.context_parallel_size,
                 rank=self.parallel.context_parallel_rank,
-                group=self.parallel.context_parallel_group,
-                model_parallel_group=self.parallel.model_parallel_group,
+                group=self.parallel.cp_mesh.get_group(),
+                model_parallel_group=self.parallel.model_mesh.get_group(),
                 model_parallel_src_rank=self.parallel.model_parallel_src_rank,
             )
-        self.model = self.draft_model
-        if self.context_parallel_size > 1 and bool(
-            self.args.train.torch_compile
-        ):
-            print_on_global_main(
-                "Disabling torch.compile because the CP path contains "
-                "autograd collectives and dynamic FlexAttention masks."
-            )
-            self.args.train.torch_compile = False
-        if self.args.train.torch_compile:
-            print_on_local_main("Compiling training model with torch.compile...")
-            self.model = torch.compile(self.model, dynamic=True)
-        self.model = self._wrap_with_fsdp(self.model)
-
-        self.train_dataset = CacheDataset(
-            cache_dir=self.args.data.target_cache_path,
-            context_parallel_size=self.context_parallel_size,
-            context_parallel_rank=self.parallel.context_parallel_rank,
+        self.model = apply_parallelism(
+            self.draft_model,
+            self.parallel,
+            self.parallel_config,
+            param_dtype=self.precision_dtype,
+            sequence_length=self.args.data.get("max_length"),
         )
+        self._pure_expert_modules = get_pure_expert_modules(self.draft_model)
+
+        if self.online_target_enabled:
+            paths = self.args.data.get("train_data_path")
+            paths = [os.fspath(paths)] if isinstance(paths, (str, os.PathLike)) else list(paths or [])
+            if not paths:
+                raise ValueError("Online target training requires data.train_data_path.")
+            self.train_dataset = JsonLineDataset(paths)
+            self.data_collator = ConversationCollator(
+                tokenizer=self.tokenizer,
+                chat_template=self.args.data.chat_template,
+                max_length=int(self.args.data.max_length),
+                min_loss_tokens=int(self.args.data.get("min_loss_tokens", 1)),
+            )
+        else:
+            self.train_dataset = CacheDataset(
+                cache_dir=self.args.data.target_cache_path,
+                context_parallel_size=self.context_parallel_size,
+                context_parallel_rank=self.parallel.context_parallel_rank,
+            )
+            self.data_collator = (self.data_collator_cls or CacheCollator)()
         # Hashing a 256K packed source on every worker creates needless shared
         # filesystem traffic. Validate the complete cache identity once, then
         # broadcast any error so all ranks fail together before training.
         cache_validation_error = [None]
-        if is_global_main_process():
+        if not self.online_target_enabled and is_global_main_process():
             source_jsonl_path = self.args.data.get("source_jsonl_path")
             try:
                 validate_train_cache(
@@ -309,7 +358,35 @@ class BaseTrainer:
             warmup_ratio=float(self.args.train.warmup_ratio),
             weight_decay=float(self.args.train.weight_decay),
         )
-        if self.resume_checkpoint_dir is not None:
+        if resume_is_distributed:
+            model_config = getattr(self.draft_model.config, "to_dict", lambda: {})()
+            progress = DistributedTrainingProgress(
+                next_micro_step=0,
+                global_step=0,
+                epoch=0,
+                data_position=0,
+                local_batch_size=int(self.args.train.local_batch_size),
+                saved_world_size=self.world_size,
+                parallel_config=self.parallel_config.to_dict(),
+                model_config=model_config,
+            )
+            progress = load_distributed_training_checkpoint(
+                checkpoint_dir=self.resume_checkpoint_dir,
+                model=self.model,
+                optimizer_bundle=self.optimizer,
+                progress=progress,
+            )
+            if int(progress.local_batch_size) != int(self.args.train.local_batch_size):
+                raise ValueError(
+                    "Resume local_batch_size mismatch: "
+                    f"{progress.local_batch_size} != {self.args.train.local_batch_size}."
+                )
+            self.next_micro_step = int(progress.next_micro_step)
+            print_on_global_main(
+                f"AUTO-RESUME distributed_checkpoint from {self.resume_checkpoint_dir}, "
+                f"next_micro_step={self.next_micro_step}, saved_world_size={progress.saved_world_size}."
+            )
+        elif self.resume_checkpoint_dir is not None:
             resume_state = load_training_state(
                 resume_checkpoint_dir=self.resume_checkpoint_dir,
                 optimizer=self.optimizer,
@@ -322,6 +399,8 @@ class BaseTrainer:
             self.next_micro_step = resume_state.next_micro_step
         else:
             print_on_local_main("Training from scratch.")
+        if self.online_target_enabled:
+            self.online_target = self.build_online_target()
         self.info_board()
 
     @property
@@ -334,7 +413,9 @@ class BaseTrainer:
         print_on_local_main(
             "  Parallel topology = "
             f"CP {self.context_parallel_size} x FSDP {self.fsdp_size} "
-            f"(effective data replicas {self.data_parallel_size})"
+            f"(effective data replicas {self.data_parallel_size}), "
+            f"draft EP {self.parallel_config.ep}, "
+            f"target EP {self.target_parallel_config.ep}"
         )
         print_on_local_main(f"  Num train epochs = {self.args.train.num_train_epochs}")
         print_on_local_main(f"  Samples per epoch = {self.samples_per_epoch}")
@@ -368,42 +449,41 @@ class BaseTrainer:
 
         # Training only uses the target checkpoint to initialize frozen draft
         # embeddings and lm_head weights.
-        target_model = load_target_model_with_head(
-            model_args.target_model_name_or_path,
-            dtype=self.precision_dtype,
-        ).to(device="cpu").eval()
-        target_embed_tokens, target_lm_head = get_target_embeddings(target_model)
-        draft_model.initialize_embeddings_and_head(
-            embed_tokens=target_embed_tokens,
-            lm_head=target_lm_head,
-            freeze=True,
-        )
-        del target_model
+        if str(target_config.model_type) == "deepseek_v4":
+            embed_weight = _load_checkpoint_tensor(
+                model_args.target_model_name_or_path,
+                ("model.embed_tokens.weight", "model.language_model.embed_tokens.weight", "embed.weight"),
+            )
+            head_weight = _load_checkpoint_tensor(
+                model_args.target_model_name_or_path,
+                ("lm_head.weight", "model.lm_head.weight", "head.weight"),
+            )
+            draft_model.initialize_embedding_and_head_weights(
+                embed_weight=embed_weight.to(self.precision_dtype),
+                lm_head_weight=head_weight.to(self.precision_dtype),
+                freeze=True,
+            )
+        else:
+            target_model = load_target_model_with_head(
+                model_args.target_model_name_or_path,
+                dtype=self.precision_dtype,
+            ).to(device="cpu").eval()
+            target_embed_tokens, target_lm_head = get_target_embeddings(target_model)
+            draft_model.initialize_embeddings_and_head(
+                embed_tokens=target_embed_tokens,
+                lm_head=target_lm_head,
+                freeze=True,
+            )
+            del target_model
         return draft_model, tokenizer
 
     def _build_draft_model(self, *, target_config, model_args):
         raise NotImplementedError
 
-    def _wrap_with_fsdp(self, model):
-        fsdp_kwargs = _build_fsdp_kwargs(
-            sharding_strategy_name=self.args.train.sharding_strategy,
-            precision_dtype=self.precision_dtype,
-            world_size=self.world_size,
-            fsdp_size=self.fsdp_size,
+    def build_online_target(self):
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement online target training."
         )
-        fsdp_kwargs["device_id"] = self.device
-        if bool(self.args.train.get("fsdp_layerwise", False)):
-            uncompiled_model = getattr(model, "_orig_mod", model)
-            decoder_layers = list(getattr(uncompiled_model, "layers", []))
-            if not decoder_layers:
-                raise ValueError(
-                    "train.fsdp_layerwise=true but the draft model does not "
-                    "expose decoder layers."
-                )
-            fsdp_kwargs["auto_wrap_policy"] = ModuleWrapPolicy(
-                {type(layer) for layer in decoder_layers}
-            )
-        return FSDP(model, **fsdp_kwargs)
 
     def _build_train_dataloader(self, start_offset_samples=0, num_samples=None):
         sampler = StatelessResumableDistributedSampler(
@@ -418,7 +498,7 @@ class BaseTrainer:
             self.train_dataset,
             batch_size=int(self.args.train.local_batch_size),
             sampler=sampler,
-            collate_fn=self.data_collator_cls(),
+            collate_fn=self.data_collator,
             num_workers=int(self.args.data.num_workers),
             pin_memory=True,
             drop_last=True,
@@ -428,6 +508,26 @@ class BaseTrainer:
 
     def run_batch(self, batch):
         raise NotImplementedError
+
+    def forward_model(self, **kwargs):
+        buffer_names = self.args.train.get(
+            "context_parallel_buffers",
+            ["input_ids", "labels", "attention_mask", "position_ids"],
+        )
+        sequence_dims = self.args.train.get("context_parallel_sequence_dims", {})
+        buffers = []
+        dims = []
+        for name in buffer_names:
+            value = kwargs.get(name)
+            if isinstance(value, torch.Tensor):
+                buffers.append(value)
+                dims.append(int(sequence_dims.get(name, 1)))
+        with self.fixed_context_parallel.forward_context(
+            buffers=buffers,
+            sequence_dims=dims,
+        ):
+            # Always call the module to preserve compile/FSDP pre-forward hooks.
+            return self.model(**kwargs)
 
     def _checkpoint_kwargs(self):
         return dict(
@@ -441,6 +541,9 @@ class BaseTrainer:
             global_rank=self.global_rank,
             world_size=self.world_size,
             local_batch_size=int(self.args.train.local_batch_size),
+            parallel_config=self.parallel_config,
+            model_config=getattr(self.draft_model.config, "to_dict", lambda: {})(),
+            micro_batches_per_epoch=self.micro_batches_per_epoch,
         )
 
     def save_and_eval_checkpoint(self):
@@ -487,8 +590,7 @@ class BaseTrainer:
                 should_sync = (
                     (self.next_micro_step + 1) % self.gradient_accumulation_steps == 0
                 )
-                sync_context = nullcontext() if should_sync else self.model.no_sync()
-                with sync_context:
+                with gradient_sync_context(self.model, should_sync=should_sync):
                     loss = self.run_batch(batch) / self.gradient_accumulation_steps
                     loss.backward()
                 # Target activations are immutable offline supervision.  Once
@@ -504,9 +606,20 @@ class BaseTrainer:
                 if not should_sync:
                     continue
 
-                grad_norm = FSDP.clip_grad_norm_(
+                synchronize_pure_expert_gradients(
+                    self._pure_expert_modules,
+                    sparse_mesh=self.parallel.sparse_mesh,
+                )
+
+                grad_norm = clip_grad_norm_(
                     self.model,
                     float(self.args.train.max_grad_norm),
+                    pure_expert_modules=self._pure_expert_modules,
+                    expert_parallel_group=(
+                        self.parallel.expert_parallel_group
+                        if self.parallel.pure_expert_parallel
+                        else None
+                    ),
                 )
                 self.optimizer.step()
                 training_logger.on_optimizer_step(
@@ -528,6 +641,9 @@ class BaseTrainer:
         self.save_and_eval_checkpoint()
 
     def clean_up(self):
+        if self.online_target is not None:
+            self.online_target.close()
+            self.online_target = None
         close_dataset = getattr(self.train_dataset, "close", None)
         if close_dataset is not None:
             close_dataset()

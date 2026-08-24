@@ -7,8 +7,13 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import yaml
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp import FullStateDictConfig, StateDictType
+
+from deepspec.distributed.distributed_checkpoint import (
+    TrainingProgress as DistributedTrainingProgress,
+    full_model_state_dict,
+    save_training_checkpoint as save_distributed_training_checkpoint,
+    write_checkpoint_metadata,
+)
 
 from deepspec.utils import (
     ensure_dir,
@@ -151,6 +156,9 @@ def save_checkpoint(
     global_rank: int,
     world_size: int,
     local_batch_size: int,
+    parallel_config,
+    model_config: dict,
+    micro_batches_per_epoch: int,
 ) -> str:
     assert next_micro_step % gradient_accumulation_steps == 0, (
         "next_micro_step must be aligned with gradient_accumulation_steps at "
@@ -168,20 +176,25 @@ def save_checkpoint(
         draft_model=draft_model,
         checkpoint_dir=checkpoint_dir,
     )
-    training_state = _serialize_training_state(
-        optimizer=optimizer,
+    progress = DistributedTrainingProgress(
         next_micro_step=next_micro_step,
-        gradient_accumulation_steps=gradient_accumulation_steps,
-        global_rank=global_rank,
-        world_size=world_size,
+        global_step=global_step,
+        epoch=next_micro_step // int(micro_batches_per_epoch),
+        data_position=next_micro_step * int(local_batch_size),
         local_batch_size=local_batch_size,
+        saved_world_size=world_size,
+        parallel_config=parallel_config.to_dict(),
+        model_config=model_config,
     )
-    torch.save(
-        training_state,
-        _rank_training_state_path(checkpoint_dir, global_rank),
+    save_distributed_training_checkpoint(
+        checkpoint_dir=checkpoint_dir,
+        model=model,
+        optimizer_bundle=optimizer,
+        progress=progress,
     )
     dist.barrier()
     if is_global_main_process():
+        write_checkpoint_metadata(checkpoint_dir, progress=progress)
         safe_symlink(
             checkpoint_dir,
             os.path.join(checkpoint_dir_root, "step_latest"),
@@ -226,14 +239,7 @@ def _serialize_training_state(
 
 
 def _full_model_state_dict(model):
-    assert isinstance(model, FSDP), "training model must be wrapped in FSDP"
-    state_dict_config = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-    with FSDP.state_dict_type(
-        model,
-        StateDictType.FULL_STATE_DICT,
-        state_dict_config,
-    ):
-        return model.state_dict()
+    return full_model_state_dict(model)
 
 
 def _save_model_checkpoint(*, model, draft_model, checkpoint_dir: str):

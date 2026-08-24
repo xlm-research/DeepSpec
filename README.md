@@ -38,6 +38,10 @@ bash scripts/train/train.sh
 
 Hardware: the default configs and scripts assume a single node with 8 GPUs. For fewer GPUs, reduce `CUDA_VISIBLE_DEVICES`.
 
+The modular PyTorch-native FSDP2/TP/fixed-CP architecture, torchrun profiles,
+distributed-checkpoint migration notes, support matrix, and validated commands
+are documented in [doc/distributed_training.md](./doc/distributed_training.md).
+
 
 ## Evaluation
 

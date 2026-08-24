@@ -1,34 +1,16 @@
 import contextlib
-import os
 import time
-from datetime import timedelta
 
 import torch
 import torch.distributed as dist
 from torch.utils.data import Sampler
 
+from deepspec.distributed.runtime import initialize_runtime
+
 
 def init_dist(local_rank: int, timeout_minutes: int = 60):
-    local_world_size = torch.cuda.device_count()
-    node_rank = int(os.environ.get("RANK", "0"))
-    node_world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    master_addr = os.environ.get("MASTER_ADDR", "127.0.0.1")
-    master_port = os.environ.get("MASTER_PORT", "29500")
-    rank = node_rank * local_world_size + local_rank
-    world_size = node_world_size * local_world_size
-    init_method = f"tcp://{master_addr}:{master_port}"
-    torch.cuda.set_device(local_rank)
-    device = torch.device("cuda", local_rank)
-
-    dist.init_process_group(
-        backend="nccl",
-        init_method=init_method,
-        rank=rank,
-        world_size=world_size,
-        timeout=timedelta(minutes=timeout_minutes),
-        device_id=device,
-    )
-    return device, rank, world_size
+    runtime = initialize_runtime(local_rank, timeout_minutes=timeout_minutes)
+    return runtime.device, runtime.global_rank, runtime.world_size
 
 
 def is_global_main_process():

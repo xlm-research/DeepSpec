@@ -26,6 +26,29 @@ class ParallelTopology:
     model_parallel_src_rank: int
 
 
+def compute_context_parallel_range(
+    *, sequence_length: int, context_parallel_rank: int, context_parallel_size: int
+) -> tuple[int, int]:
+    """Return the balanced contiguous interval owned by one CP rank."""
+
+    sequence_length = int(sequence_length)
+    rank = int(context_parallel_rank)
+    size = int(context_parallel_size)
+    if sequence_length < 1:
+        raise ValueError("sequence_length must be positive.")
+    if size < 1 or not 0 <= rank < size:
+        raise ValueError(f"Invalid CP rank/size: rank={rank}, size={size}.")
+    base, remainder = divmod(sequence_length, size)
+    start = rank * base + min(rank, remainder)
+    length = base + int(rank < remainder)
+    if length == 0:
+        raise ValueError(
+            "A sequence must contain at least one token per CP rank: "
+            f"sequence_length={sequence_length}, CP={size}."
+        )
+    return start, start + length
+
+
 def build_parallel_topology(
     *,
     context_parallel_size: int,
@@ -112,4 +135,8 @@ def build_parallel_topology(
     )
 
 
-__all__ = ["ParallelTopology", "build_parallel_topology"]
+__all__ = [
+    "ParallelTopology",
+    "build_parallel_topology",
+    "compute_context_parallel_range",
+]
