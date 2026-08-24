@@ -58,4 +58,10 @@ if __name__ == "__main__":
     if os.path.exists(".git"):
         print("git status:", "\n\n".join(get_git_sha(detail_info=True)))
         print("git diff:", get_git_diff())
-    torch.multiprocessing.spawn(main, nprocs=torch.cuda.device_count())
+    if "LOCAL_RANK" in os.environ:
+        # Standard torchrun contract: one Python process per worker.
+        main(int(os.environ["LOCAL_RANK"]))
+    else:
+        # Backward-compatible single-node entry. New launches should use
+        # torchrun so rank/world-size semantics also work across nodes.
+        torch.multiprocessing.spawn(main, nprocs=torch.cuda.device_count())

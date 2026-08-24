@@ -724,30 +724,21 @@ def _deepseek_v4_forward_context_parallel(
     device,
 ):
     del device
-    input_ids = model_inputs["input_ids"]
-    if int(input_ids.shape[0]) != 1:
+    if int(model_inputs["input_ids"].shape[0]) != 1:
         raise ValueError("DeepSeek-V4 Ring CP currently requires batch size 1.")
     attention_mask = model_inputs["attention_mask"]
-    if attention_mask.shape != input_ids.shape:
-        raise ValueError("DeepSeek-V4 Ring CP input IDs and attention mask must align.")
-    valid_sequence_length = int(attention_mask.sum(dim=1)[0].item())
-    if valid_sequence_length < 1:
-        raise ValueError("DeepSeek-V4 Ring CP received an empty token sequence.")
-    if not bool(attention_mask[0, :valid_sequence_length].all()) or bool(
-        attention_mask[0, valid_sequence_length:].any()
+    sequence_length = int(attention_mask.sum(dim=1)[0].item())
+    if not bool(attention_mask[0, :sequence_length].all()) or bool(
+        attention_mask[0, sequence_length:].any()
     ):
         raise ValueError("DeepSeek-V4 Ring CP requires right-padded attention masks.")
-    # CP partitions the aligned tensor shape, not the number of valid tokens.
-    # Right padding is causally invisible to the real prefix and guarantees
-    # every rank owns a multiple of the model's 128-token attention unit.
-    sequence_length = int(input_ids.shape[1])
     local_start, local_end = compute_context_parallel_range(
         sequence_length=sequence_length,
         context_parallel_rank=int(context_parallel_rank),
         context_parallel_size=int(context_parallel_size),
     )
     backbone = _get_backbone(self)
-    local_input_ids = input_ids[:, local_start:local_end]
+    local_input_ids = model_inputs["input_ids"][:, local_start:local_end]
     inputs_embeds = backbone.embed_tokens(local_input_ids)
     position_ids = torch.arange(
         local_start,
@@ -832,7 +823,6 @@ def install_deepseek_v4_ring_context_parallel(target_model):
     target_model.forward_context_parallel = MethodType(
         _deepseek_v4_forward_context_parallel, target_model
     )
-    target_model._deepspec_context_layout = "contiguous"
     target_model._deepspec_ring_cp_installed = True
     return target_model
 
@@ -841,10 +831,6 @@ def install_target_context_parallel(target_model):
     model_type = str(target_model.config.model_type)
     if model_type == "deepseek_v4":
         return install_deepseek_v4_ring_context_parallel(target_model)
-    if model_type.lower() in ("qwen3_5", "qwen3_5_text"):
-        from .qwen3_6_cp import install_qwen3_6_ring_context_parallel
-
-        return install_qwen3_6_ring_context_parallel(target_model)
     raise NotImplementedError(
         f"No model-native target Context Parallel adapter for {model_type!r}."
     )
@@ -855,3 +841,4 @@ __all__ = [
     "install_target_context_parallel",
     "ring_left_context",
 ]
+

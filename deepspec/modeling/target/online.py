@@ -12,12 +12,10 @@ import os
 
 import torch
 import torch.distributed as dist
-import torch.nn.functional as F
-from accelerate import init_empty_weights
 from torch import nn
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.fsdp import MixedPrecision, ShardingStrategy
+from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
+from torch.distributed.fsdp import FSDPModule
 from transformers import AutoConfig, AutoModel, FineGrainedFP8Config
 from transformers.distributed.configuration_utils import DistributedConfig
 
@@ -29,30 +27,9 @@ from deepspec.modeling.pure_ep import (
     materialize_modules_locally,
 )
 from deepspec.utils import compute_context_parallel_range
-from deepspec.utils.rank_local_state import (
-    RANK_LOCAL_STATE_FORMAT,
-    load_rank_local_model_state,
-    rank_local_state_path,
-    rank_local_topology_metadata,
-    save_rank_local_model_state,
-)
 
 from .common import TargetForwardResult
 from .deepseek_v4_cp import install_target_context_parallel
-
-
-_DEEPSEEK_V4_CP_SHARD_ALIGNMENT = 128
-
-
-def _context_parallel_padded_length(sequence_length: int, cp_size: int) -> int:
-    sequence_length = int(sequence_length)
-    cp_size = int(cp_size)
-    if sequence_length < 1:
-        raise ValueError("sequence_length must be positive.")
-    if cp_size < 1:
-        raise ValueError("context_parallel_size must be positive.")
-    alignment = _DEEPSEEK_V4_CP_SHARD_ALIGNMENT * cp_size
-    return ((sequence_length + alignment - 1) // alignment) * alignment
 
 
 def _get_target_backbone(target_model):
@@ -148,41 +125,10 @@ def _dequantizing_config(target_config):
     return FineGrainedFP8Config(**quantization_config)
 
 
-def _normalize_target_tensor_dtypes(target_model) -> None:
-    """Mirror the source loader's dtype policy for rank-local target state.
-
-    Parameters are intentionally normalized to BF16 for the frozen FSDP target,
-    while numerically sensitive persistent buffers follow the model's strict-FP32
-    policy used by ``from_pretrained``.
-    """
-
+def _normalize_target_parameter_dtype(target_model) -> None:
     for parameter in target_model.parameters():
         if parameter.is_floating_point() and parameter.dtype != torch.bfloat16:
             parameter.data = parameter.data.to(dtype=torch.bfloat16)
-
-    strict_fp32_patterns = getattr(
-        target_model,
-        "_keep_in_fp32_modules_strict",
-        (),
-    ) or ()
-    for name, buffer in target_model.named_buffers():
-        if (
-            buffer.is_floating_point()
-            and any(
-                str(pattern) in name for pattern in strict_fp32_patterns
-            )
-            and buffer.dtype != torch.float32
-        ):
-            buffer.data = buffer.data.to(dtype=torch.float32)
-
-
-def _build_rank_local_cache_model(target_config):
-    """Build a meta model whose tensor dtypes match the cached source model."""
-
-    with init_empty_weights(include_buffers=True):
-        model = AutoModel.from_config(target_config)
-    _normalize_target_tensor_dtypes(model)
-    return model
 
 
 def _build_rank_local_ep_target_model(
@@ -228,7 +174,7 @@ def _build_rank_local_ep_target_model(
         )
 
     model = AutoModel.from_pretrained(model_name_or_path, **load_kwargs)
-    _normalize_target_tensor_dtypes(model)
+    _normalize_target_parameter_dtype(model)
 
     if ep_size > 1:
         expected_local_experts = int(target_config.n_routed_experts) // ep_size
@@ -317,9 +263,9 @@ def _materialize_meta_module(module: nn.Module, *, device) -> None:
 
 
 def _wrap_target_model_with_fsdp(
-    *, target_model, device, process_group, topology
+    *, target_model, device, topology
 ):
-    """FULL_SHARD dense target state while keeping routed experts pure-EP."""
+    """FSDP2-shard dense target state while keeping routed experts pure-EP."""
 
     backbone = _get_target_backbone(target_model)
     decoder_layers = list(backbone.layers)
@@ -332,69 +278,75 @@ def _wrap_target_model_with_fsdp(
     )
     pure_expert_modules = get_pure_expert_modules(target_model)
     materialize_modules_locally(pure_expert_modules, device=device)
-    fsdp_kwargs = {
-        "process_group": process_group,
-        "device_id": device,
-        "limit_all_gathers": True,
-        "mixed_precision": MixedPrecision(
-            param_dtype=torch.bfloat16,
-            buffer_dtype=torch.bfloat16,
-        ),
-        "sharding_strategy": ShardingStrategy.FULL_SHARD,
-        "sync_module_states": False,
-        "use_orig_params": True,
-        "param_init_fn": lambda module: _materialize_meta_module(
-            module, device=device
-        ),
+    ignored_params = {
+        parameter
+        for expert_root in pure_expert_modules
+        for parameter in expert_root.parameters()
     }
+    mp_policy = MixedPrecisionPolicy(
+        param_dtype=torch.bfloat16,
+        reduce_dtype=torch.float32,
+        output_dtype=torch.bfloat16,
+    )
+    mesh = (
+        topology.dense_mesh["dp_shard_cp"]
+        if topology.config.dp_replicate == 1
+        else topology.fsdp_mesh
+    )
     for layer_idx, decoder_layer in enumerate(decoder_layers):
-        layer_fsdp_kwargs = dict(fsdp_kwargs)
-        routed_experts = getattr(getattr(decoder_layer, "mlp", None), "experts", None)
-        if bool(getattr(routed_experts, "_deepspec_pure_expert_parallel", False)):
-            layer_fsdp_kwargs["ignored_modules"] = [routed_experts]
-        backbone.layers[layer_idx] = FSDP(decoder_layer, **layer_fsdp_kwargs)
+        fully_shard(
+            decoder_layer,
+            mesh=mesh,
+            mp_policy=mp_policy,
+            reshard_after_forward=True,
+            ignored_params=ignored_params,
+        )
+    fully_shard(
+        target_model,
+        mesh=mesh,
+        mp_policy=mp_policy,
+        reshard_after_forward=False,
+        ignored_params=ignored_params,
+    )
     return target_model
 
 
 def _run_target_forward_context_parallel(
     *, target_model, model_inputs, target_layer_ids, topology, device
 ):
-    padded_sequence_length = int(model_inputs["input_ids"].shape[1])
-    if model_inputs["attention_mask"].shape != model_inputs["input_ids"].shape:
-        raise ValueError("Online target input IDs and attention mask must align.")
-    expected_padded_length = _context_parallel_padded_length(
-        int(model_inputs["attention_mask"].sum(dim=1)[0].item()),
-        int(topology.context_parallel_size),
-    )
-    if padded_sequence_length != expected_padded_length:
-        raise ValueError(
-            "Online target CP input must be right-padded to a multiple of "
-            f"{_DEEPSEEK_V4_CP_SHARD_ALIGNMENT} * CP: expected "
-            f"{expected_padded_length}, got {padded_sequence_length}."
-        )
     cp_forward = getattr(target_model, "forward_context_parallel", None)
     if cp_forward is None:
         raise NotImplementedError(
             "The online target does not expose forward_context_parallel()."
         )
-    result = cp_forward(
-        model_inputs=model_inputs,
-        target_layer_ids=target_layer_ids,
-        context_parallel_group=topology.context_parallel_group,
-        context_parallel_rank=topology.context_parallel_rank,
-        context_parallel_size=topology.context_parallel_size,
-        tensor_parallel_group=topology.tensor_parallel_group,
-        tensor_parallel_rank=topology.tensor_parallel_rank,
-        tensor_parallel_size=topology.tensor_parallel_size,
-        device=device,
-    )
+    # This model-specific method intentionally bypasses ``target_model(...)``.
+    # Explicitly run the root FSDP2 materialization that its __call__ hook would
+    # otherwise perform; child decoder layers still execute through __call__.
+    if isinstance(target_model, FSDPModule):
+        target_model.unshard()
+    try:
+        result = cp_forward(
+            model_inputs=model_inputs,
+            target_layer_ids=target_layer_ids,
+            context_parallel_group=topology.context_parallel_group,
+            context_parallel_rank=topology.context_parallel_rank,
+            context_parallel_size=topology.context_parallel_size,
+            tensor_parallel_group=topology.tensor_parallel_group,
+            tensor_parallel_rank=topology.tensor_parallel_rank,
+            tensor_parallel_size=topology.tensor_parallel_size,
+            device=device,
+        )
+    finally:
+        if isinstance(target_model, FSDPModule):
+            target_model.reshard()
     if not isinstance(result, TargetForwardResult):
         raise TypeError(
             "forward_context_parallel() must return TargetForwardResult, got "
             f"{type(result)!r}."
         )
+    sequence_length = int(model_inputs["attention_mask"].sum(dim=1)[0].item())
     expected_start, expected_end = compute_context_parallel_range(
-        sequence_length=padded_sequence_length,
+        sequence_length=sequence_length,
         context_parallel_rank=topology.context_parallel_rank,
         context_parallel_size=topology.context_parallel_size,
     )
@@ -451,28 +403,11 @@ class DeepseekV4OnlineTarget:
         target_config.num_hidden_layers = retained_layers
         self.target_num_hidden_layers = retained_layers
 
-        global_rank = int(dist.get_rank())
-        cache_path = rank_local_state_path(
-            self.rank_local_cache_dir,
-            prefix=f"target.{RANK_LOCAL_STATE_FORMAT}",
-            global_rank=global_rank,
-        )
-        cache_metadata = rank_local_topology_metadata(topology)
-        cache_metadata.update(
-            kind="target",
-            global_rank=global_rank,
+        model = _build_rank_local_ep_target_model(
             model_name_or_path=self.model_name_or_path,
-            num_hidden_layers=int(retained_layers),
+            target_config=target_config,
+            topology=topology,
         )
-        cache_exists = os.path.isfile(cache_path)
-        if cache_exists:
-            model = _build_rank_local_cache_model(target_config)
-        else:
-            model = _build_rank_local_ep_target_model(
-                model_name_or_path=self.model_name_or_path,
-                target_config=target_config,
-                topology=topology,
-            )
         model = model.eval()
         model.requires_grad_(False)
         if topology.expert_parallel_size > 1 or topology.tensor_parallel_size > 1:
@@ -486,21 +421,8 @@ class DeepseekV4OnlineTarget:
         self.model = _wrap_target_model_with_fsdp(
             target_model=model,
             device=device,
-            process_group=topology.fsdp_group,
             topology=topology,
         ).eval()
-        if cache_exists:
-            load_rank_local_model_state(
-                self.model,
-                cache_path,
-                expected_metadata=cache_metadata,
-            )
-        else:
-            save_rank_local_model_state(
-                self.model,
-                cache_path,
-                metadata=cache_metadata,
-            )
 
     def forward_training_batch(self, batch) -> dict[str, torch.Tensor]:
         """Run one target forward and return a cache-shaped in-memory batch."""
@@ -515,31 +437,9 @@ class DeepseekV4OnlineTarget:
             attention_mask[0, sequence_length:].any()
         ):
             raise ValueError("Online target requires a right-padded attention mask.")
-        input_ids = batch["input_ids"][:, :sequence_length]
-        model_attention_mask = attention_mask[:, :sequence_length]
-        loss_mask = batch["loss_mask"][:, :sequence_length]
-        padded_sequence_length = sequence_length
-        if int(self.topology.context_parallel_size) > 1:
-            padded_sequence_length = _context_parallel_padded_length(
-                sequence_length,
-                int(self.topology.context_parallel_size),
-            )
-            padding = padded_sequence_length - sequence_length
-            pad_token_id = getattr(
-                getattr(self.model, "config", None), "pad_token_id", 0
-            )
-            if pad_token_id is None:
-                pad_token_id = 0
-            input_ids = F.pad(
-                input_ids, (0, padding), value=int(pad_token_id)
-            )
-            model_attention_mask = F.pad(
-                model_attention_mask, (0, padding), value=0
-            )
-            loss_mask = F.pad(loss_mask, (0, padding), value=0)
         model_inputs = {
-            "input_ids": input_ids,
-            "attention_mask": model_attention_mask,
+            "input_ids": batch["input_ids"][:, :sequence_length],
+            "attention_mask": attention_mask[:, :sequence_length],
         }
         with torch.no_grad():
             if self.topology.context_parallel_size > 1:
@@ -570,12 +470,12 @@ class DeepseekV4OnlineTarget:
 
         return {
             "input_ids": model_inputs["input_ids"],
-            "loss_mask": loss_mask,
+            "loss_mask": batch["loss_mask"][:, :sequence_length],
             "target_hidden_states": result.target_hidden_states,
             "target_last_hidden_states": result.target_last_hidden_states,
             "context_start": metadata(context_start),
             "context_len": metadata(context_len),
-            "seq_len": metadata(padded_sequence_length),
+            "seq_len": metadata(sequence_length),
         }
 
     def close(self) -> None:

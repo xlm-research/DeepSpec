@@ -9,11 +9,11 @@ seed = 42
 
 model = dict(
     target_model_name_or_path=(
-        "/mnt/afs_agents/share_models/deepseek-ai/DeepSeek-V4-Flash"
+        "/mnt/afs-agentpro/share/models/deepseek-ai/DeepSeek-V4-Flash-0731"
     ),
-    block_size=5,
+    block_size=7,
     num_draft_layers=3,
-    target_layer_ids=[40, 41, 42],
+    target_layer_ids=[0, 1, 2],
     # V4 has no tokenizer mask token.  This checkpoint reserves embedding rows
     # above the tokenizer's 128000 entries; use the final reserved row.
     mask_token_id=129279,
@@ -30,7 +30,8 @@ model = dict(
 
 train = dict(
     trainer_cls=DeepseekV4DSparkTrainer,
-    lr=6.0e-4,
+    # Keep the initially random routed draft stable across optimizer steps.
+    lr=1.0e-5,
     warmup_ratio=0.04,
     weight_decay=0.0,
     precision="bf16",
@@ -45,12 +46,18 @@ train = dict(
     max_train_steps=1,
     max_grad_norm=1.0,
     sharding_strategy="full_shard",
-    fsdp_size=8,
-    fsdp_layerwise=True,
-    context_parallel_size=1,
-    expert_parallel_size=8,
-    tensor_parallel_size=1,
-    pure_expert_parallel=True,
+    parallel=dict(
+        dp_replicate=1,
+        dp_shard=4,
+        cp=2,
+        tp=1,
+        ep=1,
+        expert_tp=1,
+        use_fsdp=True,
+        context_parallel_backend="model_native",
+        expert_dispatch_backend="native",
+    ),
+    target_parallel=dict(ep=8),
     # The distributed sliding-window path is shape-dynamic and performs ring
     # P2P collectives; whole-model compile is intentionally disabled.
     torch_compile=False,
@@ -63,14 +70,13 @@ logging = dict(
 
 data = dict(
     online_target=True,
-    train_data_path=None,
+    train_data_path=(
+        "train_data/spec_o3_coldstartsft.first8.repeat1.deepspec.jsonl"
+    ),
     target_cache_path=None,
     chat_template="deepseek_v4",
     max_length=131072,
     min_loss_tokens=14,
-    # Group similarly sized records across synchronized sample ranks.  Raw
-    # JSONL byte length is used as a zero-tokenization-cost sequence proxy.
-    length_bucket_size=512,
     num_workers=1,
     prefetch_factor=1,
 )

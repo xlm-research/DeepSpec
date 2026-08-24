@@ -45,7 +45,7 @@ class WarmupScheduler(TwoStageScheduler):
             if not self.finished:
                 self.after_scheduler.base_lrs = self.base_lrs
                 self.finished = True
-            return self.after_scheduler.get_lr()
+            return self.after_scheduler.get_last_lr()
 
         return [(self.last_epoch + 1) / self.warmup_epochs * lr for lr in self.base_lrs]
 

@@ -22,7 +22,6 @@ from .parallel import (
     compute_context_parallel_range,
 )
 
-
 def seed_all(seed):
     torch.manual_seed(seed)
     random.seed(seed)
@@ -76,8 +75,8 @@ __all__ = [
     "StatelessResumableDistributedSampler",
     "add_metric",
     "build_parallel_topology",
-    "compute_context_parallel_range",
     "ensure_dir",
+    "compute_context_parallel_range",
     "flush",
     "get_git_diff",
     "get_git_sha",

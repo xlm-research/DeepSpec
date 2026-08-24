@@ -38,25 +38,9 @@ bash scripts/train/train.sh
 
 Hardware: the default configs and scripts assume a single node with 8 GPUs. For fewer GPUs, reduce `CUDA_VISIBLE_DEVICES`.
 
-### Qwen3.6 DSpark
-
-The `wzj/feat/qwen3.6` integration adds the Qwen3.6 hybrid multimodal
-target, layer-wise target FSDP, native causal Ring Context Parallel for
-full-attention K/V, causal DeltaNet-state handoff, rank-local head/tail target
-caches, and matching draft-model Ring CP.
-
-Set the model and JSONL paths, then run both cache generation and training:
-
-```bash
-MODEL_PATH=/path/to/Qwen3.6-27B \
-DATA_PATH=/path/to/train.jsonl \
-CP_SIZE=8 FSDP_SIZE=8 \
-bash qwen3_6_full.sh
-```
-
-For multimodal datasets, set `MEDIA_ROOT` for relative media paths. A URI
-prefix can be rewritten with
-`MEDIA_URI_MAP='s3://source/prefix=/mounted/replacement'`.
+The modular PyTorch-native FSDP2/TP/fixed-CP architecture, torchrun profiles,
+distributed-checkpoint migration notes, support matrix, and validated commands
+are documented in [doc/distributed_training.md](./doc/distributed_training.md).
 
 
 ## Evaluation

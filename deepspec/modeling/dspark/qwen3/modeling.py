@@ -663,6 +663,7 @@ class Qwen3DSparkDecoderLayer(GradientCheckpointingLayer):
 
 class Qwen3DSparkModel(Qwen3PreTrainedModel):
     _no_split_modules = ["Qwen3DSparkDecoderLayer"]
+    decoder_layer_cls = Qwen3DSparkDecoderLayer
 
     def __init__(self, config) -> None:
         super().__init__(config)
@@ -699,9 +700,16 @@ class Qwen3DSparkModel(Qwen3PreTrainedModel):
         )
         self.layers = nn.ModuleList(
             [
-                Qwen3DSparkDecoderLayer(config, layer_idx)
+                self.decoder_layer_cls(config, layer_idx)
                 for layer_idx in range(config.num_hidden_layers)
             ]
+        )
+        layer_types = list(getattr(config, "layer_types", []))
+        self.draft_sliding_window = (
+            int(config.sliding_window)
+            if layer_types
+            and all(layer_type == "sliding_attention" for layer_type in layer_types)
+            else None
         )
         self.norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen3RotaryEmbedding(config)
@@ -713,6 +721,23 @@ class Qwen3DSparkModel(Qwen3PreTrainedModel):
         self.hidden_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.block_size = int(config.block_size)
+        self.verification_block_size = int(
+            getattr(config, "verification_block_size", self.block_size)
+        )
+        self.proposal_hidden_offset = int(
+            getattr(config, "proposal_hidden_offset", 0)
+        )
+        if self.proposal_hidden_offset < 0 or (
+            self.proposal_hidden_offset + self.block_size
+            > self.verification_block_size
+        ):
+            raise ValueError(
+                "The proposal hidden-state slice must fit inside the draft "
+                "verification block: "
+                f"offset={self.proposal_hidden_offset}, "
+                f"num_draft_tokens={self.block_size}, "
+                f"verification_block_size={self.verification_block_size}."
+            )
         self.mask_token_id = config.mask_token_id
         self.num_anchors = int(config.num_anchors)
 
@@ -776,6 +801,18 @@ class Qwen3DSparkModel(Qwen3PreTrainedModel):
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.lm_head(hidden_states)
+
+    def build_auxiliary_training_outputs(
+        self,
+        *,
+        hidden_states: torch.Tensor,
+        draft_logits: torch.Tensor,
+        previous_token_ids: torch.Tensor,
+        target_ids: torch.Tensor,
+        eval_mask: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        del hidden_states, draft_logits, previous_token_ids, target_ids, eval_mask
+        return {}
 
     def predict_confidence_step(
         self,
@@ -966,9 +1003,12 @@ class Qwen3DSparkModel(Qwen3PreTrainedModel):
             anchor_positions,
             block_keep_mask,
             mask_token_id=self.mask_token_id,
-            block_size=self.block_size,
+            block_size=self.verification_block_size,
         )
-        draft_position_ids = create_position_ids(anchor_positions, self.block_size)
+        draft_position_ids = create_position_ids(
+            anchor_positions,
+            self.verification_block_size,
+        )
         if self.context_parallel_size > 1:
             context_position_ids = torch.cat(
                 [
@@ -992,8 +1032,9 @@ class Qwen3DSparkModel(Qwen3PreTrainedModel):
                 sequence_length=sequence_length,
                 context_chunk_len=local_context_len,
                 context_parallel_size=self.context_parallel_size,
-                block_size=self.block_size,
+                block_size=self.verification_block_size,
                 device=device,
+                sliding_window=self.draft_sliding_window,
             )
         else:
             context_position_ids = torch.arange(
@@ -1006,8 +1047,9 @@ class Qwen3DSparkModel(Qwen3PreTrainedModel):
                 anchor_positions=anchor_positions,
                 block_keep_mask=block_keep_mask,
                 seq_len=sequence_length,
-                block_size=self.block_size,
+                block_size=self.verification_block_size,
                 device=device,
+                sliding_window=self.draft_sliding_window,
             )
         output_hidden = self._forward_backbone(
             position_ids=backbone_position_ids,
@@ -1020,7 +1062,20 @@ class Qwen3DSparkModel(Qwen3PreTrainedModel):
         )
 
         num_blocks = anchor_positions.size(1)
-        output_hidden_4d = output_hidden.reshape(bsz, num_blocks, self.block_size, -1)
+        verification_hidden_4d = output_hidden.reshape(
+            bsz,
+            num_blocks,
+            self.verification_block_size,
+            -1,
+        )
+        output_hidden_4d = verification_hidden_4d[
+            :,
+            :,
+            self.proposal_hidden_offset : (
+                self.proposal_hidden_offset + self.block_size
+            ),
+            :,
+        ]
 
         label_offsets = torch.arange(1, self.block_size + 1, device=device).view(
             1, 1, -1
@@ -1136,12 +1191,7 @@ class Qwen3DSparkModel(Qwen3PreTrainedModel):
             [anchor_token_ids.unsqueeze(-1), target_ids[:, :, :-1]],
             dim=-1,
         )
-        draft_logits = self.compute_logits(output_hidden).reshape(
-            bsz,
-            num_blocks,
-            self.block_size,
-            -1,
-        )
+        draft_logits = self.compute_logits(output_hidden_4d)
         if self.markov_head is not None:
             draft_logits = self.markov_head.apply_block_logits(
                 draft_logits,
@@ -1172,6 +1222,14 @@ class Qwen3DSparkModel(Qwen3PreTrainedModel):
             else:
                 confidence_pred = self.confidence_head(output_hidden_4d).float()
 
+        auxiliary_outputs = self.build_auxiliary_training_outputs(
+            hidden_states=output_hidden_4d,
+            draft_logits=draft_logits,
+            previous_token_ids=prev_token_ids,
+            target_ids=target_ids,
+            eval_mask=eval_mask,
+        )
+
         return DSparkForwardOutput(
             draft_logits=draft_logits,
             target_ids=target_ids,
@@ -1179,6 +1237,7 @@ class Qwen3DSparkModel(Qwen3PreTrainedModel):
             block_keep_mask=block_keep_mask,
             confidence_pred=confidence_pred,
             aligned_target_logits=aligned_target_logits,
+            **auxiliary_outputs,
         )
 
 
