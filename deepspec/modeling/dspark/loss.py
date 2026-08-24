@@ -5,6 +5,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 
 from deepspec.utils.metrics import add_metric
+from deepspec.training.loss import loss_reduction_group, loss_reduction_size
 from .common import DSparkForwardOutput
 
 
@@ -17,7 +18,11 @@ def _all_reduce_loss_denominators(
     for key in ("ce_loss_den", "l1_loss_den", "confidence_loss_den"):
         tensor = loss_terms[key].detach().clone()
         if world_size > 1:
-            dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+            dist.all_reduce(
+                tensor,
+                op=dist.ReduceOp.SUM,
+                group=loss_reduction_group(),
+            )
         denominators[key] = tensor
     return denominators
 
@@ -265,7 +270,7 @@ def compute_dspark_loss(
         loss_decay_gamma=loss_decay_gamma,
         l1_loss_alpha=float(l1_loss_alpha),
     )
-    world_size = dist.get_world_size()
+    world_size = loss_reduction_size()
     global_denominators = _all_reduce_loss_denominators(
         loss_terms,
         world_size=world_size,

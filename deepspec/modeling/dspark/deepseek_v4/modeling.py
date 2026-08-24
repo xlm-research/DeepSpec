@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import ClassVar
+from types import SimpleNamespace
 
 import torch
 import torch.distributed as dist
@@ -257,6 +258,7 @@ class DeepseekV4DSparkDecoderLayer(nn.Module):
 
 class DeepseekV4DSparkModel(DeepseekV4PreTrainedModel):
     _no_split_modules: ClassVar[list[str]] = ["DeepseekV4DSparkDecoderLayer"]
+    decoder_layer_cls = DeepseekV4DSparkDecoderLayer
 
     @torch.no_grad()
     def _init_weights(self, module):
@@ -285,7 +287,7 @@ class DeepseekV4DSparkModel(DeepseekV4PreTrainedModel):
         )
         self.layers = nn.ModuleList(
             [
-                DeepseekV4DSparkDecoderLayer(config, layer_idx)
+                self.decoder_layer_cls(config, layer_idx)
                 for layer_idx in range(config.num_hidden_layers)
             ]
         )
@@ -306,6 +308,17 @@ class DeepseekV4DSparkModel(DeepseekV4PreTrainedModel):
             config.hidden_size, config.vocab_size, bias=False
         )
         self.block_size = int(config.block_size)
+        self.verification_block_size = int(
+            getattr(config, "verification_block_size", self.block_size)
+        )
+        self.proposal_hidden_offset = int(
+            getattr(config, "proposal_hidden_offset", 0)
+        )
+        if self.proposal_hidden_offset < 0 or (
+            self.proposal_hidden_offset + self.block_size
+            > self.verification_block_size
+        ):
+            raise ValueError("DFlash2 proposal slice does not fit verification block.")
         self.mask_token_id = int(config.mask_token_id)
         self.num_anchors = int(config.num_anchors)
         self.local_num_anchors = self.num_anchors
@@ -376,6 +389,27 @@ class DeepseekV4DSparkModel(DeepseekV4PreTrainedModel):
             model_parallel_src_rank=topology.model_parallel_src_rank,
         )
 
+    def apply_model_parallelism(self, *, context, config) -> None:
+        """Install the V4-specific TP/EP layout on the FSDP2 mesh registry."""
+
+        sparse = context.sparse_mesh
+        ep_group = None if sparse is None else sparse["ep"].get_group()
+        ep_rank = 0 if sparse is None else sparse["ep"].get_local_rank()
+        topology = SimpleNamespace(
+            context_parallel_size=config.cp,
+            context_parallel_rank=context.context_parallel_rank,
+            context_parallel_group=context.cp_mesh.get_group(),
+            model_parallel_src_rank=context.model_parallel_src_rank,
+            expert_parallel_size=config.ep,
+            expert_parallel_rank=ep_rank,
+            expert_parallel_group=ep_group,
+            tensor_parallel_size=config.tp,
+            tensor_parallel_rank=context.tensor_parallel_rank,
+            tensor_parallel_group=context.tp_mesh.get_group(),
+            pure_expert_parallel=config.ep > 1,
+        )
+        self.configure_parallelism(topology)
+
     def _synchronize_anchor_sampling(
         self,
         anchor_positions: torch.Tensor,
@@ -438,6 +472,12 @@ class DeepseekV4DSparkModel(DeepseekV4PreTrainedModel):
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.lm_head(hidden_states)
+
+    def build_auxiliary_training_outputs(
+        self, *, hidden_states, draft_logits, previous_token_ids, target_ids, eval_mask
+    ) -> dict[str, torch.Tensor]:
+        del hidden_states, draft_logits, previous_token_ids, target_ids, eval_mask
+        return {}
 
     def sample_draft_tokens(
         self,
@@ -537,7 +577,7 @@ class DeepseekV4DSparkModel(DeepseekV4PreTrainedModel):
                 context_position_ids=context_position_ids,
                 anchor_positions=anchor_positions,
                 block_keep_mask=block_keep_mask,
-                block_size=self.block_size,
+                block_size=self.verification_block_size,
             )
         return self.norm(self.hc_head(hidden_streams))
 
@@ -634,11 +674,11 @@ class DeepseekV4DSparkModel(DeepseekV4PreTrainedModel):
             anchor_positions,
             block_keep_mask,
             mask_token_id=self.mask_token_id,
-            block_size=self.block_size,
+            block_size=self.verification_block_size,
         )
         global_anchor_positions = anchor_positions + int(local_start)
         draft_position_ids = create_position_ids(
-            global_anchor_positions, self.block_size
+            global_anchor_positions, self.verification_block_size
         )
         context_position_ids = torch.arange(
             context_global_start,
@@ -656,9 +696,14 @@ class DeepseekV4DSparkModel(DeepseekV4PreTrainedModel):
         )
 
         num_blocks = int(anchor_positions.shape[1])
-        output_hidden_4d = output_hidden.view(
-            batch, num_blocks, self.block_size, -1
+        verification_hidden_4d = output_hidden.view(
+            batch, num_blocks, self.verification_block_size, -1
         )
+        output_hidden_4d = verification_hidden_4d[
+            :, :,
+            self.proposal_hidden_offset : self.proposal_hidden_offset + self.block_size,
+            :,
+        ]
         label_offsets = torch.arange(
             1, self.block_size + 1, device=input_ids.device
         ).view(1, 1, -1)
@@ -698,9 +743,7 @@ class DeepseekV4DSparkModel(DeepseekV4PreTrainedModel):
         prev_token_ids = torch.cat(
             [anchor_token_ids.unsqueeze(-1), target_ids[:, :, :-1]], dim=-1
         )
-        draft_logits = self.compute_logits(output_hidden).view(
-            batch, num_blocks, self.block_size, -1
-        )
+        draft_logits = self.compute_logits(output_hidden_4d)
         if self.markov_head is not None:
             draft_logits = self.markov_head.apply_block_logits(
                 draft_logits,
@@ -725,6 +768,13 @@ class DeepseekV4DSparkModel(DeepseekV4PreTrainedModel):
                 )
                 features = torch.cat([features, previous], dim=-1)
             confidence_pred = self.confidence_head(features).float()
+        auxiliary_outputs = self.build_auxiliary_training_outputs(
+            hidden_states=output_hidden_4d,
+            draft_logits=draft_logits,
+            previous_token_ids=prev_token_ids,
+            target_ids=target_ids,
+            eval_mask=eval_mask,
+        )
         return DSparkForwardOutput(
             draft_logits=draft_logits,
             target_ids=target_ids,
@@ -732,6 +782,7 @@ class DeepseekV4DSparkModel(DeepseekV4PreTrainedModel):
             block_keep_mask=block_keep_mask,
             confidence_pred=confidence_pred,
             aligned_target_logits=aligned_target_logits,
+            **auxiliary_outputs,
         )
 
 

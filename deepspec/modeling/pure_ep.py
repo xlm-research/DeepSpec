@@ -17,6 +17,12 @@ def get_pure_expert_modules(model: nn.Module) -> list[nn.Module]:
     ]
 
 
+def _source_rank(process_group) -> int:
+    if hasattr(dist, "get_global_rank"):
+        return int(dist.get_global_rank(process_group, 0))
+    return int(dist.get_process_group_ranks(process_group)[0])
+
+
 def distribute_expert_parameter(
     module: nn.Module,
     parameter_name: str,
@@ -26,7 +32,7 @@ def distribute_expert_parameter(
     size: int,
     process_group,
 ) -> None:
-    """Slice this rank's experts locally without broadcasting parameters."""
+    """Keep this EP rank's expert slice without startup-time broadcasts."""
 
     del process_group
     parameter = module._parameters[parameter_name]
@@ -42,33 +48,62 @@ def distribute_expert_parameter(
         )
     shard_width = int(parameter.shape[dim]) // size
     local_shard = parameter.detach().narrow(
-        dim,
-        rank * shard_width,
-        shard_width,
-    )
-    if parameter.is_meta:
-        local_shard = local_shard.contiguous()
-    else:
-        device = (
-            torch.device("cuda", torch.cuda.current_device())
-            if torch.cuda.is_available()
-            else parameter.device
+        dim, rank * shard_width, shard_width
+    ).contiguous()
+    if not parameter.is_meta:
+        local_shard = local_shard.clone().to(
+            device=(
+                torch.device("cuda", torch.cuda.current_device())
+                if torch.cuda.is_available()
+                else parameter.device
+            )
         )
-        # clone() releases storage for experts owned by other EP ranks.
-        local_shard = local_shard.clone().to(device=device)
     module._parameters[parameter_name] = nn.Parameter(
         local_shard,
         requires_grad=bool(parameter.requires_grad),
     )
 
 
-def materialize_modules_locally(
-    modules: list[nn.Module], *, device
-) -> None:
-    """Materialize locally initialized/loaded modules without communication."""
+def materialize_modules_locally(modules: list[nn.Module], *, device) -> None:
+    """Materialize rank-local expert modules without parameter collectives."""
 
     if not modules:
         return
+    seen_parameters: set[int] = set()
+    seen_buffers: set[int] = set()
+    for root in modules:
+        for module in root.modules():
+            for name, parameter in list(module._parameters.items()):
+                if parameter is None or id(parameter) in seen_parameters:
+                    continue
+                seen_parameters.add(id(parameter))
+                tensor = (
+                    torch.empty_like(parameter, device=device)
+                    if parameter.is_meta
+                    else parameter.to(device=device)
+                )
+                module._parameters[name] = nn.Parameter(
+                    tensor, requires_grad=bool(parameter.requires_grad)
+                )
+            for name, buffer in list(module._buffers.items()):
+                if buffer is None or id(buffer) in seen_buffers:
+                    continue
+                seen_buffers.add(id(buffer))
+                module._buffers[name] = (
+                    torch.empty_like(buffer, device=device)
+                    if buffer.is_meta
+                    else buffer.to(device=device)
+                )
+
+
+def materialize_and_broadcast_modules(
+    modules: list[nn.Module], *, device, process_group
+) -> None:
+    """Replicate EP-owned modules without letting FSDP shard their parameters."""
+
+    if not modules:
+        return
+    source_rank = _source_rank(process_group)
     seen_parameters: set[int] = set()
     seen_buffers: set[int] = set()
     for root in modules:
@@ -87,6 +122,11 @@ def materialize_modules_locally(
                     requires_grad=bool(parameter.requires_grad),
                 )
                 module._parameters[name] = materialized
+                dist.broadcast(
+                    materialized.data,
+                    src=source_rank,
+                    group=process_group,
+                )
             for name, buffer in list(module._buffers.items()):
                 if buffer is None or id(buffer) in seen_buffers:
                     continue
@@ -97,15 +137,7 @@ def materialize_modules_locally(
                     else buffer.to(device=device)
                 )
                 module._buffers[name] = materialized
-
-
-def materialize_and_broadcast_modules(
-    modules: list[nn.Module], *, device, process_group
-) -> None:
-    """Compatibility alias; parameter broadcast was intentionally removed."""
-
-    del process_group
-    materialize_modules_locally(modules, device=device)
+                dist.broadcast(materialized, src=source_rank, group=process_group)
 
 
 def synchronize_module_gradients(
@@ -116,9 +148,16 @@ def synchronize_module_gradients(
     seen_parameters: set[int] = set()
     for module in modules:
         for parameter in module.parameters():
-            if id(parameter) in seen_parameters or parameter.grad is None:
+            if id(parameter) in seen_parameters:
                 continue
             seen_parameters.add(id(parameter))
+            # Routing is data dependent, so an expert may be unused on one
+            # replica while the corresponding parameter has a gradient on
+            # another. Every rank must still issue the exact same collectives
+            # in the exact same order; a zero gradient is the correct local
+            # contribution for an unused expert.
+            if parameter.grad is None:
+                parameter.grad = torch.zeros_like(parameter)
             for process_group, size in process_groups:
                 size = int(size)
                 if size <= 1:
@@ -127,9 +166,24 @@ def synchronize_module_gradients(
                 parameter.grad.div_(size)
 
 
+def synchronize_pure_expert_gradients(modules: list[nn.Module], *, sparse_mesh) -> None:
+    """Average EP-owned parameters over their orthogonal replica dimensions."""
+
+    if not modules or sparse_mesh is None:
+        return
+    process_groups = []
+    for dimension in ("dp_replicate", "expert_fsdp"):
+        mesh = sparse_mesh[dimension]
+        size = int(mesh.size())
+        if size > 1:
+            process_groups.append((mesh.get_group(), size))
+    synchronize_module_gradients(modules, process_groups=process_groups)
+
+
 __all__ = [
     "get_pure_expert_modules",
     "materialize_and_broadcast_modules",
     "materialize_modules_locally",
     "synchronize_module_gradients",
+    "synchronize_pure_expert_gradients",
 ]

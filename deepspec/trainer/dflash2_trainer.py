@@ -6,6 +6,7 @@ from deepspec.modeling.dflash2.qwen3_8.config import (
     build_draft_config as build_qwen3_8_dflash2_config,
 )
 from deepspec.trainer.dspark_trainer import Qwen3DSparkTrainer
+from deepspec.trainer.dspark_trainer import DeepseekV4DSparkTrainer
 
 
 class Qwen3_8DFlash2Trainer(Qwen3DSparkTrainer):
@@ -16,30 +17,18 @@ class Qwen3_8DFlash2Trainer(Qwen3DSparkTrainer):
         )
         return Qwen3_8DFlash2Model(draft_config)
 
-    def _checkpoint_kwargs(self):
-        kwargs = super()._checkpoint_kwargs()
-        # DFlash2 checkpoints are public HF weights, not rank-local resume
-        # shards; existing trainers keep the Dev/Base checkpoint path.
-        kwargs["parallel"] = None
-        return kwargs
-
     def run_batch(self, batch):
-        # DFlash2 never consumes target final logits. Drop both cache
-        # references as soon as the draft forward owns what autograd needs.
+        # DFlash2 uses CE plus selector path supervision; neither term needs
+        # target final-layer logits.
         batch.pop("target_last_hidden_states", None)
-        target_hidden_states = batch.pop("target_hidden_states")
-        model_inputs = dict(
+        outputs = self.forward_model(
             input_ids=batch["input_ids"],
-            target_hidden_states=target_hidden_states,
+            target_hidden_states=batch["target_hidden_states"],
             loss_mask=batch["loss_mask"],
             target_last_hidden_states=None,
+            context_chunk_len=batch["context_chunk_len"],
+            seq_len=batch["seq_len"],
         )
-        if self.context_parallel_size > 1:
-            model_inputs.update(
-                context_chunk_len=batch["context_len"],
-                seq_len=batch["seq_len"],
-            )
-        outputs = self.model(**model_inputs)
         return compute_dflash2_loss(
             outputs=outputs,
             loss_decay_gamma=self.args.model.loss_decay_gamma,
@@ -51,4 +40,39 @@ class Qwen3_8DFlash2Trainer(Qwen3DSparkTrainer):
         )
 
 
-__all__ = ["Qwen3_8DFlash2Trainer"]
+class DeepseekV4DFlash2Trainer(DeepseekV4DSparkTrainer):
+    def _build_draft_model(self, *, target_config, model_args):
+        from deepspec.modeling.dflash2.deepseek_v4 import (
+            DeepseekV4DFlash2Model,
+            build_draft_config,
+        )
+
+        return DeepseekV4DFlash2Model(
+            build_draft_config(target_config=target_config, model_args=model_args)
+        )
+
+    def run_batch(self, batch):
+        if self.online_target_enabled:
+            batch = self.online_target.forward_training_batch(batch)
+        batch.pop("target_last_hidden_states", None)
+        outputs = self.forward_model(
+            input_ids=batch["input_ids"],
+            target_hidden_states=batch["target_hidden_states"],
+            loss_mask=batch["loss_mask"],
+            target_last_hidden_states=None,
+            context_start=batch["context_start"],
+            context_len=batch["context_len"],
+            seq_len=batch["seq_len"],
+        )
+        return compute_dflash2_loss(
+            outputs=outputs,
+            loss_decay_gamma=self.args.model.loss_decay_gamma,
+            ce_loss_alpha=float(self.args.model.ce_loss_alpha),
+            selector_loss_alpha=float(self.args.model.selector_loss_alpha),
+            selector_loss_decay_gamma=self.args.model.get(
+                "selector_loss_decay_gamma"
+            ),
+        )
+
+
+__all__ = ["DeepseekV4DFlash2Trainer", "Qwen3_8DFlash2Trainer"]

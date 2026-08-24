@@ -601,13 +601,8 @@ def _parallelize_moe(moe: nn.Module, *, topology) -> None:
             output_chunks = []
             for chunk_start in range(0, collective_tokens, token_chunk_size):
                 chunk_end = min(chunk_start + token_chunk_size, total_tokens)
+                full_chunk_length = chunk_end - chunk_start
                 full_hidden_chunk = hidden_states[chunk_start:chunk_end]
-                # ``collective_tokens`` is the EP-group maximum. Ranks with a
-                # shorter local sequence must keep entering matching
-                # collectives with an empty chunk after their tokens run out.
-                # Deriving the length from the slice prevents a negative
-                # length when ``chunk_start`` is already past ``total_tokens``.
-                full_chunk_length = int(full_hidden_chunk.shape[0])
                 if ep_over_cp:
                     source_splits = None
                     source_length = full_chunk_length
@@ -736,7 +731,10 @@ def _parallelize_moe(moe: nn.Module, *, topology) -> None:
     experts._deepspec_expert_parallel_rank = ep_rank
     experts._deepspec_tensor_parallel_size = 1
     experts._deepspec_tensor_parallel_rank = 0
-    experts._deepspec_pure_expert_parallel = True
+    # With EP disabled, routed experts are ordinary model parameters and must
+    # be sharded/synchronized by FSDP2.  Mark them pure-EP only when an actual
+    # expert mesh owns their parameter and gradient semantics.
+    experts._deepspec_pure_expert_parallel = ep_size > 1
     experts._deepspec_expert_parallel_over_context = ep_over_cp
 
 

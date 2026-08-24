@@ -55,29 +55,7 @@ TEMPLATE_REGISTRY.register(
             "{% if message['role'] == 'system' %}{{ message['content'] }}"
             "{% elif message['role'] == 'user' %}<｜User｜>{{ message['content'] }}"
             "{% elif message['role'] == 'assistant' %}<｜Assistant｜></think>"
-            "{{ message['content'] }}{{ eos_token }}"
-            "{% endif %}"
-            "{% endfor %}"
-        ),
-    ),
-)
-
-TEMPLATE_REGISTRY.register(
-    "deepseek_v4_flash_body",
-    ChatTemplate(
-        assistant_header="<｜Assistant｜>",
-        user_header="<｜User｜>",
-        system_prompt="You are a helpful assistant.",
-        end_of_turn_token="<｜end▁of▁sentence｜>",
-        tokenizer_chat_template=(
-            "{% for message in messages %}"
-            "{% if loop.first %}{{ bos_token }}{% endif %}"
-            "{% if message['role'] == 'system' %}{{ message['content'] }}"
-            "{% elif message['role'] == 'user' %}<｜User｜>{{ message['content'] }}"
-            "{% elif message['role'] == 'assistant' %}<｜Assistant｜>"
-            "{{ message['content'] }}{{ eos_token }}"
-            "{% endif %}"
-            "{% endfor %}"
+            "{{ message['content'] }}{{ eos_token }}{% endif %}{% endfor %}"
         ),
     ),
 )

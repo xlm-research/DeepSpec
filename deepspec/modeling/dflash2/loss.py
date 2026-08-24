@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from deepspec.modeling.dspark.common import DSparkForwardOutput
 from deepspec.modeling.dspark.loss import compute_dspark_loss
 from deepspec.utils.metrics import add_metric
+from deepspec.training.loss import loss_reduction_group, loss_reduction_size
 
 
 def _selector_position_weights(
@@ -70,10 +71,14 @@ def compute_dflash2_loss(
     selector_loss_num = (per_token_loss * weights).sum()
     selector_loss_den = weights.sum()
 
-    world_size = dist.get_world_size()
+    world_size = loss_reduction_size()
     global_selector_den = selector_loss_den.detach().clone()
     if world_size > 1:
-        dist.all_reduce(global_selector_den, op=dist.ReduceOp.SUM)
+        dist.all_reduce(
+            global_selector_den,
+            op=dist.ReduceOp.SUM,
+            group=loss_reduction_group(),
+        )
     selector_backward_loss = (
         selector_loss_num / (global_selector_den + 1e-6)
     ) * world_size
