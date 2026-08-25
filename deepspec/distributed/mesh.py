@@ -64,6 +64,87 @@ class ParallelContext:
             )
         return cls(config, dense, sparse, dp, loss, fsdp, cp, tp, model)
 
+    def with_sparse_config(self, config: ParallelConfig) -> "ParallelContext":
+        """Create a model-specific sparse view while reusing the dense mesh.
+
+        TorchTitan initializes the world/dense mesh once and derives its
+        sparse ``(dp_replicate, efsdp, ep)`` view from the same ordered rank
+        tensor.  Reusing the dense registry is important when an online target
+        and a trainable draft need different EP degrees: it avoids creating a
+        second set of CP/TP/FSDP process groups while keeping the target EP
+        communicator independent from the draft model.
+        """
+
+        if not dist.is_initialized():
+            raise RuntimeError("Initialize torch.distributed before building meshes.")
+        config.validate_world_size(dist.get_world_size())
+        dense_dimensions = ("dp_replicate", "dp_shard", "cp", "tp", "pp")
+        changed = [
+            name
+            for name in dense_dimensions
+            if getattr(config, name) != getattr(self.config, name)
+        ]
+        if changed:
+            raise ValueError(
+                "A sparse model view must reuse the existing dense layout; "
+                f"changed={changed}."
+            )
+
+        sparse = None
+        if config.ep > 1:
+            sparse = DeviceMesh(
+                self.dense_mesh.device_type,
+                self.dense_mesh.mesh.reshape(
+                    config.dp_replicate,
+                    config.expert_fsdp,
+                    config.ep,
+                ),
+                mesh_dim_names=("dp_replicate", "expert_fsdp", "ep"),
+            )
+        return type(self)(
+            config=config,
+            dense_mesh=self.dense_mesh,
+            sparse_mesh=sparse,
+            dp_mesh=self.dp_mesh,
+            loss_mesh=self.loss_mesh,
+            fsdp_mesh=self.fsdp_mesh,
+            cp_mesh=self.cp_mesh,
+            tp_mesh=self.tp_mesh,
+            model_mesh=self.model_mesh,
+        )
+
+    @staticmethod
+    def _group_ranks(group) -> tuple[int, ...]:
+        if group is None:
+            return ()
+        return tuple(int(rank) for rank in dist.get_process_group_ranks(group))
+
+    def local_group_dict(self) -> dict[str, object]:
+        """Return the rank-local communicator mapping for diagnostics."""
+
+        groups = {
+            "dense_coordinate": tuple(self.dense_mesh.get_coordinate() or ()),
+            "dp_replicate": self._group_ranks(
+                self.dense_mesh["dp_replicate"].get_group()
+            ),
+            "dp_shard": self._group_ranks(
+                self.dense_mesh["dp_shard"].get_group()
+            ),
+            "fsdp_shard": self._group_ranks(
+                self.fsdp_mesh["dp_shard_cp"].get_group()
+            ),
+            "cp": self._group_ranks(self.context_parallel_group),
+            "tp": self._group_ranks(self.tensor_parallel_group),
+            "ep": self._group_ranks(self.expert_parallel_group),
+        }
+        if self.sparse_mesh is not None:
+            groups["expert_fsdp"] = self._group_ranks(
+                self.sparse_mesh["expert_fsdp"].get_group()
+            )
+        else:
+            groups["expert_fsdp"] = ()
+        return groups
+
     def mesh(self, name: str) -> DeviceMesh:
         meshes = {
             "dense": self.dense_mesh,

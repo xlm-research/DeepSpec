@@ -212,10 +212,16 @@ class BaseTrainer:
                     "train.target_parallel may override sparse target settings "
                     f"but not the shared dense layout; changed={changed_dense}."
                 )
-            self.target_parallel = ParallelContext.build(
-                self.target_parallel_config,
-                device_type=self.device.type,
+            self.target_parallel = self.parallel.with_sparse_config(
+                self.target_parallel_config
             )
+        print(
+            "[deepspec-mesh] "
+            f"global_rank={self.global_rank} "
+            f"draft={self.parallel.local_group_dict()} "
+            f"target={self.target_parallel.local_group_dict()}",
+            flush=True,
+        )
         self.context_parallel_size = self.parallel_config.cp
         self.fsdp_size = self.parallel_config.fsdp_shard_size
         self.data_parallel_size = self.parallel.data_parallel_size
@@ -640,7 +646,7 @@ class BaseTrainer:
 
         self.save_and_eval_checkpoint()
 
-    def clean_up(self):
+    def clean_up(self, *, synchronize: bool = True):
         if self.online_target is not None:
             self.online_target.close()
             self.online_target = None
@@ -648,5 +654,7 @@ class BaseTrainer:
         if close_dataset is not None:
             close_dataset()
         training_logger.close()
-        dist.barrier()
-        dist.destroy_process_group()
+        if synchronize and dist.is_initialized():
+            dist.barrier()
+        if dist.is_initialized():
+            dist.destroy_process_group()

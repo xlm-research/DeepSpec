@@ -5,7 +5,7 @@ from deepspec.utils.constant import BASE_CKPT_DIR, BASE_TB_DIR
 
 
 project_name = "deepspec"
-exp_name = "dspark_block7_qwen3_6_27b"
+exp_name = "dflash_block7_qwen3_6_27b"
 seed = 42
 
 model = dict(
@@ -16,18 +16,16 @@ model = dict(
     mask_token_id=248077,
     num_anchors=512,
 
-    # Markov head.
-    markov_rank=256,
-    markov_head_type="vanilla",
+    # DFlash does not use the DSpark Markov head.
+    markov_rank=0,
 
-    # Confidence head.
-    confidence_head_alpha=1.0,
-    confidence_head_with_markov=True,
+    # DFlash does not use confidence-based early stopping.
+    confidence_head_alpha=0.0,
 
-    # Loss.
+    # DFlash trains the parallel block predictions with CE only.
     loss_decay_gamma=4.0,
-    ce_loss_alpha=0.1,
-    l1_loss_alpha=0.9,
+    ce_loss_alpha=1.0,
+    l1_loss_alpha=0.0,
 )
 
 train = dict(
@@ -38,17 +36,19 @@ train = dict(
     precision="bf16",
     local_batch_size=1,
     global_batch_size=512,
-    num_train_epochs=10,
+    # The repeat60 JSONL already supplies repeated examples, so consume the
+    # generated offline cache once.
+    num_train_epochs=1,
     max_train_steps=None,
     max_grad_norm=1.0,
     sharding_strategy="full_shard",
-    fsdp_size=None,
+    # Balanced 8-GPU default: CP=2 for sequence memory and FSDP=4 for params.
+    # The one-click launcher derives FSDP from CONTEXT_PARALLEL_SIZE and
+    # overrides both values together.
+    fsdp_size=4,
     fsdp_layerwise=False,
-    context_parallel_size=1,
-    expert_parallel_size=1,
-    tensor_parallel_size=1,
-    pure_expert_parallel=False,
-    torch_compile=True,
+    context_parallel_size=2,
+    torch_compile=False,
 )
 
 logging = dict(
@@ -60,9 +60,10 @@ data = dict(
     target_cache_path=None,
     chat_template="qwen",
     max_length=4096,
-    num_workers=4,
+    num_workers=1,
     prefetch_factor=1,
-    multimodal=True,
+    # The bundled JSONL has literal <image> text but no media file paths.
+    multimodal=False,
 )
 
 
@@ -70,24 +71,13 @@ def finalize_cfg(cfg):
     logging_cfg = dict(cfg["logging"])
     project_name = str(cfg["project_name"])
     exp_name = str(cfg["exp_name"])
-    output_root = os.environ.get("DEEPSPEC_OUTPUT_ROOT")
-    checkpoint_root = (
-        os.path.join(output_root, "checkpoints")
-        if output_root
-        else BASE_CKPT_DIR
-    )
-    tensorboard_root = (
-        os.path.join(output_root, "tensorboard")
-        if output_root
-        else BASE_TB_DIR
-    )
     logging_cfg["checkpoint_dir"] = os.path.join(
-        checkpoint_root,
+        BASE_CKPT_DIR,
         project_name,
         exp_name,
     )
     logging_cfg["tensorboard_dir"] = os.path.join(
-        tensorboard_root,
+        BASE_TB_DIR,
         project_name,
         exp_name,
     )
