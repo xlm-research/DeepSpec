@@ -11,6 +11,9 @@
 #   config/dflash/dflash_qwen3_4b.py
 #   config/dflash/dflash_qwen3_8b.py
 #   config/dflash/dflash_qwen3_14b.py
+#   config/dflash/dflash_qwen3_6_27b.py
+## dflash2
+#   config/dflash2/dflash2_qwen3_8_27b.py
 ## dspark
 #   config/dspark/dspark_gemma4_12b.py
 #   config/dspark/dspark_qwen3_4b.py

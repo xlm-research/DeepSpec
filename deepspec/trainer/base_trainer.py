@@ -212,10 +212,16 @@ class BaseTrainer:
                     "train.target_parallel may override sparse target settings "
                     f"but not the shared dense layout; changed={changed_dense}."
                 )
-            self.target_parallel = ParallelContext.build(
-                self.target_parallel_config,
-                device_type=self.device.type,
+            self.target_parallel = self.parallel.with_sparse_config(
+                self.target_parallel_config
             )
+        print(
+            "[deepspec-mesh] "
+            f"global_rank={self.global_rank} "
+            f"draft={self.parallel.local_group_dict()} "
+            f"target={self.target_parallel.local_group_dict()}",
+            flush=True,
+        )
         self.context_parallel_size = self.parallel_config.cp
         self.fsdp_size = self.parallel_config.fsdp_shard_size
         self.data_parallel_size = self.parallel.data_parallel_size

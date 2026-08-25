@@ -14,6 +14,7 @@ autograd-aware collectives below.
 from __future__ import annotations
 
 import copy
+import math
 import os
 from types import MethodType
 
@@ -575,7 +576,8 @@ def _parallelize_moe(moe: nn.Module, *, topology) -> None:
         def all_to_all_experts_forward(
             self, hidden_states, top_k_index, top_k_weights
         ):
-            total_tokens = int(hidden_states.shape[0])
+            original_total_tokens = int(hidden_states.shape[0])
+            total_tokens = original_total_tokens
             if int(top_k_index.shape[0]) != total_tokens:
                 raise ValueError("MoE routing indices must align with tokens.")
 
@@ -597,6 +599,61 @@ def _parallelize_moe(moe: nn.Module, *, topology) -> None:
                     group=ep_group,
                 )
                 collective_tokens = int(collective_tokens_tensor.item())
+                # TorchTitan's EP dispatcher enters AllToAll with a common
+                # physical token count on every EP rank. Online distillation
+                # can produce different local sequence lengths, so pad the
+                # shorter ranks explicitly instead of merely iterating to the
+                # maximum. The previous implementation could create negative
+                # chunk lengths once chunk_start exceeded a short rank's token
+                # count, causing ranks to issue a different collective order.
+                padding_tokens = collective_tokens - total_tokens
+                if padding_tokens > 0:
+                    hidden_states = torch.cat(
+                        [
+                            hidden_states,
+                            hidden_states.new_zeros(
+                                (padding_tokens, *hidden_states.shape[1:])
+                            ),
+                        ],
+                        dim=0,
+                    )
+                    top_k_index = torch.cat(
+                        [
+                            top_k_index,
+                            torch.arange(
+                                padding_tokens
+                                * math.prod(top_k_index.shape[1:]),
+                                device=top_k_index.device,
+                                dtype=top_k_index.dtype,
+                            ).reshape(
+                                padding_tokens, *top_k_index.shape[1:]
+                            )
+                            % global_experts,
+                        ],
+                        dim=0,
+                    )
+                    top_k_weights = torch.cat(
+                        [
+                            top_k_weights,
+                            top_k_weights.new_zeros(
+                                (padding_tokens, *top_k_weights.shape[1:])
+                            ),
+                        ],
+                        dim=0,
+                    )
+                    total_tokens = collective_tokens
+                    if not bool(
+                        getattr(self, "_deepspec_ep_padding_reported", False)
+                    ):
+                        print(
+                            "[deepspec-ep-padding] "
+                            f"global_rank={dist.get_rank()} "
+                            f"local_tokens={original_total_tokens} "
+                            f"collective_tokens={collective_tokens} "
+                            f"padding_tokens={padding_tokens}",
+                            flush=True,
+                        )
+                        self._deepspec_ep_padding_reported = True
 
             output_chunks = []
             for chunk_start in range(0, collective_tokens, token_chunk_size):
@@ -721,7 +778,7 @@ def _parallelize_moe(moe: nn.Module, *, topology) -> None:
 
             if not output_chunks:
                 return hidden_states.new_empty(hidden_states.shape)
-            return torch.cat(output_chunks, dim=0)
+            return torch.cat(output_chunks, dim=0)[:original_total_tokens]
 
         experts.forward = MethodType(all_to_all_experts_forward, experts)
         experts._deepspec_expert_dispatch = "all_to_all"
