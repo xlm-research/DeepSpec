@@ -7,10 +7,13 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 BASE_DIR=$(cd "${SCRIPT_DIR}/../.." && pwd)
 cd "${BASE_DIR}"
 
-# SenseCore runs the same command on master and every worker, and injects the
-# node count, node rank, and rendezvous address for this task.
-NNODES=${SENSECORE_PYTORCH_NNODES:-1}
-NODE_RANK=${SENSECORE_PYTORCH_NODE_RANK:-0}
+# SenseCore runs this script once per node. Depending on the launcher version,
+# it either injects SENSECORE_PYTORCH_* or uses the standard-looking
+# WORLD_SIZE/RANK variables for *node* count/rank (not GPU process count/rank).
+SCHEDULER_WORLD_SIZE=${WORLD_SIZE:-}
+SCHEDULER_RANK=${RANK:-}
+NNODES=${SENSECORE_PYTORCH_NNODES:-${SCHEDULER_WORLD_SIZE:-1}}
+NODE_RANK=${SENSECORE_PYTORCH_NODE_RANK:-${SCHEDULER_RANK:-0}}
 MASTER_ADDR=${MASTER_ADDR:-localhost}
 MASTER_PORT=${MASTER_PORT:-29501}
 NPROC_PER_NODE=${NPROC_PER_NODE:-8}
@@ -19,7 +22,7 @@ CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}
 
 TARGET_MODEL_PATH=${TARGET_MODEL_PATH:-/mnt/afs-agentpro/share/models/deepseek-ai/DeepSeek-V4-Flash-0731}
 TRAIN_DATA_PATH=${TRAIN_DATA_PATH:-${BASE_DIR}/train_data/spec_o3_coldstartsft.repeat60.deepspec.packed_256k.jsonl}
-OUTPUT_ROOT=${OUTPUT_ROOT:-${BASE_DIR}/output/deepseek_v4_flash_dspark_fsdp2_multinode_128}
+OUTPUT_ROOT=${OUTPUT_ROOT:-${BASE_DIR}/output/deepseek_v4_flash_dspark_fsdp2_multinode_128_64}
 LOG_DIR=${LOG_DIR:-${OUTPUT_ROOT}/logs}
 mkdir -p "${LOG_DIR}"
 NODE_LOG=${LOG_DIR}/node_rank_${NODE_RANK}.log
@@ -55,10 +58,10 @@ diagnose_exit() {
 }
 trap diagnose_exit EXIT
 
-# SenseCore may expose WORLD_SIZE directly. When it does not, derive it from
-# the platform-provided node count and the number of local worker processes.
-# Keep this calculation in the launcher so users never need to set WORLD_SIZE
-# or DP_REPLICATE manually.
+# Compute the GPU-process world size from the platform node world size. Do not
+# treat SenseCore's outer WORLD_SIZE as torchrun WORLD_SIZE: for a 2-node x
+# 8-GPU job SenseCore reports WORLD_SIZE=2 here, while torchrun will assign
+# WORLD_SIZE=16 to train.py workers.
 for topology_var in NNODES NODE_RANK NPROC_PER_NODE; do
     topology_value=${!topology_var}
     if [[ ! "${topology_value}" =~ ^[0-9]+$ ]]; then
@@ -75,20 +78,22 @@ if ((NODE_RANK >= NNODES)); then
     exit 1
 fi
 
-CALCULATED_WORLD_SIZE=$((NNODES * NPROC_PER_NODE))
-if [[ -n "${WORLD_SIZE:-}" ]]; then
-    if [[ ! "${WORLD_SIZE}" =~ ^[1-9][0-9]*$ ]]; then
-        echo "WORLD_SIZE must be a positive integer; got ${WORLD_SIZE}." >&2
+TRAIN_WORLD_SIZE=$((NNODES * NPROC_PER_NODE))
+if [[ -n "${SCHEDULER_WORLD_SIZE}" ]]; then
+    if [[ ! "${SCHEDULER_WORLD_SIZE}" =~ ^[1-9][0-9]*$ ]]; then
+        echo "Scheduler WORLD_SIZE must be a positive integer; got ${SCHEDULER_WORLD_SIZE}." >&2
         exit 1
     fi
-    WORLD_SIZE_SOURCE=environment
+    if ((SCHEDULER_WORLD_SIZE == NNODES)); then
+        SCHEDULER_WORLD_SIZE_UNIT=nodes
+    elif ((SCHEDULER_WORLD_SIZE == TRAIN_WORLD_SIZE)); then
+        SCHEDULER_WORLD_SIZE_UNIT=gpu_processes
+    else
+        echo "Scheduler WORLD_SIZE=${SCHEDULER_WORLD_SIZE} matches neither NNODES=${NNODES} nor NNODES*NPROC_PER_NODE=${TRAIN_WORLD_SIZE}." >&2
+        exit 1
+    fi
 else
-    WORLD_SIZE=${CALCULATED_WORLD_SIZE}
-    WORLD_SIZE_SOURCE=NNODES_x_NPROC_PER_NODE
-fi
-if ((WORLD_SIZE != CALCULATED_WORLD_SIZE)); then
-    echo "WORLD_SIZE=${WORLD_SIZE} does not match NNODES*NPROC_PER_NODE=${CALCULATED_WORLD_SIZE}." >&2
-    exit 1
+    SCHEDULER_WORLD_SIZE_UNIT=not_injected
 fi
 
 MAX_LENGTH=${MAX_LENGTH:-131072}
@@ -107,7 +112,7 @@ TORCHRUN_PER_RANK_LOGS=${TORCHRUN_PER_RANK_LOGS:-true}
 # 128-GPU topology: each physical 8-GPU node is one CP8/FSDP8/target-EP8
 # domain. Target EP therefore communicates only between CP shards of the same
 # sample. DP_REPLICATE is the remaining dense world dimension and is derived
-# from WORLD_SIZE rather than configured independently.
+# from TRAIN_WORLD_SIZE rather than configured independently.
 DP_SHARD=${DP_SHARD:-1}
 CP=${CP:-8}
 TP=${TP:-1}
@@ -123,19 +128,19 @@ for parallel_var in DP_SHARD CP TP DRAFT_EP TARGET_EP; do
 done
 
 DENSE_REPLICA_DOMAIN=$((DP_SHARD * CP * TP))
-if ((WORLD_SIZE % DENSE_REPLICA_DOMAIN != 0)); then
-    echo "WORLD_SIZE=${WORLD_SIZE} must be divisible by DP_SHARD*CP*TP=${DENSE_REPLICA_DOMAIN}." >&2
+if ((TRAIN_WORLD_SIZE % DENSE_REPLICA_DOMAIN != 0)); then
+    echo "TRAIN_WORLD_SIZE=${TRAIN_WORLD_SIZE} must be divisible by DP_SHARD*CP*TP=${DENSE_REPLICA_DOMAIN}." >&2
     exit 1
 fi
-DP_REPLICATE=$((WORLD_SIZE / DENSE_REPLICA_DOMAIN))
+DP_REPLICATE=$((TRAIN_WORLD_SIZE / DENSE_REPLICA_DOMAIN))
 DENSE_PARALLEL_SIZE=$((DP_REPLICATE * DP_SHARD * CP * TP))
 FSDP_SHARD_SIZE=$((DP_SHARD * CP))
 SPARSE_DOMAIN=$((DP_SHARD * CP * TP))
 DATA_PARALLEL_SIZE=$((DP_REPLICATE * DP_SHARD))
 MICRO_GLOBAL_BATCH_SIZE=$((DATA_PARALLEL_SIZE * LOCAL_BATCH_SIZE))
 
-if ((WORLD_SIZE != DENSE_PARALLEL_SIZE)); then
-    echo "WORLD_SIZE=${WORLD_SIZE} must equal DP_REPLICATE*DP_SHARD*CP*TP=${DENSE_PARALLEL_SIZE}." >&2
+if ((TRAIN_WORLD_SIZE != DENSE_PARALLEL_SIZE)); then
+    echo "TRAIN_WORLD_SIZE=${TRAIN_WORLD_SIZE} must equal DP_REPLICATE*DP_SHARD*CP*TP=${DENSE_PARALLEL_SIZE}." >&2
     exit 1
 fi
 if ((SPARSE_DOMAIN % TARGET_EP != 0)); then
@@ -169,10 +174,11 @@ if ((SAVE_STEPS < 1)); then
 fi
 GRADIENT_ACCUMULATION_STEPS=$((GLOBAL_BATCH_SIZE / MICRO_GLOBAL_BATCH_SIZE))
 
-echo "Launching DeepSeek-V4-Flash DSpark FSDP2 on ${WORLD_SIZE} GPUs:"
+echo "Launching DeepSeek-V4-Flash DSpark FSDP2 on ${TRAIN_WORLD_SIZE} GPUs:"
 echo "  start=${START_TIME}, host=$(hostname), pid=$$"
 echo "  node=${NODE_RANK}/${NNODES}, rendezvous=${MASTER_ADDR}:${MASTER_PORT}"
-echo "  world size=${WORLD_SIZE} (source=${WORLD_SIZE_SOURCE}, NNODES*NPROC_PER_NODE=${CALCULATED_WORLD_SIZE})"
+echo "  scheduler world size=${SCHEDULER_WORLD_SIZE:-<unset>} (${SCHEDULER_WORLD_SIZE_UNIT})"
+echo "  training world size=${TRAIN_WORLD_SIZE} (=NNODES*NPROC_PER_NODE)"
 echo "  dense mesh: DP_REPLICATE=${DP_REPLICATE}, DP_SHARD=${DP_SHARD}, CP=${CP}, TP=${TP}"
 echo "  FSDP shard=${FSDP_SHARD_SIZE}, draft EP=${DRAFT_EP}, target EP=${TARGET_EP}, target EFSDP=${TARGET_EFSDP}"
 echo "  local batch=${LOCAL_BATCH_SIZE}, global batch=${GLOBAL_BATCH_SIZE}, gradient accumulation=${GRADIENT_ACCUMULATION_STEPS}"
