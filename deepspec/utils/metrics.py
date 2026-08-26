@@ -8,11 +8,13 @@ _REDUCTION_PATTERN = re.compile(r"^(dp_)?(mean|sum|max|min|last)$")
 _DEFAULT_RATIO_REDUCTION = "dp_sum"
 _metrics = {}
 _reduction_group = None
+_validated_schema = None
 
 
 def configure_reduction_group(group) -> None:
-    global _reduction_group
+    global _reduction_group, _validated_schema
     _reduction_group = group
+    _validated_schema = None
 
 
 def _group_world_size() -> int:
@@ -82,8 +84,12 @@ def _schema():
 
 
 def _assert_schema_consistent():
+    global _validated_schema
     local_schema = _schema()
+    if local_schema == _validated_schema:
+        return
     if _group_world_size() == 1:
+        _validated_schema = local_schema
         return
     gathered = [None for _ in range(_group_world_size())]
     dist.all_gather_object(gathered, local_schema, group=_reduction_group)
@@ -93,6 +99,7 @@ def _assert_schema_consistent():
             "metric schema mismatch across ranks: "
             f"rank0={reference}, rank{rank}={schema}"
         )
+    _validated_schema = local_schema
 
 
 def _safe_div(numerator: torch.Tensor, denominator: torch.Tensor) -> float:
@@ -152,10 +159,78 @@ def add_metric(
     entry["values"].append(value)
 
 
-def flush() -> dict[str, float]:
+class PendingMetricReduction:
+    """Packed asynchronous metric reductions finalized after optimizer compute."""
+
+    def __init__(
+        self,
+        *,
+        local_values,
+        packed_reductions,
+        last_reduction,
+    ):
+        self.local_values = local_values
+        self.packed_reductions = packed_reductions
+        self.last_reduction = last_reduction
+
+    def wait(self, *, materialize: bool = True) -> dict[str, float]:
+        summary = (
+            {
+                name: float(value.item())
+                for name, value in self.local_values.items()
+            }
+            if materialize
+            else {}
+        )
+        for tensor, work, specs in self.packed_reductions:
+            if work is not None:
+                work.wait()
+            if not materialize:
+                continue
+            values = tensor.detach().cpu().tolist()
+            for spec in specs:
+                kind, name, first, second = spec
+                if kind == "ratio":
+                    denominator = float(values[second])
+                    summary[name] = (
+                        0.0 if denominator == 0.0 else float(values[first]) / denominator
+                    )
+                else:
+                    summary[name] = float(values[first]) / float(second)
+        if self.last_reduction is not None:
+            gathered, work, names = self.last_reduction
+            if work is not None:
+                work.wait()
+            if materialize:
+                values = gathered[-1].detach().cpu().tolist()
+                summary.update(
+                    {name: float(value) for name, value in zip(names, values)}
+                )
+        return summary
+
+
+def flush_async() -> PendingMetricReduction:
+    """Pack scalar metrics and launch at most one collective per reduction op.
+
+    DSpark records many numerator/denominator pairs. Reducing each scalar
+    separately produced more than forty tiny NCCL calls per optimizer step at
+    128 GPUs. Packing them turns that latency-bound tail into one SUM, plus an
+    optional MAX/MIN/LAST collective, and ``async_op`` lets the SUM overlap the
+    FP32 Adam update.
+    """
+
     _assert_schema_consistent()
     try:
-        summary = {}
+        local_values = {}
+        sum_values = []
+        sum_specs = []
+        max_values = []
+        max_specs = []
+        min_values = []
+        min_specs = []
+        last_values = []
+        last_names = []
+        world_size = _group_world_size()
         for name, entry in sorted(_metrics.items()):
             reduction = entry["reduction"]
             if entry["kind"] == "ratio":
@@ -165,23 +240,91 @@ def flush() -> dict[str, float]:
                 den = torch.stack(
                     [_clone_to_reduce_device(value) for value in entry["den"]]
                 ).sum()
-                num = _reduce_dp_value(num, "sum")
-                den = _reduce_dp_value(den, "sum")
-                summary[name] = _safe_div(num, den)
+                first = len(sum_values)
+                sum_values.extend((num, den))
+                sum_specs.append(("ratio", name, first, first + 1))
                 continue
 
             local_reduction = reduction[3:] if reduction.startswith("dp_") else reduction
             value = _local_reduce(entry["values"], local_reduction)
-            if reduction.startswith("dp_"):
-                value = _reduce_dp_value(value, local_reduction)
-            summary[name] = value.item()
-        return summary
+            if not reduction.startswith("dp_"):
+                local_values[name] = value
+            elif local_reduction in ("sum", "mean"):
+                index = len(sum_values)
+                sum_values.append(value)
+                divisor = world_size if local_reduction == "mean" else 1
+                sum_specs.append(("scalar", name, index, divisor))
+            elif local_reduction == "max":
+                index = len(max_values)
+                max_values.append(value)
+                max_specs.append(("scalar", name, index, 1))
+            elif local_reduction == "min":
+                index = len(min_values)
+                min_values.append(value)
+                min_specs.append(("scalar", name, index, 1))
+            elif local_reduction == "last":
+                last_values.append(value)
+                last_names.append(name)
+            else:
+                raise AssertionError(f"unsupported reduction: {local_reduction}")
+
+        packed_reductions = []
+        for values, specs, op in (
+            (sum_values, sum_specs, dist.ReduceOp.SUM),
+            (max_values, max_specs, dist.ReduceOp.MAX),
+            (min_values, min_specs, dist.ReduceOp.MIN),
+        ):
+            if not values:
+                continue
+            tensor = torch.stack(values)
+            work = None
+            if world_size > 1:
+                work = dist.all_reduce(
+                    tensor,
+                    op=op,
+                    group=_reduction_group,
+                    async_op=True,
+                )
+            packed_reductions.append((tensor, work, specs))
+
+        last_reduction = None
+        if last_values:
+            tensor = torch.stack(last_values)
+            gathered = [torch.empty_like(tensor) for _ in range(world_size)]
+            work = None
+            if world_size > 1:
+                work = dist.all_gather(
+                    gathered,
+                    tensor,
+                    group=_reduction_group,
+                    async_op=True,
+                )
+            else:
+                gathered[0].copy_(tensor)
+            last_reduction = (gathered, work, last_names)
+
+        return PendingMetricReduction(
+            local_values=local_values,
+            packed_reductions=packed_reductions,
+            last_reduction=last_reduction,
+        )
     finally:
         reset()
+
+
+def flush() -> dict[str, float]:
+    return flush_async().wait()
 
 
 def reset() -> None:
     _metrics.clear()
 
 
-__all__ = ["add_metric", "configure_reduction_group", "flush", "reset"]
+__all__ = [
+    "PendingMetricReduction",
+    "add_metric",
+    "configure_reduction_group",
+    "flush",
+    "flush_async",
+    "reset",
+]

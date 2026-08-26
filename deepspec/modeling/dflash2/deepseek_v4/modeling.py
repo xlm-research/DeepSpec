@@ -91,5 +91,14 @@ class DeepseekV4DFlash2Model(DeepseekV4DSparkModel):
             temperature=temperature,
         )
 
+    def filter_checkpoint_state_dict(self, state_dict):
+        """Exclude target-owned embedding/head tensors from draft checkpoints."""
+
+        return {
+            key: value
+            for key, value in state_dict.items()
+            if key not in {"embed_tokens.weight", "lm_head.weight"}
+        }
+
 
 __all__ = ["DeepseekV4DFlash2DecoderLayer", "DeepseekV4DFlash2Model"]

@@ -9,6 +9,9 @@ from torch.distributed.tensor import DTensor, distribute_tensor
 from deepspec.utils.optim import CosineAnnealingWarmupLR
 
 
+_OPTIMIZER_DTYPE = torch.float32
+
+
 class MasterWeightAdamW(Optimizer):
     """AdamW over model parameters with FP32 master weights and moments.
 
@@ -39,6 +42,7 @@ class MasterWeightAdamW(Optimizer):
         # Eager state allocation gives distributed checkpoint load a complete
         # sharded tensor template even before the first optimizer step.
         for group in self.param_groups:
+            group.setdefault("step", 0)
             for parameter in group["params"]:
                 if parameter.requires_grad:
                     self._initialize_parameter_state(parameter)
@@ -47,10 +51,37 @@ class MasterWeightAdamW(Optimizer):
         state = self.state[parameter]
         if state:
             return
-        state["step"] = torch.zeros((), dtype=torch.float32, device=parameter.device)
-        state["master_param"] = parameter.detach().clone().to(torch.float32)
+        state["step"] = torch.zeros(
+            (), dtype=_OPTIMIZER_DTYPE, device=parameter.device
+        )
+        state["master_param"] = parameter.detach().clone().to(_OPTIMIZER_DTYPE)
         state["exp_avg"] = torch.zeros_like(state["master_param"])
         state["exp_avg_sq"] = torch.zeros_like(state["master_param"])
+
+    def load_state_dict(self, state_dict) -> None:
+        super().load_state_dict(state_dict)
+        # torch.optim may cast floating-point state to the model parameter's
+        # dtype while loading.  A BF16 model must still resume with FP32 master
+        # weights and FP32 Adam accumulators.
+        for state in self.state.values():
+            for name in ("step", "master_param", "exp_avg", "exp_avg_sq"):
+                value = state.get(name)
+                if torch.is_tensor(value) and value.dtype != _OPTIMIZER_DTYPE:
+                    state[name] = value.to(_OPTIMIZER_DTYPE)
+        # Older checkpoints stored the common Adam step only in each parameter
+        # state.  Recover it once while loading instead of reading one CUDA
+        # scalar per parameter on every optimizer step.
+        for group in self.param_groups:
+            if "step" in group:
+                group["step"] = int(group["step"])
+                continue
+            group_step = 0
+            for parameter in group["params"]:
+                state_step = self.state[parameter].get("step")
+                if state_step is not None:
+                    group_step = int(state_step.item())
+                    break
+            group["step"] = group_step
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -63,6 +94,8 @@ class MasterWeightAdamW(Optimizer):
             lr = float(group["lr"])
             weight_decay = float(group["weight_decay"])
             eps = float(group["eps"])
+            step = int(group.get("step", 0)) + 1
+            group["step"] = step
             for parameter in group["params"]:
                 gradient = parameter.grad
                 if gradient is None:
@@ -71,12 +104,14 @@ class MasterWeightAdamW(Optimizer):
                     raise RuntimeError("MasterWeightAdamW does not support sparse gradients.")
                 self._initialize_parameter_state(parameter)
                 state = self.state[parameter]
-                state["step"].add_(1)
-                step = int(state["step"].item())
+                state["step"].fill_(step)
                 master = state["master_param"]
                 exp_avg = state["exp_avg"]
                 exp_avg_sq = state["exp_avg_sq"]
-                grad_float = gradient.to(torch.float32)
+                # BF16-reduced gradients are promoted before every optimizer
+                # update; master weights and both moment accumulators therefore
+                # remain FP32 throughout training.
+                grad_float = gradient.to(_OPTIMIZER_DTYPE)
                 if weight_decay:
                     master.mul_(1.0 - lr * weight_decay)
                 exp_avg.mul_(beta1).add_(grad_float, alpha=1.0 - beta1)

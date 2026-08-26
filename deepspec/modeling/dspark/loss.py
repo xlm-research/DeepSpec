@@ -14,17 +14,18 @@ def _all_reduce_loss_denominators(
     *,
     world_size: int,
 ) -> dict[str, torch.Tensor]:
-    denominators = {}
-    for key in ("ce_loss_den", "l1_loss_den", "confidence_loss_den"):
-        tensor = loss_terms[key].detach().clone()
-        if world_size > 1:
-            dist.all_reduce(
-                tensor,
-                op=dist.ReduceOp.SUM,
-                group=loss_reduction_group(),
-            )
-        denominators[key] = tensor
-    return denominators
+    keys = ("ce_loss_den", "l1_loss_den", "confidence_loss_den")
+    # These values are all needed before backward, but reducing each scalar
+    # separately introduced three latency-bound cross-node collectives per
+    # micro-step. One packed reduction has identical numerics and one launch.
+    packed = torch.stack([loss_terms[key].detach() for key in keys])
+    if world_size > 1:
+        dist.all_reduce(
+            packed,
+            op=dist.ReduceOp.SUM,
+            group=loss_reduction_group(),
+        )
+    return dict(zip(keys, packed.unbind()))
 
 
 def _build_loss_weight_mask(
@@ -240,11 +241,12 @@ def _build_loss(
     world_size: int,
 ) -> torch.Tensor:
     ce_loss = loss_terms["ce_loss_num"] / (global_denominators["ce_loss_den"] + 1e-6)
-    l1_loss = ce_loss.new_zeros(())
-    if global_denominators["l1_loss_den"].item() > 0:
-        l1_loss = loss_terms["l1_loss_num"] / (
-            global_denominators["l1_loss_den"] + 1e-6
-        )
+    l1_denominator = global_denominators["l1_loss_den"]
+    l1_loss = torch.where(
+        l1_denominator > 0,
+        loss_terms["l1_loss_num"] / (l1_denominator + 1e-6),
+        ce_loss.new_zeros(()),
+    )
     confidence_loss = ce_loss.new_zeros(())
     if has_confidence:
         confidence_loss = loss_terms["confidence_loss_num"] / (
@@ -280,11 +282,11 @@ def compute_dspark_loss(
     confidence_head_alpha = float(confidence_head_alpha)
 
     local_ce_loss = loss_terms["ce_loss_num"] / (loss_terms["ce_loss_den"] + 1e-6)
-    local_l1_loss = local_ce_loss.new_zeros(())
-    if global_denominators["l1_loss_den"].item() > 0:
-        local_l1_loss = loss_terms["l1_loss_num"] / (
-            loss_terms["l1_loss_den"] + 1e-6
-        )
+    local_l1_loss = torch.where(
+        loss_terms["l1_loss_den"] > 0,
+        loss_terms["l1_loss_num"] / (loss_terms["l1_loss_den"] + 1e-6),
+        local_ce_loss.new_zeros(()),
+    )
     local_confidence_loss = local_ce_loss.new_zeros(())
     if has_confidence:
         local_confidence_loss = loss_terms["confidence_loss_num"] / (
@@ -302,7 +304,7 @@ def compute_dspark_loss(
         den=loss_terms["ce_loss_den"],
         tag="train",
     )
-    if global_denominators["l1_loss_den"].item() > 0:
+    if l1_loss_alpha > 0:
         add_metric(
             "l1_loss",
             loss_terms["l1_loss_num"],

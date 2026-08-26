@@ -1,15 +1,25 @@
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 from types import SimpleNamespace
 
 import torch
+import torch.distributed as dist
 
 from deepspec.modeling.dflash2.common import (
     CandidateSelector,
     GroupedDynamicCausalConv,
 )
+from deepspec.modeling.dflash2.loss import compute_dflash2_loss
 from deepspec.modeling.dflash2.qwen3_8.config import build_draft_config
+from deepspec.modeling.dspark.common import DSparkForwardOutput
+from deepspec.training.loss import configure_loss_reduction_group
 from deepspec.utils.config import load_config, parse_opts_to_config
+from deepspec.utils.metrics import configure_reduction_group
+from deepspec.utils.metrics import flush as flush_metrics
+from deepspec.utils.metrics import reset as reset_metrics
+from deepspec.utils import training_logger
+from tests.distributed_test_utils import require_torchrun
 
 
 class DFlash2DynamicConvTest(unittest.TestCase):
@@ -48,6 +58,45 @@ class DFlash2DynamicConvTest(unittest.TestCase):
 
 
 class DFlash2CandidateSelectorTest(unittest.TestCase):
+    def test_selector_starts_as_noop_and_can_learn_on_first_step(self):
+        selector = CandidateSelector(
+            vocab_size=8,
+            hidden_size=4,
+            rank=2,
+            top_k=3,
+            initializer_range=0.02,
+        )
+        hidden = torch.randn(2, 4)
+        unary = torch.randn(2, 3)
+        candidates = torch.tensor([[1, 3, 5], [0, 2, 7]])
+        predecessors = torch.tensor([4, 6])
+        scores = selector.pair_scores(
+            hidden=hidden,
+            unary=unary,
+            candidate_ids=candidates,
+            predecessor_ids=predecessors,
+        )
+        torch.testing.assert_close(scores, unary)
+        self.assertEqual(
+            torch.count_nonzero(selector.successor_codebook).item(), 0
+        )
+
+        scores.sum().backward()
+        self.assertIsNotNone(selector.successor_codebook.grad)
+        self.assertGreater(
+            selector.successor_codebook.grad.abs().sum().item(), 0.0
+        )
+
+    def test_selector_rejects_candidate_pool_larger_than_vocabulary(self):
+        with self.assertRaisesRegex(ValueError, "selector_top_k"):
+            CandidateSelector(
+                vocab_size=4,
+                hidden_size=2,
+                rank=1,
+                top_k=5,
+                initializer_range=0.02,
+            )
+
     def test_teacher_forced_topk_targets(self):
         selector = CandidateSelector(
             vocab_size=6,
@@ -120,6 +169,106 @@ class DFlash2CandidateSelectorTest(unittest.TestCase):
         self.assertEqual(tokens.tolist(), [[2, 3]])
         self.assertEqual(tuple(candidates.shape), (1, 2, 2))
         self.assertIsNone(probs)
+
+
+class DFlash2LossTest(unittest.TestCase):
+    def test_base_and_selector_cross_entropy_are_both_trainable(self):
+        self.addCleanup(reset_metrics)
+        reset_metrics()
+        draft_logits = torch.zeros(1, 1, 2, 3, requires_grad=True)
+        selector_scores = torch.zeros(1, 1, 2, 2, requires_grad=True)
+        outputs = DSparkForwardOutput(
+            draft_logits=draft_logits,
+            target_ids=torch.tensor([[[0, 1]]]),
+            eval_mask=torch.ones(1, 1, 2, dtype=torch.bool),
+            block_keep_mask=torch.ones(1, 1, dtype=torch.bool),
+            selector_scores=selector_scores,
+            selector_target_indices=torch.tensor([[[0, 1]]]),
+            selector_loss_mask=torch.ones(1, 1, 2, dtype=torch.bool),
+            selector_recall_mask=torch.ones(1, 1, 2, dtype=torch.bool),
+        )
+        with patch("deepspec.modeling.dflash2.loss.add_metric") as add_metric:
+            loss = compute_dflash2_loss(
+                outputs=outputs,
+                loss_decay_gamma=None,
+                ce_loss_alpha=1.0,
+                selector_loss_alpha=1.0,
+                selector_loss_decay_gamma=None,
+            )
+        dflash2_metric = next(
+            call
+            for call in add_metric.call_args_list
+            if call.args[0] == "dflash2_loss"
+        )
+        self.assertEqual(dflash2_metric.kwargs["reduction"], "dp_mean")
+        torch.testing.assert_close(
+            loss.detach(),
+            torch.log(torch.tensor(3.0)) + torch.log(torch.tensor(2.0)),
+        )
+        loss.backward()
+        self.assertGreater(draft_logits.grad.abs().sum().item(), 0.0)
+        self.assertGreater(selector_scores.grad.abs().sum().item(), 0.0)
+
+    def test_console_prefers_global_dflash2_loss(self):
+        with patch.object(training_logger, "print_on_global_main") as printer:
+            training_logger._print_summary(
+                summary={"train/loss": 0.0, "train/dflash2_loss": 12.5},
+                global_step=1,
+                next_micro_step=1,
+                micro_batches_per_epoch=1,
+                max_train_steps=1,
+            )
+        self.assertIn("loss=12.5000", printer.call_args.args[0])
+
+
+class DFlash2DistributedLossTest(unittest.TestCase):
+    def test_global_loss_when_rank_zero_has_no_valid_anchor(self):
+        runtime = require_torchrun(self, world_size=2)
+        configure_loss_reduction_group(dist.group.WORLD)
+        configure_reduction_group(dist.group.WORLD)
+        reset_metrics()
+
+        has_tokens = runtime.global_rank == 1
+        eval_mask = torch.full(
+            (1, 1, 2),
+            has_tokens,
+            dtype=torch.bool,
+            device=runtime.device,
+        )
+        draft_logits = torch.zeros(
+            1, 1, 2, 3, device=runtime.device, requires_grad=True
+        )
+        selector_scores = torch.zeros(
+            1, 1, 2, 2, device=runtime.device, requires_grad=True
+        )
+        outputs = DSparkForwardOutput(
+            draft_logits=draft_logits,
+            target_ids=torch.tensor([[[0, 1]]], device=runtime.device),
+            eval_mask=eval_mask,
+            block_keep_mask=torch.full(
+                (1, 1), has_tokens, dtype=torch.bool, device=runtime.device
+            ),
+            selector_scores=selector_scores,
+            selector_target_indices=torch.tensor(
+                [[[0, 1]]], device=runtime.device
+            ),
+            selector_loss_mask=eval_mask,
+            selector_recall_mask=eval_mask,
+        )
+        loss = compute_dflash2_loss(
+            outputs=outputs,
+            loss_decay_gamma=None,
+            ce_loss_alpha=1.0,
+            selector_loss_alpha=1.0,
+            selector_loss_decay_gamma=None,
+        )
+        loss.backward()
+        metrics = flush_metrics()
+        expected = torch.log(torch.tensor(3.0)) + torch.log(torch.tensor(2.0))
+        self.assertAlmostEqual(
+            metrics["train/dflash2_loss"], expected.item(), places=5
+        )
+        dist.barrier()
 
 
 class Qwen3_8DFlash2ConfigTest(unittest.TestCase):

@@ -33,6 +33,10 @@ def build_draft_config(target_config, model_args):
     # sliding window.  CSA/HCA belong to the full target model, not the draft.
     draft_config.layer_types = ["sliding_attention"] * num_draft_layers
     draft_config.mlp_layer_types = ["moe"] * num_draft_layers
+    # DeepseekV4DSparkModel is constructed directly instead of through
+    # ``from_pretrained``.  Select the grouped expert dispatcher explicitly so
+    # the draft does not inherit/fall back to the per-expert eager Python loop.
+    draft_config._experts_implementation = "grouped_mm"
     draft_config.sliding_window = int(
         model_args.get("sliding_window", target_config.sliding_window)
     )
@@ -59,4 +63,3 @@ def build_draft_config(target_config, model_args):
 
 
 __all__ = ["build_draft_config"]
-

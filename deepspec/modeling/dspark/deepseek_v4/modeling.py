@@ -32,6 +32,7 @@ from deepspec.modeling.deepseek_v4_parallel import (
     parallelize_deepseek_v4_model,
 )
 from deepspec.modeling.target.deepseek_v4_cp import ring_left_context
+from deepspec.utils.parallel import compute_context_parallel_range
 from deepspec.utils.sampling import sample_tokens
 
 
@@ -260,6 +261,19 @@ class DeepseekV4DSparkModel(DeepseekV4PreTrainedModel):
     _no_split_modules: ClassVar[list[str]] = ["DeepseekV4DSparkDecoderLayer"]
     decoder_layer_cls = DeepseekV4DSparkDecoderLayer
 
+    @classmethod
+    def _can_set_experts_implementation(cls) -> bool:
+        """Declare support provided by the upstream decorated V4 experts.
+
+        Transformers normally detects expert-dispatch support by looking for
+        ``@use_experts_implementation`` in the model class's own source file.
+        This adapter reuses the already-decorated ``DeepseekV4Experts`` class
+        from Transformers, so that source-code heuristic otherwise incorrectly
+        forces the draft back to the eager per-expert loop.
+        """
+
+        return True
+
     @torch.no_grad()
     def _init_weights(self, module):
         super()._init_weights(module)
@@ -269,6 +283,11 @@ class DeepseekV4DSparkModel(DeepseekV4PreTrainedModel):
     def __init__(self, config) -> None:
         super().__init__(config)
         self.config = config
+        if self.config._experts_implementation != "grouped_mm":
+            raise RuntimeError(
+                "DeepSeek-V4 draft MoE requires experts_implementation="
+                f"'grouped_mm', got {self.config._experts_implementation!r}."
+            )
         required = (
             "target_layer_ids",
             "mask_token_id",
@@ -606,9 +625,19 @@ class DeepseekV4DSparkModel(DeepseekV4PreTrainedModel):
             )
         if input_ids.shape[0] != 1:
             raise ValueError("DeepSeek-V4 draft CP currently requires batch size 1.")
-        start = int(context_start.reshape(-1)[0].item())
-        local_length = int(context_len.reshape(-1)[0].item())
-        total_length = int(seq_len.reshape(-1)[0].item())
+        del context_start, context_len, seq_len
+        total_length = int(input_ids.shape[1])
+        start, end = compute_context_parallel_range(
+            sequence_length=total_length,
+            context_parallel_rank=self.context_parallel_rank,
+            context_parallel_size=self.context_parallel_size,
+        )
+        local_length = end - start
+        if int(target_hidden_states.shape[1]) != local_length:
+            raise RuntimeError(
+                "Target CP shard length does not match the draft partition: "
+                f"target={target_hidden_states.shape[1]}, expected={local_length}."
+            )
         local_target = target_hidden_states[:, :local_length]
         halo, halo_start = ring_left_context(
             local_target,
