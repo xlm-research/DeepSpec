@@ -4,6 +4,7 @@ import json
 
 import torch
 import torch.distributed as dist
+from torch.profiler import record_function
 from torch.utils.data import DataLoader
 from transformers import AutoConfig, AutoProcessor, AutoTokenizer
 
@@ -51,6 +52,7 @@ from deepspec.trainer.ckpt_manager import (
 import deepspec.utils.training_logger as training_logger
 from deepspec.utils.hfai_suspend import SuspendController
 from deepspec.utils.metrics import configure_reduction_group
+from deepspec.utils.torch_profiler import build_torch_profiler
 
 
 _PRECISION_DTYPES = {
@@ -86,6 +88,7 @@ def _load_checkpoint_tensor(checkpoint_dir: str, names: tuple[str, ...]):
                 if name in available:
                     return handle.get_tensor(name)
     raise KeyError(f"None of {names} exists in {checkpoint_dir}.")
+
 
 def _compute_gradient_accumulation_steps(
     *, world_size: int, local_batch_size: int, global_batch_size: int
@@ -157,13 +160,17 @@ def _launch_eval(
     exp_name: str,
 ) -> None:
     from deepspec.utils.constant import auto_eval_command
+
     if auto_eval_command is not None:
-        command = auto_eval_command(target_model_name_or_path,checkpoint_dir,step,tensorboard_dir,exp_name)
+        command = auto_eval_command(
+            target_model_name_or_path, checkpoint_dir, step, tensorboard_dir, exp_name
+        )
         print_on_global_main(f"Submitting auto eval for {checkpoint_dir}")
         print_on_global_main(command)
         os.system(command)
     else:
         print("You can use this function to launch your auto eval script!")
+
 
 class BaseTrainer:
     data_collator_cls = None
@@ -265,9 +272,7 @@ class BaseTrainer:
                 precision_dtype=self.precision_dtype,
                 global_rank=self.global_rank,
             )
-        configure_cp = getattr(
-            self.draft_model, "configure_context_parallel", None
-        )
+        configure_cp = getattr(self.draft_model, "configure_context_parallel", None)
         if configure_cp is None:
             if self.context_parallel_size > 1:
                 raise NotImplementedError(
@@ -292,9 +297,15 @@ class BaseTrainer:
 
         if self.online_target_enabled:
             paths = self.args.data.get("train_data_path")
-            paths = [os.fspath(paths)] if isinstance(paths, (str, os.PathLike)) else list(paths or [])
+            paths = (
+                [os.fspath(paths)]
+                if isinstance(paths, (str, os.PathLike))
+                else list(paths or [])
+            )
             if not paths:
-                raise ValueError("Online target training requires data.train_data_path.")
+                raise ValueError(
+                    "Online target training requires data.train_data_path."
+                )
             self.train_dataset = JsonLineDataset(paths)
             self.data_collator = ConversationCollator(
                 tokenizer=self.tokenizer,
@@ -336,8 +347,7 @@ class BaseTrainer:
         dist.broadcast_object_list(cache_validation_error, src=0)
         if cache_validation_error[0] is not None:
             raise ValueError(
-                "Target cache identity validation failed: "
-                f"{cache_validation_error[0]}"
+                f"Target cache identity validation failed: {cache_validation_error[0]}"
             )
 
         (
@@ -426,8 +436,12 @@ class BaseTrainer:
         print_on_local_main(f"  Num train epochs = {self.args.train.num_train_epochs}")
         print_on_local_main(f"  Samples per epoch = {self.samples_per_epoch}")
         print_on_local_main(f"  Local batch size = {self.args.train.local_batch_size}")
-        print_on_local_main(f"  Global batch size = {self.args.train.global_batch_size}")
-        print_on_local_main(f"  Gradient accumulation steps = {self.gradient_accumulation_steps}")
+        print_on_local_main(
+            f"  Global batch size = {self.args.train.global_batch_size}"
+        )
+        print_on_local_main(
+            f"  Gradient accumulation steps = {self.gradient_accumulation_steps}"
+        )
         print_on_local_main(f"  Steps per epoch = {self.steps_per_epoch}")
         print_on_local_main(f"  Max train steps = {self.max_train_steps}")
 
@@ -458,7 +472,11 @@ class BaseTrainer:
         if str(target_config.model_type) == "deepseek_v4":
             embed_weight = _load_checkpoint_tensor(
                 model_args.target_model_name_or_path,
-                ("model.embed_tokens.weight", "model.language_model.embed_tokens.weight", "embed.weight"),
+                (
+                    "model.embed_tokens.weight",
+                    "model.language_model.embed_tokens.weight",
+                    "embed.weight",
+                ),
             )
             head_weight = _load_checkpoint_tensor(
                 model_args.target_model_name_or_path,
@@ -470,10 +488,14 @@ class BaseTrainer:
                 freeze=True,
             )
         else:
-            target_model = load_target_model_with_head(
-                model_args.target_model_name_or_path,
-                dtype=self.precision_dtype,
-            ).to(device="cpu").eval()
+            target_model = (
+                load_target_model_with_head(
+                    model_args.target_model_name_or_path,
+                    dtype=self.precision_dtype,
+                )
+                .to(device="cpu")
+                .eval()
+            )
             target_embed_tokens, target_lm_head = get_target_embeddings(target_model)
             draft_model.initialize_embeddings_and_head(
                 embed_tokens=target_embed_tokens,
@@ -590,61 +612,103 @@ class BaseTrainer:
         )
         prefetcher = CUDAPrefetcher(dataloader, self.device)
         training_logger.start_session(global_step=self.global_step)
+        profiler = build_torch_profiler(
+            self.args.get("profiling"),
+            global_rank=self.global_rank,
+            world_size=self.world_size,
+        )
+        save_checkpoints = bool(self.args.logging.get("save_checkpoints", True))
+        pending_log = None
 
-        with self.suspend_controller.monitoring():
+        with profiler, self.suspend_controller.monitoring():
             for batch in prefetcher:
                 should_sync = (
-                    (self.next_micro_step + 1) % self.gradient_accumulation_steps == 0
-                )
-                with gradient_sync_context(self.model, should_sync=should_sync):
-                    loss = self.run_batch(batch) / self.gradient_accumulation_steps
-                    loss.backward()
-                # Target activations are immutable offline supervision.  Once
-                # backward has consumed them, drop the last Python references
-                # immediately so their CUDA storage can be reused by the next
-                # micro-batch instead of keeping it alive through optimizer and
-                # checkpoint work.
-                del loss
-                batch.pop("target_hidden_states", None)
-                batch.pop("target_last_hidden_states", None)
-                self.next_micro_step += 1
+                    self.next_micro_step + 1
+                ) % self.gradient_accumulation_steps == 0
+                with record_function("deepspec::training_micro_step"):
+                    with gradient_sync_context(self.model, should_sync=should_sync):
+                        with record_function("deepspec::forward_and_loss"):
+                            loss = (
+                                self.run_batch(batch) / self.gradient_accumulation_steps
+                            )
+                        with record_function("deepspec::backward"):
+                            loss.backward()
+                    # Target activations are immutable offline supervision.  Once
+                    # backward has consumed them, drop the last Python references
+                    # immediately so their CUDA storage can be reused by the next
+                    # micro-batch instead of keeping it alive through optimizer and
+                    # checkpoint work.
+                    del loss
+                    batch.pop("target_hidden_states", None)
+                    batch.pop("target_last_hidden_states", None)
+                    self.next_micro_step += 1
 
-                if not should_sync:
-                    continue
+                    if should_sync:
+                        with record_function("deepspec::expert_gradient_sync"):
+                            synchronize_pure_expert_gradients(
+                                self._pure_expert_modules,
+                                sparse_mesh=self.parallel.sparse_mesh,
+                            )
 
-                synchronize_pure_expert_gradients(
-                    self._pure_expert_modules,
-                    sparse_mesh=self.parallel.sparse_mesh,
-                )
+                        with record_function("deepspec::gradient_norm"):
+                            grad_norm = clip_grad_norm_(
+                                self.model,
+                                float(self.args.train.max_grad_norm),
+                                pure_expert_modules=self._pure_expert_modules,
+                                expert_parallel_group=(
+                                    self.parallel.expert_parallel_group
+                                    if self.parallel.pure_expert_parallel
+                                    else None
+                                ),
+                            )
+                        # A packed metric reduction from the previous optimizer
+                        # step has had an entire target/draft forward+backward
+                        # window to complete. Drain it now, then launch this
+                        # step's metrics before Adam so its collective can run
+                        # concurrently with optimizer kernels and the next
+                        # training step instead of extending this step's tail.
+                        with record_function("deepspec::training_log_previous_wait"):
+                            training_logger.finish_optimizer_step(pending_log)
+                        with record_function("deepspec::training_log"):
+                            pending_log = training_logger.begin_optimizer_step(
+                                global_step=self.global_step,
+                                next_micro_step=self.next_micro_step,
+                                micro_batches_per_epoch=self.micro_batches_per_epoch,
+                                max_train_steps=self.max_train_steps,
+                                learning_rate=self.optimizer.get_learning_rate(),
+                                grad_norm=grad_norm,
+                            )
+                        with record_function("deepspec::optimizer_step"):
+                            self.optimizer.step()
 
-                grad_norm = clip_grad_norm_(
-                    self.model,
-                    float(self.args.train.max_grad_norm),
-                    pure_expert_modules=self._pure_expert_modules,
-                    expert_parallel_group=(
-                        self.parallel.expert_parallel_group
-                        if self.parallel.pure_expert_parallel
-                        else None
-                    ),
-                )
-                self.optimizer.step()
-                training_logger.on_optimizer_step(
-                    global_step=self.global_step,
-                    next_micro_step=self.next_micro_step,
-                    micro_batches_per_epoch=self.micro_batches_per_epoch,
-                    max_train_steps=self.max_train_steps,
-                    learning_rate=self.optimizer.get_learning_rate(),
-                    grad_norm=grad_norm.item(),
-                )
+                        if (
+                            save_checkpoints
+                            and self.global_step
+                            % int(self.args.logging.checkpointing_steps)
+                            == 0
+                        ):
+                            training_logger.finish_optimizer_step(pending_log)
+                            pending_log = None
+                            with record_function("deepspec::checkpoint"):
+                                self.save_and_eval_checkpoint()
 
-                if self.global_step % int(self.args.logging.checkpointing_steps) == 0:
-                    self.save_and_eval_checkpoint()
+                        if self.suspend_controller.requested():
+                            training_logger.finish_optimizer_step(pending_log)
+                            pending_log = None
+                            self._save_and_suspend()
+                            profiler.step()
+                            return
+                profiler.step()
 
-                if self.suspend_controller.requested():
-                    self._save_and_suspend()
-                    return
+        # Preserve the final log record. This wait is outside the profiled
+        # training-step region and, in normal runs, the final checkpoint/exit
+        # is not part of throughput timing either.
+        training_logger.finish_optimizer_step(pending_log)
 
-        self.save_and_eval_checkpoint()
+        if save_checkpoints:
+            self.save_and_eval_checkpoint()
+        else:
+            print_on_global_main("Checkpoint saving is disabled for this training run.")
 
     def clean_up(self, *, synchronize: bool = True):
         if self.online_target is not None:

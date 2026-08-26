@@ -43,7 +43,7 @@ train = dict(
     # each draft micro-batch.  Keep one epoch so every sample needs one target
     # forward rather than recomputing identical supervision across epochs.
     num_train_epochs=1,
-    max_train_steps=1,
+    max_train_steps=None,
     max_grad_norm=1.0,
     sharding_strategy="full_shard",
     parallel=dict(
@@ -56,6 +56,15 @@ train = dict(
         use_fsdp=True,
         context_parallel_backend="model_native",
         expert_dispatch_backend="native",
+        # The three 24.5-GB gathered draft blocks fit together on a 288-GB
+        # B300. Keep them materialized across the gradient-accumulation window
+        # and prefetch the static decoder order to remove exposed FSDP bubbles.
+        reshard_after_forward=False,
+        forward_prefetch=True,
+        backward_prefetch=True,
+        prefetch_depth=2,
+        reduce_dtype="bf16",
+        fsdp_wrap_granularity="block",
     ),
     target_parallel=dict(ep=8),
     # The distributed sliding-window path is shape-dynamic and performs ring
@@ -66,13 +75,31 @@ train = dict(
 logging = dict(
     logging_steps=10,
     checkpointing_steps=3000,
+    save_checkpoints=True,
+)
+
+profiling = dict(
+    enabled=False,
+    trace_dir="output/torch_profile",
+    ranks=[0],
+    # Schedule units are gradient-accumulation micro-steps.  The profile
+    # launcher overrides these values from the runtime accumulation factor.
+    skip_first_steps=0,
+    wait_steps=0,
+    warmup_steps=1,
+    active_steps=1,
+    repeat=1,
+    record_shapes=True,
+    profile_memory=True,
+    with_stack=True,
+    with_flops=True,
+    use_gzip=True,
+    row_limit=100,
 )
 
 data = dict(
     online_target=True,
-    train_data_path=(
-        "train_data/spec_o3_coldstartsft.first8.repeat1.deepspec.jsonl"
-    ),
+    train_data_path=("train_data/spec_o3_coldstartsft.first8.repeat1.deepspec.jsonl"),
     target_cache_path=None,
     chat_template="deepseek_v4",
     max_length=131072,
@@ -86,14 +113,10 @@ def finalize_cfg(cfg):
     logging_cfg = dict(cfg["logging"])
     output_root = os.environ.get("DEEPSPEC_OUTPUT_ROOT")
     checkpoint_root = (
-        os.path.join(output_root, "checkpoints")
-        if output_root
-        else BASE_CKPT_DIR
+        os.path.join(output_root, "checkpoints") if output_root else BASE_CKPT_DIR
     )
     tensorboard_root = (
-        os.path.join(output_root, "tensorboard")
-        if output_root
-        else BASE_TB_DIR
+        os.path.join(output_root, "tensorboard") if output_root else BASE_TB_DIR
     )
     logging_cfg["checkpoint_dir"] = os.path.join(
         checkpoint_root,

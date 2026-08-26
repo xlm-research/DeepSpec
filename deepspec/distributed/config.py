@@ -31,6 +31,13 @@ class ParallelConfig:
     context_parallel_backend: str = "pytorch"
     dynamic_context_parallel: bool = False
     reshard_after_forward: bool = True
+    forward_prefetch: bool = False
+    backward_prefetch: bool = False
+    prefetch_depth: int = 1
+    # Preserve the historical shared-path policy. Individual draft configs may
+    # opt into BF16 reduction after a numerical/performance comparison.
+    reduce_dtype: str = "fp32"
+    fsdp_wrap_granularity: str = "block"
 
     @property
     def dense_world_size(self) -> int:
@@ -182,6 +189,25 @@ class ParallelConfig:
             raise ValueError(
                 "expert_dispatch_backend must be native, deepep, or auto, got "
                 f"{self.expert_dispatch_backend!r}."
+            )
+        if (
+            not isinstance(self.prefetch_depth, int)
+            or isinstance(self.prefetch_depth, bool)
+            or self.prefetch_depth < 1
+        ):
+            raise ValueError(
+                "prefetch_depth must be a positive integer, got "
+                f"{self.prefetch_depth!r}."
+            )
+        if self.reduce_dtype not in {"auto", "bf16", "fp32"}:
+            raise ValueError(
+                "reduce_dtype must be auto, bf16, or fp32, got "
+                f"{self.reduce_dtype!r}."
+            )
+        if self.fsdp_wrap_granularity not in {"block", "block_components"}:
+            raise ValueError(
+                "fsdp_wrap_granularity must be block or block_components, got "
+                f"{self.fsdp_wrap_granularity!r}."
             )
 
     def validate_model(

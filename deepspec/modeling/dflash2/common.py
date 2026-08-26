@@ -88,6 +88,7 @@ class GroupedDynamicCausalConv(nn.Module):
             2 * self.kernel_size * groups,
             bias=False,
         )
+        self.reset_to_identity()
 
     @torch.no_grad()
     def reset_to_identity(self):
@@ -153,8 +154,14 @@ class CandidateSelector(nn.Module):
         super().__init__()
         self.rank = int(rank)
         self.top_k = int(top_k)
-        if self.rank < 1 or self.top_k < 1:
-            raise ValueError("selector_rank and selector_top_k must be positive.")
+        self.initializer_range = float(initializer_range)
+        if self.rank < 1:
+            raise ValueError("selector_rank must be positive.")
+        if not 1 <= self.top_k <= int(vocab_size):
+            raise ValueError(
+                "selector_top_k must be in [1, vocab_size]: "
+                f"top_k={self.top_k}, vocab_size={int(vocab_size)}."
+            )
         # These are Parameters rather than Embedding modules because the public
         # DFlash2 safetensors keys omit a trailing `.weight`.
         self.predecessor_codebook = nn.Parameter(
@@ -168,13 +175,46 @@ class CandidateSelector(nn.Module):
             self.rank,
             bias=False,
         )
-        self.reset_parameters(float(initializer_range))
+        self.reset_parameters()
 
     @torch.no_grad()
-    def reset_parameters(self, initializer_range: float):
-        self.predecessor_codebook.normal_(mean=0.0, std=initializer_range)
-        self.successor_codebook.normal_(mean=0.0, std=initializer_range)
-        self.hidden_projection.weight.normal_(mean=0.0, std=initializer_range)
+    def reset_parameters(self):
+        """Start as an exact no-op over the base DFlash logits."""
+
+        self.predecessor_codebook.normal_(
+            mean=0.0, std=self.initializer_range
+        )
+        # The selector is bilinear. Zeroing one codebook collapses its score
+        # to the base logit while still giving this tensor a first-step
+        # gradient; the other factors start learning after it moves off zero.
+        self.successor_codebook.zero_()
+        self.hidden_projection.weight.normal_(
+            mean=0.0, std=self.initializer_range
+        )
+
+    def pair_scores(
+        self,
+        *,
+        hidden: torch.Tensor,
+        unary: torch.Tensor,
+        candidate_ids: torch.Tensor,
+        predecessor_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply the same pairwise transition rule in training and decode."""
+
+        hidden_code = self.hidden_projection(hidden)
+        predecessor_code = F.embedding(
+            predecessor_ids,
+            self.predecessor_codebook,
+        )
+        successor_code = F.embedding(
+            candidate_ids,
+            self.successor_codebook,
+        )
+        pairwise = (
+            (predecessor_code * hidden_code).unsqueeze(-2) * successor_code
+        ).sum(dim=-1)
+        return unary + pairwise
 
     def _candidate_scores(
         self,
@@ -190,19 +230,15 @@ class CandidateSelector(nn.Module):
             dim=-1,
             sorted=False,
         )
-        hidden_code = self.hidden_projection(hidden)
-        predecessor_code = F.embedding(
-            predecessor_ids,
-            self.predecessor_codebook,
-        )
-        successor_code = F.embedding(
+        return (
+            self.pair_scores(
+                hidden=hidden,
+                unary=unary,
+                candidate_ids=candidates,
+                predecessor_ids=predecessor_ids,
+            ),
             candidates,
-            self.successor_codebook,
         )
-        pairwise = (
-            (predecessor_code * hidden_code).unsqueeze(-2) * successor_code
-        ).sum(dim=-1)
-        return unary + pairwise, candidates
 
     def training_outputs(
         self,
@@ -242,24 +278,16 @@ class CandidateSelector(nn.Module):
             dim=-1,
             sorted=False,
         )
-        hidden_code = self.hidden_projection(hidden)
         predecessor = anchor_ids
         path = []
         probability_rows = []
         for position in range(hidden.shape[-2]):
-            predecessor_code = F.embedding(
-                predecessor,
-                self.predecessor_codebook,
+            scores = self.pair_scores(
+                hidden=hidden[..., position, :],
+                unary=unary[..., position, :],
+                candidate_ids=candidates[..., position, :],
+                predecessor_ids=predecessor,
             )
-            successor_code = F.embedding(
-                candidates[..., position, :],
-                self.successor_codebook,
-            )
-            edges = (
-                (predecessor_code * hidden_code[..., position, :]).unsqueeze(-2)
-                * successor_code
-            ).sum(dim=-1)
-            scores = unary[..., position, :] + edges
             if float(temperature) > 0.0:
                 probs = torch.softmax(scores.float() / float(temperature), dim=-1)
                 selected = torch.multinomial(

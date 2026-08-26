@@ -7,9 +7,8 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 BASE_DIR=$(cd "${SCRIPT_DIR}/../.." && pwd)
 cd "${BASE_DIR}"
 
-# SenseCore runs this script once per node. Depending on the launcher version,
-# it either injects SENSECORE_PYTORCH_* or uses the standard-looking
-# WORLD_SIZE/RANK variables for *node* count/rank (not GPU process count/rank).
+# SenseCore invokes this script once on every node. Its outer WORLD_SIZE/RANK
+# describe nodes, while torchrun creates the per-GPU process world below.
 SCHEDULER_WORLD_SIZE=${WORLD_SIZE:-}
 SCHEDULER_RANK=${RANK:-}
 NNODES=${SENSECORE_PYTORCH_NNODES:-${SCHEDULER_WORLD_SIZE:-1}}
@@ -22,16 +21,14 @@ CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}
 
 TARGET_MODEL_PATH=${TARGET_MODEL_PATH:-/mnt/afs-agentpro/share/models/deepseek-ai/DeepSeek-V4-Flash-0731}
 TRAIN_DATA_PATH=${TRAIN_DATA_PATH:-${BASE_DIR}/train_data/spec_o3_coldstartsft.repeat60.deepspec.packed_256k.jsonl}
-OUTPUT_ROOT=${OUTPUT_ROOT:-${BASE_DIR}/output/deepseek_v4_flash_dspark_fsdp2_multinode_128_128}
+OUTPUT_ROOT=${OUTPUT_ROOT:-${BASE_DIR}/output/deepseek_v4_flash_dflash2_fsdp2_multinode_128}
 LOG_DIR=${LOG_DIR:-${OUTPUT_ROOT}/logs}
 mkdir -p "${LOG_DIR}"
 NODE_LOG=${LOG_DIR}/node_rank_${NODE_RANK}.log
 TORCHRUN_LOG_DIR=${LOG_DIR}/torchrun_node_rank_${NODE_RANK}
 mkdir -p "${TORCHRUN_LOG_DIR}"
 
-# Capture the complete shell lifecycle, including validation failures that
-# occur before torchrun starts. The EXIT trap adds a concise diagnosis after
-# the raw traceback without hiding the original failure.
+# Preserve the raw shell/Python output and append a short failure diagnosis.
 exec > >(tee -a "${NODE_LOG}") 2>&1
 START_TIME=$(date '+%Y-%m-%d %H:%M:%S %z')
 diagnose_exit() {
@@ -41,27 +38,23 @@ diagnose_exit() {
     if ((status == 0)); then
         echo "[deepspec-launch-diagnosis] completed successfully"
     elif [[ -f "${NODE_LOG}" ]] && grep -qE 'waiting for clients|assigned_ranks|DistStoreError|Rendezvous' "${NODE_LOG}"; then
-        echo "[deepspec-launch-diagnosis] rendezvous failure: not all nodes joined the same MASTER_ADDR:MASTER_PORT before timeout; compare NNODES, NODE_RANK, MASTER_ADDR and MASTER_PORT on every node"
+        echo "[deepspec-launch-diagnosis] rendezvous failure: compare NNODES, NODE_RANK, MASTER_ADDR and MASTER_PORT on every node"
     elif [[ -f "${NODE_LOG}" ]] && grep -qE 'OutOfMemoryError|CUDA out of memory' "${NODE_LOG}"; then
-        echo "[deepspec-launch-diagnosis] CUDA OOM: inspect the first [deepspec-fatal] rank and its [deepspec-cuda] peak-memory line"
+        echo "[deepspec-launch-diagnosis] CUDA OOM: inspect the earliest [deepspec-fatal] rank and its [deepspec-cuda] peak-memory line"
     elif [[ -f "${NODE_LOG}" ]] && grep -qE 'collective operation timeout|ALLTOALL_BASE|Watchdog caught collective' "${NODE_LOG}"; then
-        echo "[deepspec-launch-diagnosis] NCCL collective timeout: another rank may have failed first; inspect all per-rank stderr files and find the earliest [deepspec-fatal] or NCCL watchdog timestamp"
+        echo "[deepspec-launch-diagnosis] NCCL collective timeout: find the earliest failing rank in the per-rank stderr logs"
     elif [[ -f "${NODE_LOG}" ]] && grep -q '\[deepspec-fatal\]' "${NODE_LOG}"; then
-        echo "[deepspec-launch-diagnosis] Python training failure: the first [deepspec-fatal] block contains the original rank and traceback"
+        echo "[deepspec-launch-diagnosis] Python training failure: the first [deepspec-fatal] block contains the original traceback"
     elif [[ -f "${NODE_LOG}" ]] && grep -qE 'must (equal|be|provide)|does not (exist|match)|requires [0-9]+ nodes' "${NODE_LOG}"; then
-        echo "[deepspec-launch-diagnosis] preflight configuration failure: fix the path or topology validation message immediately above"
+        echo "[deepspec-launch-diagnosis] preflight configuration failure: fix the validation message immediately above"
     else
-        echo "[deepspec-launch-diagnosis] launcher exited without a recognized signature; inspect ${TORCHRUN_LOG_DIR} and the SenseCore container termination reason"
+        echo "[deepspec-launch-diagnosis] unrecognized launcher failure: inspect ${TORCHRUN_LOG_DIR} and the container termination reason"
     fi
     trap - EXIT
     exit "${status}"
 }
 trap diagnose_exit EXIT
 
-# Compute the GPU-process world size from the platform node world size. Do not
-# treat SenseCore's outer WORLD_SIZE as torchrun WORLD_SIZE: for a 2-node x
-# 8-GPU job SenseCore reports WORLD_SIZE=2 here, while torchrun will assign
-# WORLD_SIZE=16 to train.py workers.
 for topology_var in NNODES NODE_RANK NPROC_PER_NODE; do
     topology_value=${!topology_var}
     if [[ ! "${topology_value}" =~ ^[0-9]+$ ]]; then
@@ -98,9 +91,15 @@ fi
 
 MAX_LENGTH=${MAX_LENGTH:-131072}
 NUM_ANCHORS=${NUM_ANCHORS:-512}
+VERIFICATION_BLOCK_SIZE=${VERIFICATION_BLOCK_SIZE:-8}
 BLOCK_SIZE=${BLOCK_SIZE:-7}
+PROPOSAL_HIDDEN_OFFSET=${PROPOSAL_HIDDEN_OFFSET:-1}
 NUM_DRAFT_LAYERS=${NUM_DRAFT_LAYERS:-3}
 TARGET_LAYER_IDS=${TARGET_LAYER_IDS:-[0,1,2]}
+CONV_KERNEL_SIZE=${CONV_KERNEL_SIZE:-2}
+CONV_GROUP_SIZE=${CONV_GROUP_SIZE:-16}
+SELECTOR_RANK=${SELECTOR_RANK:-256}
+SELECTOR_TOP_K=${SELECTOR_TOP_K:-16}
 LEARNING_RATE=${LEARNING_RATE:-0.00001}
 LOCAL_BATCH_SIZE=${LOCAL_BATCH_SIZE:-1}
 GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-64}
@@ -114,32 +113,45 @@ SAVE_CHECKPOINTS=${SAVE_CHECKPOINTS:-true}
 DRY_RUN=${DRY_RUN:-false}
 TORCHRUN_PER_RANK_LOGS=${TORCHRUN_PER_RANK_LOGS:-true}
 PROFILE_ENABLED=${PROFILE_ENABLED:-false}
-RESHARD_AFTER_FORWARD=${RESHARD_AFTER_FORWARD:-false}
-FSDP_FORWARD_PREFETCH=${FSDP_FORWARD_PREFETCH:-true}
-FSDP_BACKWARD_PREFETCH=${FSDP_BACKWARD_PREFETCH:-true}
-FSDP_PREFETCH_DEPTH=${FSDP_PREFETCH_DEPTH:-2}
-FSDP_REDUCE_DTYPE=${FSDP_REDUCE_DTYPE:-bf16}
-FSDP_WRAP_GRANULARITY=${FSDP_WRAP_GRANULARITY:-block}
 
-# 128-GPU topology: each physical 8-GPU node is one CP8/FSDP8/target-EP8
-# domain. Target EP therefore communicates only between CP shards of the same
-# sample. DP_REPLICATE is the remaining dense world dimension and is derived
-# from TRAIN_WORLD_SIZE rather than configured independently.
+# One 8-GPU node is one model domain. The trainable DFlash2 draft keeps EP1;
+# the frozen MoE target overlays an independent EP8 sparse view on the same
+# CP/TP ranks. Additional nodes become data replicas automatically.
 DP_SHARD=${DP_SHARD:-1}
 CP=${CP:-8}
 TP=${TP:-1}
 DRAFT_EP=${DRAFT_EP:-1}
 TARGET_EP=${TARGET_EP:-8}
 
-for parallel_var in DP_SHARD CP TP DRAFT_EP TARGET_EP NUM_TRAIN_EPOCHS FSDP_PREFETCH_DEPTH; do
-    parallel_value=${!parallel_var}
-    if [[ ! "${parallel_value}" =~ ^[1-9][0-9]*$ ]]; then
-        echo "${parallel_var} must be a positive integer; got ${parallel_value}." >&2
+for positive_var in DP_SHARD CP TP DRAFT_EP TARGET_EP MAX_LENGTH NUM_ANCHORS VERIFICATION_BLOCK_SIZE BLOCK_SIZE PROPOSAL_HIDDEN_OFFSET NUM_DRAFT_LAYERS CONV_KERNEL_SIZE CONV_GROUP_SIZE SELECTOR_RANK SELECTOR_TOP_K LOCAL_BATCH_SIZE GLOBAL_BATCH_SIZE NUM_TRAIN_EPOCHS SAVE_STEPS; do
+    positive_value=${!positive_var}
+    if [[ ! "${positive_value}" =~ ^[1-9][0-9]*$ ]]; then
+        echo "${positive_var} must be a positive integer; got ${positive_value}." >&2
         exit 1
     fi
 done
 if [[ -n "${MAX_TRAIN_STEPS}" ]] && [[ ! "${MAX_TRAIN_STEPS}" =~ ^[1-9][0-9]*$ ]]; then
     echo "MAX_TRAIN_STEPS must be empty or a positive integer; got ${MAX_TRAIN_STEPS}." >&2
+    exit 1
+fi
+if ((MAX_LENGTH > 131072)); then
+    echo "MAX_LENGTH must not exceed 131072; got ${MAX_LENGTH}." >&2
+    exit 1
+fi
+if ((PROPOSAL_HIDDEN_OFFSET != 1)); then
+    echo "PROPOSAL_HIDDEN_OFFSET must be 1 because verification position 0 is the clean anchor." >&2
+    exit 1
+fi
+if ((BLOCK_SIZE != VERIFICATION_BLOCK_SIZE - 1)); then
+    echo "BLOCK_SIZE must equal VERIFICATION_BLOCK_SIZE-1; got ${BLOCK_SIZE} and ${VERIFICATION_BLOCK_SIZE}." >&2
+    exit 1
+fi
+if ((NUM_ANCHORS < CP)); then
+    echo "NUM_ANCHORS=${NUM_ANCHORS} must be at least CP=${CP}." >&2
+    exit 1
+fi
+if ((DRAFT_EP != 1)); then
+    echo "DeepSeek-V4 DFlash2 uses an isolated draft EP1 mesh; got DRAFT_EP=${DRAFT_EP}." >&2
     exit 1
 fi
 
@@ -178,14 +190,6 @@ if [[ ! -d "${TARGET_MODEL_PATH}" ]]; then
 fi
 if [[ ! -f "${TRAIN_DATA_PATH}" ]]; then
     echo "TRAIN_DATA_PATH does not exist: ${TRAIN_DATA_PATH}" >&2
-    exit 1
-fi
-if ((MAX_LENGTH < 1 || MAX_LENGTH > 131072)); then
-    echo "MAX_LENGTH must be in [1, 131072]; got ${MAX_LENGTH}." >&2
-    exit 1
-fi
-if ((SAVE_STEPS < 1)); then
-    echo "SAVE_STEPS must be positive; got ${SAVE_STEPS}." >&2
     exit 1
 fi
 GRADIENT_ACCUMULATION_STEPS=$((GLOBAL_BATCH_SIZE / MICRO_GLOBAL_BATCH_SIZE))
@@ -256,23 +260,23 @@ if [[ "${PROFILE_ENABLED}" == "true" ]]; then
     )
 fi
 
-echo "Launching DeepSeek-V4-Flash DSpark FSDP2 on ${TRAIN_WORLD_SIZE} GPUs:"
+echo "Launching DeepSeek-V4-Flash DFlash2 FSDP2 on ${TRAIN_WORLD_SIZE} GPUs:"
 echo "  start=${START_TIME}, host=$(hostname), pid=$$"
 echo "  node=${NODE_RANK}/${NNODES}, rendezvous=${MASTER_ADDR}:${MASTER_PORT}"
 echo "  scheduler world size=${SCHEDULER_WORLD_SIZE:-<unset>} (${SCHEDULER_WORLD_SIZE_UNIT})"
 echo "  training world size=${TRAIN_WORLD_SIZE} (=NNODES*NPROC_PER_NODE)"
 echo "  dense mesh: DP_REPLICATE=${DP_REPLICATE}, DP_SHARD=${DP_SHARD}, CP=${CP}, TP=${TP}"
 echo "  FSDP shard=${FSDP_SHARD_SIZE}, draft EP=${DRAFT_EP}, target EP=${TARGET_EP}, target EFSDP=${TARGET_EFSDP}"
+echo "  DFlash2: verification=${VERIFICATION_BLOCK_SIZE}, proposals=${BLOCK_SIZE}, hidden offset=${PROPOSAL_HIDDEN_OFFSET}"
+echo "  DFlash2: layers=${NUM_DRAFT_LAYERS}, target layers=${TARGET_LAYER_IDS}, conv=${CONV_KERNEL_SIZE}x/group${CONV_GROUP_SIZE}, selector rank=${SELECTOR_RANK}/top-k=${SELECTOR_TOP_K}"
 echo "  local batch=${LOCAL_BATCH_SIZE}, global batch=${GLOBAL_BATCH_SIZE}, gradient accumulation=${GRADIENT_ACCUMULATION_STEPS}"
 if [[ -n "${MAX_TRAIN_STEPS}" ]]; then
     echo "  schedule=fixed diagnostic override, max steps=${MAX_TRAIN_STEPS}"
 else
     echo "  schedule=dataset-derived, epochs=${NUM_TRAIN_EPOCHS}, max steps computed after loading the dataset"
 fi
-echo "  max length=${MAX_LENGTH}, logging every step, checkpoint every ${SAVE_STEPS} steps"
+echo "  max length=${MAX_LENGTH}, anchors=${NUM_ANCHORS}, logging every step, checkpoint every ${SAVE_STEPS} steps"
 echo "  profiler=${PROFILE_ENABLED}, save checkpoints=${SAVE_CHECKPOINTS}"
-echo "  FSDP overlap: reshard_after_forward=${RESHARD_AFTER_FORWARD}, forward_prefetch=${FSDP_FORWARD_PREFETCH}, backward_prefetch=${FSDP_BACKWARD_PREFETCH}, prefetch_depth=${FSDP_PREFETCH_DEPTH}"
-echo "  FSDP draft policy: reduce_dtype=${FSDP_REDUCE_DTYPE}, wrap_granularity=${FSDP_WRAP_GRANULARITY}"
 if [[ "${PROFILE_ENABLED}" == "true" ]]; then
     echo "  profile dir=${PROFILE_TRACE_DIR}, ranks=${PROFILE_RANKS}, schedule(micro-steps)=skip:${PROFILE_SKIP_FIRST_STEPS}/wait:${PROFILE_WAIT_STEPS}/warmup:${PROFILE_WARMUP_STEPS}/active:${PROFILE_ACTIVE_STEPS}/repeat:${PROFILE_REPEAT}"
 fi
@@ -289,9 +293,6 @@ export OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 export PYTHONFAULTHANDLER=${PYTHONFAULTHANDLER:-1}
 export TORCH_SHOW_CPP_STACKTRACES=${TORCH_SHOW_CPP_STACKTRACES:-1}
-# PyTorch's external addr2line symbolizer can spend minutes on a large binary
-# before the Python traceback is printed. Keep raw C++ frames so the first
-# failing rank is visible immediately in multi-node logs.
 export TORCH_DISABLE_ADDR2LINE=${TORCH_DISABLE_ADDR2LINE:-1}
 export TORCH_DISTRIBUTED_DEBUG=${TORCH_DISTRIBUTED_DEBUG:-INFO}
 export NCCL_DEBUG=${NCCL_DEBUG:-WARN}
@@ -323,12 +324,18 @@ set -x
     --master_port "${MASTER_PORT}" \
     "${TORCHRUN_LOG_ARGS[@]}" \
     train.py \
-    --config config/dspark/dspark_deepseek_v4.py \
+    --config config/dflash2/dflash2_deepseek_v4.py \
     --opts "model.target_model_name_or_path=${TARGET_MODEL_PATH}" \
+    --opts "model.verification_block_size=${VERIFICATION_BLOCK_SIZE}" \
     --opts "model.block_size=${BLOCK_SIZE}" \
+    --opts "model.proposal_hidden_offset=${PROPOSAL_HIDDEN_OFFSET}" \
     --opts "model.num_draft_layers=${NUM_DRAFT_LAYERS}" \
     --opts "model.target_layer_ids=${TARGET_LAYER_IDS}" \
     --opts "model.num_anchors=${NUM_ANCHORS}" \
+    --opts "model.conv_kernel_size=${CONV_KERNEL_SIZE}" \
+    --opts "model.conv_group_size=${CONV_GROUP_SIZE}" \
+    --opts "model.selector_rank=${SELECTOR_RANK}" \
+    --opts "model.selector_top_k=${SELECTOR_TOP_K}" \
     --opts "data.train_data_path=${TRAIN_DATA_PATH}" \
     --opts "data.max_length=${MAX_LENGTH}" \
     --opts "train.lr=${LEARNING_RATE}" \
@@ -339,12 +346,6 @@ set -x
     --opts "train.parallel.cp=${CP}" \
     --opts "train.parallel.tp=${TP}" \
     --opts "train.parallel.ep=${DRAFT_EP}" \
-    --opts "train.parallel.reshard_after_forward=${RESHARD_AFTER_FORWARD}" \
-    --opts "train.parallel.forward_prefetch=${FSDP_FORWARD_PREFETCH}" \
-    --opts "train.parallel.backward_prefetch=${FSDP_BACKWARD_PREFETCH}" \
-    --opts "train.parallel.prefetch_depth=${FSDP_PREFETCH_DEPTH}" \
-    --opts "train.parallel.reduce_dtype=${FSDP_REDUCE_DTYPE}" \
-    --opts "train.parallel.fsdp_wrap_granularity=${FSDP_WRAP_GRANULARITY}" \
     --opts "train.target_parallel.ep=${TARGET_EP}" \
     "${TRAIN_SCHEDULE_ARGS[@]}" \
     --opts "logging.logging_steps=1" \

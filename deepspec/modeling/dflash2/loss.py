@@ -109,7 +109,11 @@ def compute_dflash2_loss(
     add_metric(
         "dflash2_loss",
         total_loss.detach(),
-        reduction="mean",
+        # ``total_loss`` is the rank-local contribution scaled by the loss
+        # group size for DDP/FSDP gradient averaging. Its cross-rank mean is
+        # therefore the true global token-normalized objective. A local mean
+        # can misleadingly report zero when rank 0 has no sampled anchor.
+        reduction="dp_mean",
         tag="train",
     )
     return total_loss

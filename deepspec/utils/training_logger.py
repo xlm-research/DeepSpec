@@ -4,7 +4,7 @@ from typing import Optional
 from torch.utils.tensorboard import SummaryWriter
 
 from deepspec.utils import ensure_dir, is_global_main_process, print_on_global_main
-from deepspec.utils.metrics import add_metric, flush, reset
+from deepspec.utils.metrics import add_metric, flush_async, reset
 
 
 _writer: Optional[SummaryWriter] = None
@@ -28,14 +28,14 @@ def start_session(*, global_step: int) -> None:
     _session_start_step = int(global_step)
 
 
-def on_optimizer_step(
+def begin_optimizer_step(
     *,
     global_step: int,
     next_micro_step: int,
     micro_batches_per_epoch: int,
     max_train_steps: int,
     learning_rate: float,
-    grad_norm: float,
+    grad_norm,
 ):
     add_metric("lr", learning_rate, reduction="last", tag="train")
     add_metric("grad_norm", grad_norm, reduction="last", tag="train")
@@ -43,17 +43,38 @@ def on_optimizer_step(
     if global_step % _logging_steps != 0:
         return None
 
-    summary = flush()
-    if is_global_main_process():
-        _write_scalars(summary, global_step=global_step)
-        _print_summary(
-            summary=summary,
+    return (
+        flush_async(),
+        dict(
             global_step=global_step,
             next_micro_step=next_micro_step,
             micro_batches_per_epoch=micro_batches_per_epoch,
             max_train_steps=max_train_steps,
+        ),
+    )
+
+
+def finish_optimizer_step(pending):
+    if pending is None:
+        return None
+    reduction, metadata = pending
+    global_main = is_global_main_process()
+    # Every rank waits for collective completion, but only rank 0 needs to
+    # synchronize reduced CUDA scalars back to the CPU for printing/writing.
+    summary = reduction.wait(materialize=global_main)
+    if global_main:
+        _write_scalars(summary, global_step=metadata["global_step"])
+        _print_summary(
+            summary=summary,
+            **metadata,
         )
     return summary
+
+
+def on_optimizer_step(**kwargs):
+    """Synchronous compatibility wrapper for external callers."""
+
+    return finish_optimizer_step(begin_optimizer_step(**kwargs))
 
 
 def close() -> None:
@@ -89,8 +110,16 @@ def _print_summary(
         session_elapsed * remaining_steps / max(completed_session_steps, 1)
     ) / 60
     loss_text = ""
-    if "train/loss" in summary:
-        loss_text = f" loss={summary['train/loss']:.4f}"
+    # DFlash2 emits a correctly token-normalized cross-rank objective. Prefer
+    # it over the legacy rank-local DSpark scalar when both are present. Runs
+    # without DFlash2 retain the existing logging path unchanged.
+    loss_key = (
+        "train/dflash2_loss"
+        if "train/dflash2_loss" in summary
+        else "train/loss"
+    )
+    if loss_key in summary:
+        loss_text = f" loss={summary[loss_key]:.4f}"
     print_on_global_main(
         f"epoch={current_epoch} "
         f"step={global_step}/{max_train_steps}"

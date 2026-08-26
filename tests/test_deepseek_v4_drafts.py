@@ -71,6 +71,7 @@ class DeepseekV4DraftModelTest(unittest.TestCase):
             copy.deepcopy(tiny_target_config()),
             model_args("config/dspark/dspark_deepseek_v4.py"),
         )
+        self.assertEqual(config._experts_implementation, "grouped_mm")
         output = self._exercise(DeepseekV4DSparkModel(config).float())
         self.assertIsNone(output.selector_scores)
 
@@ -85,6 +86,60 @@ class DeepseekV4DraftModelTest(unittest.TestCase):
         self.assertTrue(
             any(layer.attention_conv is not None for layer in model.layers)
         )
+        self.assertEqual(
+            torch.count_nonzero(
+                model.candidate_selector.successor_codebook
+            ).item(),
+            0,
+        )
+
+    def test_dflash2_config_and_checkpoint_are_isolated_from_dspark(self):
+        target = tiny_target_config()
+        dflash_config = build_dflash2_config(
+            copy.deepcopy(target),
+            model_args("config/dflash2/dflash2_deepseek_v4.py"),
+        )
+        dspark_config = build_dspark_config(
+            copy.deepcopy(target),
+            model_args("config/dspark/dspark_deepseek_v4.py"),
+        )
+        self.assertEqual(
+            dflash_config.architectures,
+            ["DeepseekV4DFlash2Model"],
+        )
+        self.assertEqual(dflash_config.verification_block_size, 8)
+        self.assertEqual(dflash_config.proposal_hidden_offset, 1)
+        self.assertEqual(dflash_config.block_size, 7)
+        self.assertFalse(dflash_config.is_causal)
+        self.assertFalse(dflash_config.sample_from_anchor)
+        self.assertEqual(dflash_config.dflash_config["block_size"], 8)
+        self.assertEqual(dflash_config.dflash_config["selector_top_k"], 16)
+        self.assertEqual(
+            dspark_config.architectures,
+            ["DeepseekV4DSparkModel"],
+        )
+        self.assertEqual(dspark_config._experts_implementation, "grouped_mm")
+        self.assertEqual(dflash_config._experts_implementation, "grouped_mm")
+        self.assertFalse(hasattr(dspark_config, "dflash_config"))
+
+        model = DeepseekV4DFlash2Model(dflash_config).float()
+        filtered = model.filter_checkpoint_state_dict(
+            {
+                "embed_tokens.weight": torch.empty(1),
+                "lm_head.weight": torch.empty(1),
+                "candidate_selector.successor_codebook": torch.empty(1),
+            }
+        )
+        self.assertEqual(
+            set(filtered),
+            {"candidate_selector.successor_codebook"},
+        )
+
+    def test_dflash2_rejects_non_anchor_block_layout(self):
+        args = model_args("config/dflash2/dflash2_deepseek_v4.py")
+        args.block_size = 6
+        with self.assertRaisesRegex(ValueError, "verification_block_size - 1"):
+            build_dflash2_config(copy.deepcopy(tiny_target_config()), args)
 
 
 if __name__ == "__main__":
