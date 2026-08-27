@@ -111,6 +111,11 @@ def _compute_samples_per_epoch(*, dataset_size: int, global_batch_size: int) -> 
     return samples_per_epoch
 
 
+def _release_target_features(batch) -> None:
+    batch.pop("target_hidden_states", None)
+    batch.pop("target_last_hidden_states", None)
+
+
 def _compute_training_schedule(
     *,
     world_size: int,
@@ -251,6 +256,12 @@ class BaseTrainer:
         self.online_target = None
         if self.online_target_enabled and int(self.args.train.local_batch_size) != 1:
             raise ValueError("Online target training requires local_batch_size=1.")
+        self.target_cache_path = self.args.data.get("target_cache_path")
+        if not self.online_target_enabled and not self.target_cache_path:
+            raise ValueError(
+                "Offline target training requires data.target_cache_path. "
+                "Precompute it before launching draft training."
+            )
 
         if is_global_main_process():
             ensure_dir(self.checkpoint_dir_root)
@@ -314,10 +325,16 @@ class BaseTrainer:
                 min_loss_tokens=int(self.args.data.get("min_loss_tokens", 1)),
             )
         else:
+            expected_context_layout = (
+                "contiguous"
+                if str(self.draft_model.config.model_type) == "deepseek_v4"
+                else None
+            )
             self.train_dataset = CacheDataset(
-                cache_dir=self.args.data.target_cache_path,
+                cache_dir=self.target_cache_path,
                 context_parallel_size=self.context_parallel_size,
                 context_parallel_rank=self.parallel.context_parallel_rank,
+                expected_context_layout=expected_context_layout,
             )
             self.data_collator = (self.data_collator_cls or CacheCollator)()
         # Hashing a 256K packed source on every worker creates needless shared
@@ -633,14 +650,12 @@ class BaseTrainer:
                             )
                         with record_function("deepspec::backward"):
                             loss.backward()
-                    # Target activations are immutable offline supervision.  Once
-                    # backward has consumed them, drop the last Python references
-                    # immediately so their CUDA storage can be reused by the next
-                    # micro-batch instead of keeping it alive through optimizer and
-                    # checkpoint work.
+                    # Target activations are immutable supervision. Once backward
+                    # has consumed them, drop the final batch references so their
+                    # CUDA storage can be reused by the next micro-batch instead of
+                    # keeping it alive through optimizer and checkpoint work.
                     del loss
-                    batch.pop("target_hidden_states", None)
-                    batch.pop("target_last_hidden_states", None)
+                    _release_target_features(batch)
                     self.next_micro_step += 1
 
                     if should_sync:

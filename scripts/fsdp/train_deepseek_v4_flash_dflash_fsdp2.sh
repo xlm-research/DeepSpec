@@ -8,6 +8,7 @@ gpu_devices="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 target_model_path="${TARGET_MODEL_PATH:-/mnt/afs-agentpro/share/models/deepseek-ai/DeepSeek-V4-Flash-0731}"
 train_data_path="${TRAIN_DATA_PATH:-${repo_root}/train_data/spec_o3_coldstartsft.first8.repeat1.deepspec.jsonl}"
 output_root="${OUTPUT_ROOT:-${repo_root}/output/deepseek_v4_flash_dflash_fsdp2}"
+target_cache_dir="${TARGET_CACHE_DIR:-${output_root}/target_cache}"
 max_length="${MAX_LENGTH:-131072}"
 num_anchors="${NUM_ANCHORS:-512}"
 learning_rate="${LEARNING_RATE:-0.00001}"
@@ -32,13 +33,24 @@ if [[ ! -f "${train_data_path}" ]]; then
     exit 2
 fi
 
-echo "Training DeepSeek-V4-Flash DFlash (draft EP1, target EP8)..."
+echo "Preparing or reusing offline DeepSeek-V4 target features: ${target_cache_dir}"
+CUDA_VISIBLE_DEVICES="${gpu_devices}" \
+torchrun --standalone --nproc-per-node=8 \
+    scripts/data/prepare_deepseek_v4_target_cache.py \
+    --config config/dflash/dflash_deepseek_v4.py \
+    --opts "model.target_model_name_or_path=${target_model_path}" \
+    --opts "data.max_length=${max_length}" \
+    --train-data-path "${train_data_path}" \
+    --output-dir "${target_cache_dir}"
+
+echo "Training DeepSeek-V4-Flash DFlash from offline target features..."
 CUDA_VISIBLE_DEVICES="${gpu_devices}" \
 DEEPSPEC_OUTPUT_ROOT="${output_root}" \
 torchrun --standalone --nproc-per-node=8 train.py \
     --config config/dflash/dflash_deepseek_v4.py \
     --opts "model.target_model_name_or_path=${target_model_path}" \
-    --opts "data.train_data_path=${train_data_path}" \
+    --opts "data.target_cache_path=${target_cache_dir}" \
+    --opts "data.source_jsonl_path=${train_data_path}" \
     --opts "data.max_length=${max_length}" \
     --opts "model.num_anchors=${num_anchors}" \
     --opts "train.lr=${learning_rate}" \

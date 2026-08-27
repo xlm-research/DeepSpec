@@ -22,6 +22,7 @@ CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}
 TARGET_MODEL_PATH=${TARGET_MODEL_PATH:-/mnt/afs-agentpro/share/models/deepseek-ai/DeepSeek-V4-Flash-0731}
 TRAIN_DATA_PATH=${TRAIN_DATA_PATH:-${BASE_DIR}/train_data/spec_o3_coldstartsft.repeat60.deepspec.packed_256k.jsonl}
 OUTPUT_ROOT=${OUTPUT_ROOT:-${BASE_DIR}/output/deepseek_v4_flash_dflash2_fsdp2_multinode_128}
+TARGET_CACHE_DIR=${TARGET_CACHE_DIR:-${OUTPUT_ROOT}/target_cache}
 LOG_DIR=${LOG_DIR:-${OUTPUT_ROOT}/logs}
 mkdir -p "${LOG_DIR}"
 NODE_LOG=${LOG_DIR}/node_rank_${NODE_RANK}.log
@@ -103,9 +104,7 @@ SELECTOR_TOP_K=${SELECTOR_TOP_K:-16}
 LEARNING_RATE=${LEARNING_RATE:-0.00001}
 LOCAL_BATCH_SIZE=${LOCAL_BATCH_SIZE:-1}
 GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-64}
-# Let the trainer derive max_train_steps from the usable dataset size and the
-# requested epoch count.  The bundled repeat60 dataset is already expanded, so
-# one epoch avoids running the online target repeatedly for the same records.
+# Let the trainer derive max_train_steps from the usable cached dataset size.
 NUM_TRAIN_EPOCHS=${NUM_TRAIN_EPOCHS:-1}
 MAX_TRAIN_STEPS=${MAX_TRAIN_STEPS:-}
 SAVE_STEPS=${SAVE_STEPS:-200}
@@ -277,6 +276,7 @@ else
 fi
 echo "  max length=${MAX_LENGTH}, anchors=${NUM_ANCHORS}, logging every step, checkpoint every ${SAVE_STEPS} steps"
 echo "  profiler=${PROFILE_ENABLED}, save checkpoints=${SAVE_CHECKPOINTS}"
+echo "  offline target cache=${TARGET_CACHE_DIR}"
 if [[ "${PROFILE_ENABLED}" == "true" ]]; then
     echo "  profile dir=${PROFILE_TRACE_DIR}, ranks=${PROFILE_RANKS}, schedule(micro-steps)=skip:${PROFILE_SKIP_FIRST_STEPS}/wait:${PROFILE_WAIT_STEPS}/warmup:${PROFILE_WARMUP_STEPS}/active:${PROFILE_ACTIVE_STEPS}/repeat:${PROFILE_REPEAT}"
 fi
@@ -322,6 +322,26 @@ set -x
     --node_rank "${NODE_RANK}" \
     --master_addr "${MASTER_ADDR}" \
     --master_port "${MASTER_PORT}" \
+    scripts/data/prepare_deepseek_v4_target_cache.py \
+    --config config/dflash2/dflash2_deepseek_v4.py \
+    --opts "model.target_model_name_or_path=${TARGET_MODEL_PATH}" \
+    --opts "model.target_layer_ids=${TARGET_LAYER_IDS}" \
+    --opts "data.max_length=${MAX_LENGTH}" \
+    --opts "train.parallel.dp_replicate=${DP_REPLICATE}" \
+    --opts "train.parallel.dp_shard=${DP_SHARD}" \
+    --opts "train.parallel.cp=${CP}" \
+    --opts "train.parallel.tp=${TP}" \
+    --opts "train.parallel.ep=${DRAFT_EP}" \
+    --opts "train.target_parallel.ep=${TARGET_EP}" \
+    --train-data-path "${TRAIN_DATA_PATH}" \
+    --output-dir "${TARGET_CACHE_DIR}"
+
+"${LAUNCHER[@]}" \
+    --nproc_per_node "${NPROC_PER_NODE}" \
+    --nnodes "${NNODES}" \
+    --node_rank "${NODE_RANK}" \
+    --master_addr "${MASTER_ADDR}" \
+    --master_port "${MASTER_PORT}" \
     "${TORCHRUN_LOG_ARGS[@]}" \
     train.py \
     --config config/dflash2/dflash2_deepseek_v4.py \
@@ -336,7 +356,8 @@ set -x
     --opts "model.conv_group_size=${CONV_GROUP_SIZE}" \
     --opts "model.selector_rank=${SELECTOR_RANK}" \
     --opts "model.selector_top_k=${SELECTOR_TOP_K}" \
-    --opts "data.train_data_path=${TRAIN_DATA_PATH}" \
+    --opts "data.target_cache_path=${TARGET_CACHE_DIR}" \
+    --opts "data.source_jsonl_path=${TRAIN_DATA_PATH}" \
     --opts "data.max_length=${MAX_LENGTH}" \
     --opts "train.lr=${LEARNING_RATE}" \
     --opts "train.local_batch_size=${LOCAL_BATCH_SIZE}" \

@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# PyTorch Profiler launcher for the online DeepSeek-V4 target plus the
-# trainable DSpark/DFlash2 draft.  It reuses the validated multi-node launcher
-# and changes only diagnostic controls.
+# PyTorch Profiler launcher for DeepSeek-V4 DSpark/DFlash2 training. DSpark
+# performs target inference immediately before each micro-batch; DFlash2 uses
+# its offline target cache. The selected validated multi-node launcher owns the
+# corresponding target lifecycle.
 #
 # Default behavior:
 #   1. Run two optimizer steps without writing checkpoints.

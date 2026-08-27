@@ -80,6 +80,7 @@ echo "  node=${NODE_RANK}/${NNODES}, rendezvous=${MASTER_ADDR}:${MASTER_PORT}"
 echo "  GPUs=${NUM_GPUS}, GPUs/node=${NPROC_PER_NODE}"
 echo "  DP_REPLICATE=${DP_REPLICATE}, DP_SHARD=${DP_SHARD}, CP=${CP}, TP=${TP}"
 echo "  draft EP=${DRAFT_EP}, target EP=${TARGET_EP}, GBS=${GLOBAL_BATCH_SIZE}"
+echo "  target mode=per-micro-batch online inference"
 
 export CUDA_VISIBLE_DEVICES
 export DEEPSPEC_OUTPUT_ROOT=${OUTPUT_ROOT}

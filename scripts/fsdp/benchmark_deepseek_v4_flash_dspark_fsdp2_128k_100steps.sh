@@ -23,7 +23,7 @@ if [[ ! -f "${train_data_path}" ]]; then
     exit 2
 fi
 
-echo "Benchmarking 100 DSpark optimizer steps at 128K without checkpoint writes..."
+echo "Benchmarking 100 DSpark optimizer steps at 128K with per-micro-batch target inference..."
 mkdir -p "${output_root}/benchmark"
 CUDA_VISIBLE_DEVICES="${gpu_devices}" \
 DEEPSPEC_OUTPUT_ROOT="${output_root}" \

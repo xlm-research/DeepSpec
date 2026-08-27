@@ -32,6 +32,7 @@ mkdir -p "${output_root}"
 log_path="${output_root}/train.log"
 echo "100-step benchmark output: ${output_root}"
 echo "Checkpoint writes are disabled; initialization time is excluded."
+echo "Target inference runs once immediately before every draft micro-batch."
 
 CUDA_VISIBLE_DEVICES="${gpu_devices}" \
 DEEPSPEC_OUTPUT_ROOT="${output_root}" \

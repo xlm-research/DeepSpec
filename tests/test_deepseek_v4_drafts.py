@@ -1,5 +1,9 @@
 import copy
+import gc
+from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
+import weakref
 
 import torch
 from transformers import AutoConfig
@@ -12,6 +16,8 @@ from deepspec.modeling.dspark.deepseek_v4 import (
     DeepseekV4DSparkModel,
     build_draft_config as build_dspark_config,
 )
+from deepspec.trainer.base_trainer import _release_target_features
+from deepspec.trainer.dspark_trainer import DeepseekV4DSparkTrainer
 from deepspec.utils import load_config
 
 
@@ -140,6 +146,55 @@ class DeepseekV4DraftModelTest(unittest.TestCase):
         args.block_size = 6
         with self.assertRaisesRegex(ValueError, "verification_block_size - 1"):
             build_dflash2_config(copy.deepcopy(tiny_target_config()), args)
+
+    def test_online_target_features_are_owned_and_released_by_outer_batch(self):
+        class FakeOnlineTarget:
+            def forward_training_batch(self, _batch):
+                return {
+                    "input_ids": torch.ones(1, 4, dtype=torch.long),
+                    "loss_mask": torch.ones(1, 4, dtype=torch.bool),
+                    "target_hidden_states": torch.randn(1, 4, 6),
+                    "target_last_hidden_states": torch.randn(1, 4, 2),
+                    "context_start": torch.tensor([0]),
+                    "context_len": torch.tensor([4]),
+                    "seq_len": torch.tensor([4]),
+                }
+
+        trainer = object.__new__(DeepseekV4DSparkTrainer)
+        trainer.online_target_enabled = True
+        trainer.online_target = FakeOnlineTarget()
+        trainer.args = SimpleNamespace(
+            model=SimpleNamespace(
+                l1_loss_alpha=0.9,
+                confidence_head_alpha=1.0,
+                loss_decay_gamma=4.0,
+                ce_loss_alpha=0.1,
+            )
+        )
+        trainer.forward_model = lambda **_kwargs: object()
+        batch = {
+            "input_ids": torch.ones(1, 4, dtype=torch.long),
+            "attention_mask": torch.ones(1, 4, dtype=torch.bool),
+            "loss_mask": torch.ones(1, 4, dtype=torch.bool),
+        }
+
+        with patch(
+            "deepspec.trainer.dspark_trainer.compute_dspark_loss",
+            return_value=torch.ones((), requires_grad=True),
+        ):
+            loss = trainer.run_batch(batch)
+
+        self.assertIn("target_hidden_states", batch)
+        self.assertIn("target_last_hidden_states", batch)
+        self.assertNotIn("attention_mask", batch)
+        hidden_ref = weakref.ref(batch["target_hidden_states"])
+        last_hidden_ref = weakref.ref(batch["target_last_hidden_states"])
+        loss.backward()
+        del loss
+        _release_target_features(batch)
+        gc.collect()
+        self.assertIsNone(hidden_ref())
+        self.assertIsNone(last_hidden_ref())
 
 
 if __name__ == "__main__":

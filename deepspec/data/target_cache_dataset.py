@@ -855,6 +855,7 @@ class CacheDataset(torch.utils.data.Dataset):
         max_open_shards: int = 4,
         context_parallel_size: int = 1,
         context_parallel_rank: int = 0,
+        expected_context_layout: str | None = None,
     ):
         super().__init__()
         self.cache_dir = os.path.abspath(cache_dir)
@@ -885,13 +886,16 @@ class CacheDataset(torch.utils.data.Dataset):
                 "the target cache for the requested CP size."
             )
         self.context_layout = str(self.manifest["context_layout"])
-        expected_layout = (
-            "native_head_tail" if self.context_parallel_size > 1 else "contiguous"
-        )
-        if self.context_layout != expected_layout:
+        if expected_context_layout is None:
+            expected_context_layout = (
+                "native_head_tail"
+                if self.context_parallel_size > 1
+                else "contiguous"
+            )
+        if self.context_layout != str(expected_context_layout):
             raise ValueError(
                 "Target cache context layout is incompatible with training CP: "
-                f"{self.context_layout!r} != {expected_layout!r}."
+                f"{self.context_layout!r} != {expected_context_layout!r}."
             )
         self.index_path = os.path.join(
             self.cache_dir,
@@ -1148,6 +1152,23 @@ class CacheDataset(torch.utils.data.Dataset):
             "context_chunk_len": context_chunk_len,
             "seq_len": seq_len,
         }
+        if self.context_layout == "contiguous":
+            base, remainder = divmod(seq_len, self.context_parallel_size)
+            context_start = (
+                self.context_parallel_rank * base
+                + min(self.context_parallel_rank, remainder)
+            )
+            expected_context_len = base + int(
+                self.context_parallel_rank < remainder
+            )
+            if context_chunk_len != expected_context_len:
+                raise RuntimeError(
+                    "Contiguous target-cache shard length does not match its "
+                    "CP partition: "
+                    f"cached={context_chunk_len}, expected={expected_context_len}."
+                )
+            sample["context_start"] = context_start
+            sample["context_len"] = context_chunk_len
         if target_last_hidden_states is not None:
             sample["target_last_hidden_states"] = target_last_hidden_states
         return sample
@@ -1384,6 +1405,18 @@ class CacheCollator:
                 features,
                 "target_last_hidden_states",
             )
-        for key in ("context_chunk_len", "seq_len"):
-            batch[key] = torch.tensor([int(item[key]) for item in features])
+        metadata_keys = (
+            "context_chunk_len",
+            "seq_len",
+            "context_start",
+            "context_len",
+        )
+        for key in metadata_keys:
+            present = [key in item for item in features]
+            if any(present) and not all(present):
+                raise ValueError(
+                    f"A cache batch cannot mix samples with and without {key}."
+                )
+            if all(present):
+                batch[key] = torch.tensor([int(item[key]) for item in features])
         return batch
