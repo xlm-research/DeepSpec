@@ -949,6 +949,7 @@ class CacheDataset(torch.utils.data.Dataset):
         max_open_shards: int = 4,
         context_parallel_size: int = 1,
         context_parallel_rank: int = 0,
+        expected_context_layout: str | None = None,
     ):
         super().__init__()
         self.cache_dir = os.path.abspath(cache_dir)
@@ -984,6 +985,14 @@ class CacheDataset(torch.utils.data.Dataset):
             raise ValueError(
                 "Training received an unsupported target-cache layout: "
                 f"{self.context_layout!r}."
+            )
+        if (
+            expected_context_layout is not None
+            and self.context_layout != str(expected_context_layout)
+        ):
+            raise ValueError(
+                "Target cache context layout is incompatible with training CP: "
+                f"{self.context_layout!r} != {expected_context_layout!r}."
             )
         self.index_path = os.path.join(
             self.cache_dir,
@@ -1189,6 +1198,26 @@ class CacheDataset(torch.utils.data.Dataset):
             "context_len": context_len,
             "seq_len": seq_len,
         }
+        if self.context_layout == "contiguous":
+            base, remainder = divmod(seq_len, self.context_parallel_size)
+            expected_context_start = (
+                self.context_parallel_rank * base
+                + min(self.context_parallel_rank, remainder)
+            )
+            expected_context_len = base + int(
+                self.context_parallel_rank < remainder
+            )
+            if (
+                context_start != expected_context_start
+                or context_len != expected_context_len
+            ):
+                raise RuntimeError(
+                    "Contiguous target-cache shard does not match its CP "
+                    "partition: "
+                    f"cached=[{context_start}, {context_start + context_len}), "
+                    f"expected=[{expected_context_start}, "
+                    f"{expected_context_start + expected_context_len})."
+                )
         if target_last_hidden_states is not None:
             sample["target_last_hidden_states"] = target_last_hidden_states
         return sample

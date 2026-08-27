@@ -105,7 +105,7 @@ LEARNING_RATE=${LEARNING_RATE:-0.00001}
 LOCAL_BATCH_SIZE=${LOCAL_BATCH_SIZE:-1}
 GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-64}
 # Let the trainer derive max_train_steps from the usable dataset size and the
-# requested epoch count.  The bundled repeat60 dataset is already expanded, so
+# requested epoch count. The bundled repeat60 dataset is already expanded, so
 # one epoch avoids running the online target repeatedly for the same records.
 NUM_TRAIN_EPOCHS=${NUM_TRAIN_EPOCHS:-1}
 MAX_TRAIN_STEPS=${MAX_TRAIN_STEPS:-}
@@ -271,6 +271,7 @@ else
 fi
 echo "  max length=${MAX_LENGTH}, logging every step, checkpoint every ${SAVE_STEPS} steps"
 echo "  profiler=${PROFILE_ENABLED}, save checkpoints=${SAVE_CHECKPOINTS}"
+echo "  target mode=per-micro-batch online inference"
 echo "  FSDP overlap: reshard_after_forward=${RESHARD_AFTER_FORWARD}, forward_prefetch=${FSDP_FORWARD_PREFETCH}, backward_prefetch=${FSDP_BACKWARD_PREFETCH}, prefetch_depth=${FSDP_PREFETCH_DEPTH}"
 echo "  FSDP draft policy: reduce_dtype=${FSDP_REDUCE_DTYPE}, wrap_granularity=${FSDP_WRAP_GRANULARITY}"
 if [[ "${PROFILE_ENABLED}" == "true" ]]; then

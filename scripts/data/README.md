@@ -126,6 +126,58 @@ This produces the cache consumed by [scripts/train/train.sh](../train/train.sh):
 ~/.cache/deepspec/qwen3_4b_target_cache
 ```
 
+### DeepSeek-V4 target feature modes
+
+DeepSeek-V4 DSpark performs frozen-target inference immediately before every
+draft micro-batch. The generated selected and final hidden states remain
+in-memory only and are released after that micro-batch's backward. DFlash and
+DFlash2 use the offline EP/FSDP2 and ring-CP target runner because they only need
+selected hidden states. To prepare an eight-GPU DFlash2 cache:
+
+```bash
+torchrun --standalone --nproc-per-node=8 \
+  scripts/data/prepare_deepseek_v4_target_cache.py \
+  --config config/dflash2/dflash2_deepseek_v4.py \
+  --train-data-path /path/to/train.jsonl \
+  --output-dir /shared/cache/deepseek_v4_dflash2_cp2
+
+torchrun --standalone --nproc-per-node=8 train.py \
+  --config config/dflash2/dflash2_deepseek_v4.py \
+  --opts data.target_cache_path=/shared/cache/deepseek_v4_dflash2_cp2 \
+  --opts data.source_jsonl_path=/path/to/train.jsonl
+```
+
+The preparation command validates and reuses a completed cache. It refuses to
+overwrite a partial, stale, or incompatible directory. Keep the cache on a
+filesystem visible to every training node and set `TARGET_CACHE_DIR` when using
+the DeepSeek-V4 DFlash/DFlash2 scripts under `scripts/fsdp/`. Their caches omit
+the unused final hidden state. DSpark does not require `TARGET_CACHE_DIR`.
+
+### Multimodal targets
+
+`prepare_target_cache.py` detects image-text target configurations such as
+Qwen3.5/Qwen3.6 and loads their `AutoProcessor`. The processor expands visual
+placeholders, runs the target ViT/merger and decoder, and stores decoder hidden
+states in the same cache format used by text-only training.
+
+Both OpenAI-style content blocks and ms-swift-style top-level media lists are
+accepted. For example:
+
+```json
+{"messages":[{"role":"user","content":"<image>Describe it."},{"role":"assistant","content":"..."}],"images":["sample.jpg"]}
+```
+
+or:
+
+```json
+{"messages":[{"role":"user","content":[{"type":"image","image":"sample.jpg"},{"type":"text","text":"Describe it."}]},{"role":"assistant","content":"..."}]}
+```
+
+Use `--media-root /path/to/media` when media paths in JSONL are relative. The
+multimodal collator preserves `pixel_values`, grid metadata and multimodal token
+types required by Qwen3.6. If `max_length` would cut through a visual token
+block, that sample is skipped instead of producing a mismatched cache entry.
+
 ## Wrapper Script
 
 The wrapper script combines the default public commands:

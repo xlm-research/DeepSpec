@@ -32,7 +32,7 @@ if [[ ! -f "${train_data_path}" ]]; then
     exit 2
 fi
 
-echo "Training DeepSeek-V4-Flash DSpark (draft EP1, target EP8)..."
+echo "Training DeepSeek-V4-Flash DSpark with per-micro-batch target inference..."
 CUDA_VISIBLE_DEVICES="${gpu_devices}" \
 DEEPSPEC_OUTPUT_ROOT="${output_root}" \
 torchrun --standalone --nproc-per-node=8 train.py \

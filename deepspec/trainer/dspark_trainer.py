@@ -106,7 +106,12 @@ class DeepseekV4DSparkTrainer(Qwen3DSparkTrainer):
     def run_batch(self, batch):
         if self.online_target_enabled:
             with record_function("deepspec::target_forward"):
-                batch = self.online_target.forward_training_batch(batch)
+                target_batch = self.online_target.forward_training_batch(batch)
+            # Keep the generated supervision on the outer training-loop batch.
+            # This lets BaseTrainer explicitly drop its final references as soon
+            # as this micro-batch's backward has consumed the tensors.
+            batch.clear()
+            batch.update(target_batch)
         needs_target_logits = (
             float(self.args.model.l1_loss_alpha) > 0.0
             or float(self.args.model.confidence_head_alpha) > 0.0

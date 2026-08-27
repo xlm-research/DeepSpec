@@ -40,7 +40,7 @@ train = dict(
     # Routed experts are excluded from TP/FSDP parameter shards.
     global_batch_size=8,
     # Online distillation evaluates the frozen target once immediately before
-    # each draft micro-batch.  Keep one epoch so every sample needs one target
+    # each draft micro-batch. Keep one epoch so every sample needs one target
     # forward rather than recomputing identical supervision across epochs.
     num_train_epochs=1,
     max_train_steps=None,
