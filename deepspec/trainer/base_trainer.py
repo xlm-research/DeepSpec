@@ -1,6 +1,7 @@
 import math
 import os
 import json
+import shutil
 
 import torch
 import torch.distributed as dist
@@ -14,7 +15,7 @@ from deepspec.data import (
     ConversationCollator,
     validate_train_cache,
 )
-from deepspec.data.cuda_prefetcher import CUDAPrefetcher
+from deepspec.data.cuda_prefetcher import CUDAPrefetcher, move_batch_to_device
 from deepspec.data.jsonl_dataset import JsonLineDataset
 from deepspec.modeling.target_adapter import (
     get_target_embeddings,
@@ -26,6 +27,7 @@ from deepspec.utils import (
     ensure_dir,
     init_dist,
     is_global_main_process,
+    main_process_first,
     print_on_global_main,
     print_on_local_main,
 )
@@ -60,6 +62,9 @@ _PRECISION_DTYPES = {
     "fp16": torch.float16,
     "fp32": torch.float32,
 }
+
+_DATA_BATCH_CACHE_MARKER = ".deepspec-transient-data-batch-cache"
+_DATA_BATCH_CACHE_MARKER_CONTENT = "deepspec transient data batch cache v1\n"
 
 
 def _load_checkpoint_tensor(checkpoint_dir: str, names: tuple[str, ...]):
@@ -100,6 +105,48 @@ def _compute_gradient_accumulation_steps(
         f"local_batch_size={local_batch_size}"
     )
     return global_batch_size // denom
+
+
+def _compute_data_batch_schedule(
+    *,
+    data_batch_size: int,
+    total_samples: int,
+    global_batch_size: int,
+    data_parallel_size: int,
+    local_batch_size: int,
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """Split planned samples into near-equal, optimizer-aligned cache blocks."""
+
+    data_batch_size = int(data_batch_size)
+    total_samples = int(total_samples)
+    global_batch_size = int(global_batch_size)
+    if data_batch_size <= 0:
+        raise ValueError("data_batch_size must be positive.")
+    gradient_accumulation_steps = _compute_gradient_accumulation_steps(
+        world_size=int(data_parallel_size),
+        local_batch_size=int(local_batch_size),
+        global_batch_size=global_batch_size,
+    )
+    if total_samples <= 0 or total_samples % global_batch_size != 0:
+        raise ValueError(
+            "total_samples must contain complete global batches: "
+            f"total_samples={total_samples}, global_batch_size={global_batch_size}."
+        )
+    total_optimizer_steps = total_samples // global_batch_size
+    if data_batch_size > total_optimizer_steps:
+        raise ValueError(
+            "data_batch_size partitions cannot exceed the number of optimizer "
+            f"steps: {data_batch_size} > {total_optimizer_steps}."
+        )
+    base_steps, extra_blocks = divmod(total_optimizer_steps, data_batch_size)
+    optimizer_steps = tuple(
+        base_steps + int(index < extra_blocks)
+        for index in range(data_batch_size)
+    )
+    micro_batches = tuple(
+        steps * gradient_accumulation_steps for steps in optimizer_steps
+    )
+    return micro_batches, optimizer_steps
 
 
 def _compute_samples_per_epoch(*, dataset_size: int, global_batch_size: int) -> int:
@@ -256,6 +303,31 @@ class BaseTrainer:
         self.online_target = None
         if self.online_target_enabled and int(self.args.train.local_batch_size) != 1:
             raise ValueError("Online target training requires local_batch_size=1.")
+        configured_data_batch_size = self.args.train.get("data_batch_size")
+        self.data_batch_size = None
+        self.data_batch_micro_batches = None
+        self.optimizer_steps_per_data_batch = None
+        self.data_batch_cache_root = None
+        self.data_batch_rank_cache_dir = None
+        self._active_data_batch_cache = None
+        self._data_batch_phase = None
+        self._data_batch_end_after_current = False
+        if configured_data_batch_size is not None:
+            if not self.online_target_enabled:
+                raise ValueError("data_batch_size requires online target training.")
+            self.data_batch_size = int(configured_data_batch_size)
+            if self.data_batch_size <= 0:
+                raise ValueError("data_batch_size must be positive.")
+            self.data_batch_cache_root = os.path.abspath(
+                os.fspath(
+                    self.args.data.get("data_batch_cache_dir")
+                    or os.path.join(
+                        self.checkpoint_dir_root,
+                        "target_data_batch_cache",
+                    )
+                )
+            )
+            self._initialize_data_batch_cache()
         self.target_cache_path = self.args.data.get("target_cache_path")
         if not self.online_target_enabled and not self.target_cache_path:
             raise ValueError(
@@ -317,7 +389,15 @@ class BaseTrainer:
                 raise ValueError(
                     "Online target training requires data.train_data_path."
                 )
-            self.train_dataset = JsonLineDataset(paths)
+            # A large JSONL needs one full sequential scan to build its line
+            # index. Build it once on global rank 0 in a shared cache, then let
+            # every rank load the completed index instead of scanning the same
+            # source concurrently.
+            with main_process_first():
+                self.train_dataset = JsonLineDataset(
+                    paths,
+                    cache_dir=self.args.data.get("jsonl_index_cache_dir"),
+                )
             self.data_collator = ConversationCollator(
                 tokenizer=self.tokenizer,
                 chat_template=self.args.data.chat_template,
@@ -391,6 +471,7 @@ class BaseTrainer:
             warmup_ratio=float(self.args.train.warmup_ratio),
             weight_decay=float(self.args.train.weight_decay),
         )
+        self._draft_residency_verified = False
         if resume_is_distributed:
             model_config = getattr(self.draft_model.config, "to_dict", lambda: {})()
             progress = DistributedTrainingProgress(
@@ -432,6 +513,31 @@ class BaseTrainer:
             self.next_micro_step = resume_state.next_micro_step
         else:
             print_on_local_main("Training from scratch.")
+        if self.data_batch_size is not None:
+            if self.next_micro_step % self.gradient_accumulation_steps != 0:
+                raise ValueError(
+                    "data_batch_size requires an optimizer-step-aligned resume: "
+                    f"next_micro_step={self.next_micro_step}, "
+                    f"gradient_accumulation_steps={self.gradient_accumulation_steps}."
+                )
+            remaining_optimizer_steps = self.max_train_steps - self.global_step
+            if remaining_optimizer_steps == 0:
+                self.data_batch_micro_batches = ()
+                self.optimizer_steps_per_data_batch = ()
+            else:
+                (
+                    self.data_batch_micro_batches,
+                    self.optimizer_steps_per_data_batch,
+                ) = _compute_data_batch_schedule(
+                    data_batch_size=self.data_batch_size,
+                    total_samples=(
+                        remaining_optimizer_steps
+                        * int(self.args.train.global_batch_size)
+                    ),
+                    global_batch_size=int(self.args.train.global_batch_size),
+                    data_parallel_size=self.data_parallel_size,
+                    local_batch_size=int(self.args.train.local_batch_size),
+                )
         if self.online_target_enabled:
             self.online_target = self.build_online_target()
         self.info_board()
@@ -459,6 +565,25 @@ class BaseTrainer:
         print_on_local_main(
             f"  Gradient accumulation steps = {self.gradient_accumulation_steps}"
         )
+        if self.data_batch_size is not None:
+            print_on_local_main(f"  Data batch partitions = {self.data_batch_size}")
+            print_on_local_main(
+                "  Optimizer steps per data batch = "
+                f"{self.optimizer_steps_per_data_batch}"
+            )
+            global_samples_per_data_batch = tuple(
+                micro_batches
+                * self.data_parallel_size
+                * int(self.args.train.local_batch_size)
+                for micro_batches in self.data_batch_micro_batches
+            )
+            print_on_local_main(
+                "  Global samples per data batch = "
+                f"{global_samples_per_data_batch}"
+            )
+            print_on_local_main(
+                f"  Transient target cache = {self.data_batch_cache_root}"
+            )
         print_on_local_main(f"  Steps per epoch = {self.steps_per_epoch}")
         print_on_local_main(f"  Max train steps = {self.max_train_steps}")
 
@@ -530,6 +655,168 @@ class BaseTrainer:
             f"{type(self).__name__} does not implement online target training."
         )
 
+    def prepare_online_target_batch(self, batch):
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement target-first data batching."
+        )
+
+    def _initialize_data_batch_cache(self):
+        cache_root = self.data_batch_cache_root
+        if os.path.islink(cache_root):
+            raise ValueError(
+                f"Refusing to use a symlink as data-batch cache root: {cache_root}"
+            )
+        os.makedirs(cache_root, exist_ok=True)
+        rank_dir = os.path.join(cache_root, f"rank_{self.global_rank:05d}")
+        marker_path = os.path.join(rank_dir, _DATA_BATCH_CACHE_MARKER)
+        if os.path.lexists(rank_dir):
+            if os.path.islink(rank_dir) or not os.path.isdir(rank_dir):
+                raise ValueError(
+                    f"Invalid data-batch rank cache directory: {rank_dir}"
+                )
+            try:
+                with open(marker_path, "r", encoding="utf-8") as handle:
+                    marker = handle.read()
+            except FileNotFoundError as exc:
+                raise ValueError(
+                    "Refusing to remove an unowned data-batch cache directory: "
+                    f"{rank_dir}"
+                ) from exc
+            if marker != _DATA_BATCH_CACHE_MARKER_CONTENT:
+                raise ValueError(
+                    f"Invalid data-batch cache ownership marker: {marker_path}"
+                )
+            shutil.rmtree(rank_dir)
+        os.makedirs(rank_dir)
+        with open(marker_path, "w", encoding="utf-8") as handle:
+            handle.write(_DATA_BATCH_CACHE_MARKER_CONTENT)
+        self.data_batch_rank_cache_dir = rank_dir
+
+    def _write_data_batch_cache_file(self, batch, *, batch_index, sample_index):
+        batch_dir = os.path.join(
+            self.data_batch_rank_cache_dir,
+            f"data_batch_{batch_index:08d}",
+        )
+        os.makedirs(batch_dir, exist_ok=True)
+        path = os.path.join(batch_dir, f"sample_{sample_index:08d}.pt")
+        tmp_path = f"{path}.tmp"
+        cpu_batch = {
+            key: value.detach().to(device="cpu") for key, value in batch.items()
+        }
+        torch.save(cpu_batch, tmp_path)
+        os.replace(tmp_path, path)
+        batch.clear()
+        return path
+
+    def _delete_data_batch_cache(self, paths):
+        if not paths:
+            return
+        batch_dir = os.path.dirname(paths[0])
+        expected_parent = os.path.realpath(self.data_batch_rank_cache_dir)
+        if os.path.dirname(os.path.realpath(batch_dir)) != expected_parent:
+            raise RuntimeError(
+                f"Refusing to delete data-batch cache outside {expected_parent}: "
+                f"{batch_dir}"
+            )
+        for path in paths:
+            if os.path.dirname(path) != batch_dir:
+                raise RuntimeError(f"Mixed data-batch cache directories: {path}")
+            os.unlink(path)
+        os.rmdir(batch_dir)
+
+    def iter_training_batches(self, batches):
+        if self.data_batch_micro_batches is None:
+            yield from batches
+            return
+
+        batches = iter(batches)
+        for data_batch_index, micro_batch_count in enumerate(
+            self.data_batch_micro_batches,
+            start=1,
+        ):
+            cached_paths = []
+            self._active_data_batch_cache = cached_paths
+            self._data_batch_phase = "target_inference"
+            if dist.is_initialized():
+                print_on_global_main(
+                    f"Data batch {data_batch_index}/"
+                    f"{len(self.data_batch_micro_batches)}: "
+                    "starting isolated target inference; draft training is idle."
+                )
+            for sample_index in range(micro_batch_count):
+                try:
+                    batch = next(batches)
+                except StopIteration:
+                    break
+                prepared = self.prepare_online_target_batch(batch)
+                with record_function("deepspec::target_cache_disk_write"):
+                    cached_paths.append(
+                        self._write_data_batch_cache_file(
+                            prepared,
+                            batch_index=data_batch_index,
+                            sample_index=sample_index,
+                        )
+                    )
+
+            if not cached_paths:
+                self._active_data_batch_cache = None
+                self._data_batch_phase = None
+                return
+
+            if dist.is_initialized():
+                # Do not let an early rank enter draft collectives while a slow
+                # rank is still executing target inference. CUDA synchronization
+                # plus the global barrier makes this a hard phase boundary.
+                if self.device.type == "cuda":
+                    torch.cuda.synchronize(self.device)
+                dist.barrier()
+                global_samples = (
+                    len(cached_paths)
+                    * self.data_parallel_size
+                    * int(self.args.train.local_batch_size)
+                )
+                print_on_global_main(
+                    f"Target data batch {data_batch_index} ready: "
+                    f"global_samples={global_samples}; "
+                    "all ranks finished inference and cached it on disk; "
+                    "starting isolated draft training."
+                )
+            self._data_batch_phase = "draft_training"
+            for path_index, path in enumerate(cached_paths):
+                with record_function("deepspec::target_cache_disk_read"):
+                    cached_batch = torch.load(
+                        path,
+                        map_location="cpu",
+                        weights_only=True,
+                    )
+                    gpu_batch = move_batch_to_device(cached_batch, self.device)
+                    del cached_batch
+                self._data_batch_end_after_current = (
+                    path_index + 1 == len(cached_paths)
+                )
+                yield gpu_batch
+                self._data_batch_end_after_current = False
+                del gpu_batch
+
+            # A rank may delete the block only after every rank has completed
+            # its draft updates. If any rank fails, the barrier is never passed
+            # and the current block remains available for diagnosis.
+            if dist.is_initialized():
+                if self.device.type == "cuda":
+                    torch.cuda.synchronize(self.device)
+                dist.barrier()
+            with record_function("deepspec::target_cache_disk_delete"):
+                self._delete_data_batch_cache(cached_paths)
+            self._active_data_batch_cache = None
+            self._data_batch_phase = None
+            if dist.is_initialized():
+                dist.barrier()
+                print_on_global_main(
+                    f"Data batch {data_batch_index} draft training finished; "
+                    "deleted its transient disk cache before the next target "
+                    "inference phase."
+                )
+
     def _build_train_dataloader(self, start_offset_samples=0, num_samples=None):
         sampler = StatelessResumableDistributedSampler(
             dataset=self.train_dataset,
@@ -553,6 +840,44 @@ class BaseTrainer:
 
     def run_batch(self, batch):
         raise NotImplementedError
+
+    def _verify_draft_training_state_residency(self) -> None:
+        expected_device = self.device.type
+        parameter_tensors = list(self.draft_model.parameters())
+        gradient_tensors = [
+            parameter.grad
+            for parameter in parameter_tensors
+            if parameter.grad is not None
+        ]
+        optimizer_tensors = [
+            value
+            for state in self.optimizer.optimizer.state.values()
+            for value in state.values()
+            if torch.is_tensor(value)
+        ]
+        groups = {
+            "parameters": parameter_tensors,
+            "gradients": gradient_tensors,
+            "optimizer state": optimizer_tensors,
+        }
+        for name, tensors in groups.items():
+            if not tensors:
+                raise RuntimeError(f"Draft {name} residency check found no tensors.")
+            wrong_devices = sorted(
+                {tensor.device.type for tensor in tensors if tensor.device.type != expected_device}
+            )
+            if wrong_devices:
+                raise RuntimeError(
+                    f"Draft {name} must remain on {expected_device}, found {wrong_devices}."
+                )
+        self._draft_residency_verified = True
+        print_on_global_main(
+            "Draft GPU residency verified: "
+            f"parameters={len(parameter_tensors)}, "
+            f"gradients={len(gradient_tensors)}, "
+            f"optimizer_tensors={len(optimizer_tensors)}, "
+            f"device={expected_device}."
+        )
 
     def forward_model(self, **kwargs):
         buffer_names = self.args.train.get(
@@ -638,10 +963,15 @@ class BaseTrainer:
         pending_log = None
 
         with profiler, self.suspend_controller.monitoring():
-            for batch in prefetcher:
+            for batch in self.iter_training_batches(prefetcher):
                 should_sync = (
                     self.next_micro_step + 1
                 ) % self.gradient_accumulation_steps == 0
+                if self._data_batch_end_after_current and not should_sync:
+                    raise RuntimeError(
+                        "A target-cache data batch ended inside a gradient "
+                        "accumulation window."
+                    )
                 with record_function("deepspec::training_micro_step"):
                     with gradient_sync_context(self.model, should_sync=should_sync):
                         with record_function("deepspec::forward_and_loss"):
@@ -676,6 +1006,8 @@ class BaseTrainer:
                                     else None
                                 ),
                             )
+                        if not self._draft_residency_verified:
+                            self._verify_draft_training_state_residency()
                         # A packed metric reduction from the previous optimizer
                         # step has had an entire target/draft forward+backward
                         # window to complete. Drain it now, then launch this
@@ -695,6 +1027,13 @@ class BaseTrainer:
                             )
                         with record_function("deepspec::optimizer_step"):
                             self.optimizer.step()
+
+                        # A data-batch boundary is also a hard observability
+                        # boundary. Drain this block's asynchronous metrics before
+                        # the generator can start the next target-inference phase.
+                        if self._data_batch_end_after_current:
+                            training_logger.finish_optimizer_step(pending_log)
+                            pending_log = None
 
                         if (
                             save_checkpoints
@@ -729,6 +1068,23 @@ class BaseTrainer:
         if self.online_target is not None:
             self.online_target.close()
             self.online_target = None
+        if (
+            self.data_batch_rank_cache_dir is not None
+            and self._active_data_batch_cache is None
+        ):
+            marker_path = os.path.join(
+                self.data_batch_rank_cache_dir,
+                _DATA_BATCH_CACHE_MARKER,
+            )
+            os.unlink(marker_path)
+            os.rmdir(self.data_batch_rank_cache_dir)
+            self.data_batch_rank_cache_dir = None
+        elif self._active_data_batch_cache:
+            print(
+                "[deepspec-data-batch-cache] Retaining interrupted cache for "
+                f"rank {self.global_rank}: {self.data_batch_rank_cache_dir}",
+                flush=True,
+            )
         close_dataset = getattr(self.train_dataset, "close", None)
         if close_dataset is not None:
             close_dataset()

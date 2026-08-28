@@ -128,11 +128,18 @@ This produces the cache consumed by [scripts/train/train.sh](../train/train.sh):
 
 ### DeepSeek-V4 target feature modes
 
-DeepSeek-V4 DSpark performs frozen-target inference immediately before every
-draft micro-batch. The generated selected and final hidden states remain
-in-memory only and are released after that micro-batch's backward. DFlash and
+DeepSeek-V4 DSpark processes a bounded target-first data batch, stages that
+batch's selected and final hidden states in a transient disk cache, trains the
+draft on the block, and deletes the consumed cache before advancing. Global
+CUDA synchronization and rank barriers isolate target inference from draft
+training; draft training cannot fall back to inline target inference. DFlash and
 DFlash2 use the offline EP/FSDP2 and ring-CP target runner because they only need
-selected hidden states. To prepare an eight-GPU DFlash2 cache:
+selected hidden states. For DSpark, `DATA_BATCH_SIZE` is the number of
+partitions, not a sample count.
+For example, 15,000 planned samples with `DATA_BATCH_SIZE=3` produce three
+5,000-sample blocks when the optimizer-step boundaries divide evenly.
+
+To prepare an eight-GPU DFlash2 cache:
 
 ```bash
 torchrun --standalone --nproc-per-node=8 \
@@ -151,7 +158,8 @@ The preparation command validates and reuses a completed cache. It refuses to
 overwrite a partial, stale, or incompatible directory. Keep the cache on a
 filesystem visible to every training node and set `TARGET_CACHE_DIR` when using
 the DeepSeek-V4 DFlash/DFlash2 scripts under `scripts/fsdp/`. Their caches omit
-the unused final hidden state. DSpark does not require `TARGET_CACHE_DIR`.
+the unused final hidden state. DSpark uses `DATA_BATCH_CACHE_DIR` only for its
+bounded transient blocks; it does not require a completed offline manifest.
 
 ### Multimodal targets
 

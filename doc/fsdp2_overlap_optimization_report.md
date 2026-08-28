@@ -383,3 +383,61 @@ draft FSDP2 优化已完成并有两种 profiler、真实 accumulation、多次 
 “面向 8 × NVIDIA B300、128K sequence 的 DeepSeek-V4 DSpark 训练，完成 PyTorch FSDP2 通信/计算重叠优化与 profiling 基础设施建设；通过跨 gradient-accumulation 保留参数、BF16 gradient reduction 和静态 prefetch，将 draft-only optimizer-step median latency 降低 48.3%、吞吐提升 93.4%、暴露 FSDP 通信降低 70.9%，并用 PyTorch Profiler 与 Nsight Systems 交叉验证。完成完整在线-target 训练和数值正确性回归，同时识别 target 主导下端到端收益尚未显著，设计后续 phase timing 与重复 A/B 方案。”
 
 不建议写“完整训练提速 93%”或“端到端提速 48%”；这些数字只属于隔离后的 draft 路径。若后续重复完整 A/B 得到稳定正收益，再新增端到端指标。
+
+## 16. DATA_BATCH_SIZE=256 分块链路再验证（2026-08-27）
+
+`scripts/fsdp/train_deepseek_v4_flash_dspark_fsdp2_multinode_128.sh` 的 `DATA_BATCH_SIZE` 默认值已设为 256。这个参数表示将完整训练计划分成 256 个尽量等大、对齐 optimizer step 的数据块，不是“每块 256 条数据”。每块严格串行执行 target 推理、落盘、draft 训练和缓存删除，上一块删除完成后才进入下一块。
+
+### 16.1 128 GPU 配置检查
+
+16 节点、每节点 8 GPU 的 dry-run 通过，最终拓扑为：
+
+| 项目 | 结果 |
+| --- | --- |
+| Training world size | 128 |
+| DP replicate / shard | 16 / 1 |
+| CP / TP | 8 / 1 |
+| Draft EP / target EP | 1 / 8 |
+| Global batch / gradient accumulation | 64 / 4 |
+| Data batch partitions | 256 |
+| Draft FSDP2 | no-reshard, F/B prefetch depth 2, BF16 reduce, block wrap |
+
+这只是拓扑与命令行验证，不是 128 GPU 性能实测。日志位于 `output/dspark_data_batch256_final_dryrun_128gpu_20260827/logs/node_rank_0.log`。
+
+### 16.2 当前代码的 draft overlap A/B
+
+为避免 target 长样本波动掩盖 draft 通信收益，先使用固定 8 GPU、seq=131072、anchors=512、accumulation=4、warmup=2、measured=7 的 draft-only 负载重跑 A/B。两组初始参数 checksum 完全相同。
+
+| 配置 | Median step | P95 | Median token/s | Peak allocated | Peak reserved |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Baseline：reshard=true，无 prefetch，FP32 reduce | 966.288 ms | 971.482 ms | 14,836.153 | 161.089 GiB | 220.861 GiB |
+| 当前优化：no-reshard，F/B prefetch d2，BF16 reduce | 536.003 ms | 595.407 ms | 26,746.144 | 119.442 GiB | 180.984 GiB |
+| 变化 | -44.530% | -38.711% | +80.277% | -25.853% | -18.055% |
+
+BF16 reduction 相对 FP32 baseline 的 7 个 measured steps 最大 loss 绝对差为 0.005356，最大 grad-norm 绝对差为 0.03125，与预期的精度舍入一致。原始结果：
+
+- `output/draft_overlap_data_batch256_recheck_20260827/baseline/result.json`；
+- `output/draft_overlap_data_batch256_recheck_20260827/optimized/result.json`。
+
+已有 profiler 结论仍成立：优化后的 FSDP 暴露通信约 48 ms，主要是依赖边界上的 forward AllGather 和最终 ReduceScatter tail。当前 PyTorch 2.11 FSDP2 本地 API 没有可用的独立 ReduceScatter group/buffer-depth 调节接口；继续深化包装的已测方案反而慢 7.738%。因此本轮不加入无证据的调度改动，保留当前速度优先配置。
+
+### 16.3 256 块真实 target/draft 串行压力测试
+
+在当前单机 8 × B300 上使用用户指定的 SenseNova JSONL、真实 DeepSeek-V4 target、128K 最大长度和当前 draft 进行边界压力测试。为了在单机上覆盖所有 256 个分块边界，诊断运行设置 `GLOBAL_BATCH_SIZE=1`、`MAX_TRAIN_STEPS=256`、`NUM_ANCHORS=64`并关闭 checkpoint；这些诊断覆盖不用于表示生产收敛或 128 GPU 吞吐。
+
+| 验证项 | 结果 |
+| --- | --- |
+| Target inference start | 256/256 |
+| Target cache ready | 256/256 |
+| Draft optimizer step | 256/256 |
+| Draft finish + cache delete | 256/256 |
+| 完整分块时间窗 | 710 s |
+| 单块总时间 median / p95 / max | 1 s / 10 s / 107 s（日志精度为 1 s） |
+| Loss | 256 个全部 finite |
+| OOM / NCCL timeout / fatal | 0 / 0 / 0 |
+| 最终缓存状态 | 0 个文件，目录占用 4 KB |
+| Launcher exit | code 0，正确识别为达到 256-step 诊断上限 |
+
+运行期间手工捕获到的最大缓存快照为约 4.0 GB，完成该块后立即清空。这个数字只是 8 GPU、global batch 1 诊断运行的观测快照，不是生产峰值。完整日志：`output/dspark_data_batch256_8gpu_128k_smoke_20260827_2151/logs/node_rank_0.log`。
+
+此外，local/unit 测试 14/14 通过，2 GPU FSDP2 数值测试在两个 rank 上均为 3/3 通过，脚本 `bash -n` 通过。启动器的失败诊断顺序同时调整为 OOM、NCCL timeout、Python fatal、rendezvous，避免日志中打印的 git diff 文本使 Python 异常被误判为 rendezvous 失败。

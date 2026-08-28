@@ -9,11 +9,11 @@ from tqdm import tqdm
 from deepspec.utils.constant import CACHE_DIR
 
 class JsonLineDataset(torch.utils.data.Dataset):
-    def __init__(self, data_paths):
+    def __init__(self, data_paths, *, cache_dir=None):
         super().__init__()
         self.data_paths = sorted(data_paths)
         self.file_sizes = [os.path.getsize(path) for path in self.data_paths]
-        self.cache_dir = os.path.abspath(CACHE_DIR)
+        self.cache_dir = os.path.abspath(cache_dir or CACHE_DIR)
         os.makedirs(self.cache_dir, exist_ok=True)
         self.num_data_per_file = []
         self.cum_counts = [0]
