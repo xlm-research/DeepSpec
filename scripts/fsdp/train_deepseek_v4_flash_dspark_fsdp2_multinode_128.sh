@@ -21,8 +21,10 @@ NPROC_PER_NODE=${NPROC_PER_NODE:-8}
 CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}
 
 TARGET_MODEL_PATH=${TARGET_MODEL_PATH:-/mnt/afs-agentpro/share/models/deepseek-ai/DeepSeek-V4-Flash-0731}
-TRAIN_DATA_PATH=${TRAIN_DATA_PATH:-${BASE_DIR}/train_data/spec_o3_coldstartsft.repeat60.deepspec.packed_256k.jsonl}
-OUTPUT_ROOT=${OUTPUT_ROOT:-${BASE_DIR}/output/deepseek_v4_flash_dspark_fsdp2_multinode_128_128}
+TRAIN_DATA_PATH=${TRAIN_DATA_PATH:-/mnt/afs-agentpro/hongjiawei/code/DeepSpec-old/scripts/data/sensenova_flash_v15_use_data_json.thinking_toolcall.readable_full.flash_conversations.jsonl}
+OUTPUT_ROOT=${OUTPUT_ROOT:-${BASE_DIR}/output/deepseek_v4_flash_dspark_fsdp2_sensenova_flash_v15}
+JSONL_INDEX_CACHE_DIR=${JSONL_INDEX_CACHE_DIR:-${BASE_DIR}/output/jsonl_index_cache}
+DATA_BATCH_CACHE_DIR=${DATA_BATCH_CACHE_DIR:-${OUTPUT_ROOT}/target_data_batch_cache}
 LOG_DIR=${LOG_DIR:-${OUTPUT_ROOT}/logs}
 mkdir -p "${LOG_DIR}"
 NODE_LOG=${LOG_DIR}/node_rank_${NODE_RANK}.log
@@ -39,16 +41,22 @@ diagnose_exit() {
     set +e
     echo "[deepspec-launch-exit] time=$(date '+%Y-%m-%d %H:%M:%S %z') host=$(hostname) node_rank=${NODE_RANK} exit_code=${status}"
     if ((status == 0)); then
-        echo "[deepspec-launch-diagnosis] completed successfully"
-    elif [[ -f "${NODE_LOG}" ]] && grep -qE 'waiting for clients|assigned_ranks|DistStoreError|Rendezvous' "${NODE_LOG}"; then
-        echo "[deepspec-launch-diagnosis] rendezvous failure: not all nodes joined the same MASTER_ADDR:MASTER_PORT before timeout; compare NNODES, NODE_RANK, MASTER_ADDR and MASTER_PORT on every node"
+        if [[ "${DRY_RUN:-false}" == "true" ]]; then
+            echo "[deepspec-launch-diagnosis] dry run completed; torchrun was printed but training was not started"
+        elif [[ -n "${MAX_TRAIN_STEPS:-}" ]]; then
+            echo "[deepspec-launch-diagnosis] configured step limit reached successfully: MAX_TRAIN_STEPS=${MAX_TRAIN_STEPS}"
+        else
+            echo "[deepspec-launch-diagnosis] dataset-derived training schedule completed successfully"
+        fi
     elif [[ -f "${NODE_LOG}" ]] && grep -qE 'OutOfMemoryError|CUDA out of memory' "${NODE_LOG}"; then
         echo "[deepspec-launch-diagnosis] CUDA OOM: inspect the first [deepspec-fatal] rank and its [deepspec-cuda] peak-memory line"
     elif [[ -f "${NODE_LOG}" ]] && grep -qE 'collective operation timeout|ALLTOALL_BASE|Watchdog caught collective' "${NODE_LOG}"; then
         echo "[deepspec-launch-diagnosis] NCCL collective timeout: another rank may have failed first; inspect all per-rank stderr files and find the earliest [deepspec-fatal] or NCCL watchdog timestamp"
     elif [[ -f "${NODE_LOG}" ]] && grep -q '\[deepspec-fatal\]' "${NODE_LOG}"; then
         echo "[deepspec-launch-diagnosis] Python training failure: the first [deepspec-fatal] block contains the original rank and traceback"
-    elif [[ -f "${NODE_LOG}" ]] && grep -qE 'must (equal|be|provide)|does not (exist|match)|requires [0-9]+ nodes' "${NODE_LOG}"; then
+    elif [[ -f "${NODE_LOG}" ]] && grep -qE 'waiting for clients|assigned_ranks|DistStoreError|Rendezvous' "${NODE_LOG}"; then
+        echo "[deepspec-launch-diagnosis] rendezvous failure: not all nodes joined the same MASTER_ADDR:MASTER_PORT before timeout; compare NNODES, NODE_RANK, MASTER_ADDR and MASTER_PORT on every node"
+    elif [[ -f "${NODE_LOG}" ]] && grep -qE 'must (equal|be|provide)|does not (exist|match)|requires [0-9]+ nodes|PRODUCTION_RUN=true requires' "${NODE_LOG}"; then
         echo "[deepspec-launch-diagnosis] preflight configuration failure: fix the path or topology validation message immediately above"
     else
         echo "[deepspec-launch-diagnosis] launcher exited without a recognized signature; inspect ${TORCHRUN_LOG_DIR} and the SenseCore container termination reason"
@@ -104,14 +112,15 @@ TARGET_LAYER_IDS=${TARGET_LAYER_IDS:-[0,1,2]}
 LEARNING_RATE=${LEARNING_RATE:-0.00001}
 LOCAL_BATCH_SIZE=${LOCAL_BATCH_SIZE:-1}
 GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-64}
+DATA_BATCH_SIZE=${DATA_BATCH_SIZE:-128}
 # Let the trainer derive max_train_steps from the usable dataset size and the
-# requested epoch count. The bundled repeat60 dataset is already expanded, so
-# one epoch avoids running the online target repeatedly for the same records.
+# requested epoch count. Keep one epoch as the production default.
 NUM_TRAIN_EPOCHS=${NUM_TRAIN_EPOCHS:-1}
 MAX_TRAIN_STEPS=${MAX_TRAIN_STEPS:-}
 SAVE_STEPS=${SAVE_STEPS:-200}
 SAVE_CHECKPOINTS=${SAVE_CHECKPOINTS:-true}
 DRY_RUN=${DRY_RUN:-false}
+PRODUCTION_RUN=${PRODUCTION_RUN:-false}
 TORCHRUN_PER_RANK_LOGS=${TORCHRUN_PER_RANK_LOGS:-true}
 PROFILE_ENABLED=${PROFILE_ENABLED:-false}
 RESHARD_AFTER_FORWARD=${RESHARD_AFTER_FORWARD:-false}
@@ -131,7 +140,7 @@ TP=${TP:-1}
 DRAFT_EP=${DRAFT_EP:-1}
 TARGET_EP=${TARGET_EP:-8}
 
-for parallel_var in DP_SHARD CP TP DRAFT_EP TARGET_EP NUM_TRAIN_EPOCHS FSDP_PREFETCH_DEPTH; do
+for parallel_var in DP_SHARD CP TP DRAFT_EP TARGET_EP NUM_TRAIN_EPOCHS FSDP_PREFETCH_DEPTH DATA_BATCH_SIZE; do
     parallel_value=${!parallel_var}
     if [[ ! "${parallel_value}" =~ ^[1-9][0-9]*$ ]]; then
         echo "${parallel_var} must be a positive integer; got ${parallel_value}." >&2
@@ -141,6 +150,24 @@ done
 if [[ -n "${MAX_TRAIN_STEPS}" ]] && [[ ! "${MAX_TRAIN_STEPS}" =~ ^[1-9][0-9]*$ ]]; then
     echo "MAX_TRAIN_STEPS must be empty or a positive integer; got ${MAX_TRAIN_STEPS}." >&2
     exit 1
+fi
+if [[ "${PRODUCTION_RUN}" != "true" && "${PRODUCTION_RUN}" != "false" ]]; then
+    echo "PRODUCTION_RUN must be true or false; got ${PRODUCTION_RUN}." >&2
+    exit 1
+fi
+if [[ "${PRODUCTION_RUN}" == "true" ]]; then
+    if [[ "${DRY_RUN}" != "false" ]]; then
+        echo "PRODUCTION_RUN=true requires DRY_RUN=false; remove the stale diagnostic override." >&2
+        exit 1
+    fi
+    if [[ -n "${MAX_TRAIN_STEPS}" ]]; then
+        echo "PRODUCTION_RUN=true requires MAX_TRAIN_STEPS to be unset so the dataset/epoch schedule controls training." >&2
+        exit 1
+    fi
+    if [[ "${SAVE_CHECKPOINTS}" != "true" ]]; then
+        echo "PRODUCTION_RUN=true requires SAVE_CHECKPOINTS=true." >&2
+        exit 1
+    fi
 fi
 
 DENSE_REPLICA_DOMAIN=$((DP_SHARD * CP * TP))
@@ -264,14 +291,22 @@ echo "  training world size=${TRAIN_WORLD_SIZE} (=NNODES*NPROC_PER_NODE)"
 echo "  dense mesh: DP_REPLICATE=${DP_REPLICATE}, DP_SHARD=${DP_SHARD}, CP=${CP}, TP=${TP}"
 echo "  FSDP shard=${FSDP_SHARD_SIZE}, draft EP=${DRAFT_EP}, target EP=${TARGET_EP}, target EFSDP=${TARGET_EFSDP}"
 echo "  local batch=${LOCAL_BATCH_SIZE}, global batch=${GLOBAL_BATCH_SIZE}, gradient accumulation=${GRADIENT_ACCUMULATION_STEPS}"
+echo "  data batch partitions=${DATA_BATCH_SIZE} (planned samples are divided into near-equal optimizer-aligned blocks)"
 if [[ -n "${MAX_TRAIN_STEPS}" ]]; then
     echo "  schedule=fixed diagnostic override, max steps=${MAX_TRAIN_STEPS}"
+    echo "  WARNING: training will exit successfully after ${MAX_TRAIN_STEPS} optimizer steps"
 else
     echo "  schedule=dataset-derived, epochs=${NUM_TRAIN_EPOCHS}, max steps computed after loading the dataset"
 fi
 echo "  max length=${MAX_LENGTH}, logging every step, checkpoint every ${SAVE_STEPS} steps"
 echo "  profiler=${PROFILE_ENABLED}, save checkpoints=${SAVE_CHECKPOINTS}"
-echo "  target mode=per-micro-batch online inference"
+echo "  production safety=${PRODUCTION_RUN}"
+if [[ "${DRY_RUN}" == "true" ]]; then
+    echo "  WARNING: DRY_RUN=true; torchrun will only be printed and no training will start"
+fi
+echo "  target mode=strictly isolated target-inference/draft-training data batches"
+echo "  shared JSONL index cache=${JSONL_INDEX_CACHE_DIR}"
+echo "  transient target data-batch cache=${DATA_BATCH_CACHE_DIR}"
 echo "  FSDP overlap: reshard_after_forward=${RESHARD_AFTER_FORWARD}, forward_prefetch=${FSDP_FORWARD_PREFETCH}, backward_prefetch=${FSDP_BACKWARD_PREFETCH}, prefetch_depth=${FSDP_PREFETCH_DEPTH}"
 echo "  FSDP draft policy: reduce_dtype=${FSDP_REDUCE_DTYPE}, wrap_granularity=${FSDP_WRAP_GRANULARITY}"
 if [[ "${PROFILE_ENABLED}" == "true" ]]; then
@@ -331,10 +366,13 @@ set -x
     --opts "model.target_layer_ids=${TARGET_LAYER_IDS}" \
     --opts "model.num_anchors=${NUM_ANCHORS}" \
     --opts "data.train_data_path=${TRAIN_DATA_PATH}" \
+    --opts "data.jsonl_index_cache_dir=${JSONL_INDEX_CACHE_DIR}" \
+    --opts "data.data_batch_cache_dir=${DATA_BATCH_CACHE_DIR}" \
     --opts "data.max_length=${MAX_LENGTH}" \
     --opts "train.lr=${LEARNING_RATE}" \
     --opts "train.local_batch_size=${LOCAL_BATCH_SIZE}" \
     --opts "train.global_batch_size=${GLOBAL_BATCH_SIZE}" \
+    --opts "train.data_batch_size=${DATA_BATCH_SIZE}" \
     --opts "train.parallel.dp_replicate=${DP_REPLICATE}" \
     --opts "train.parallel.dp_shard=${DP_SHARD}" \
     --opts "train.parallel.cp=${CP}" \

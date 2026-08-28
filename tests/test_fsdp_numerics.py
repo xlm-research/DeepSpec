@@ -62,6 +62,7 @@ class FSDP2NumericsTest(unittest.TestCase):
         for state in optimizer.optimizer.state.values():
             for name in ("step", "master_param", "exp_avg", "exp_avg_sq"):
                 self.assertEqual(state[name].dtype, torch.float32)
+                self.assertEqual(state[name].device.type, "cuda")
 
     def test_forward_backward_and_update_match(self):
         runtime = require_torchrun(self, world_size=2)

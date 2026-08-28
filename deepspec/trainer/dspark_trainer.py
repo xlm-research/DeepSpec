@@ -103,15 +103,37 @@ class DeepseekV4DSparkTrainer(Qwen3DSparkTrainer):
             ),
         )
 
+    def prepare_online_target_batch(self, batch):
+        if (
+            self.data_batch_micro_batches is not None
+            and self._data_batch_phase != "target_inference"
+        ):
+            raise RuntimeError(
+                "Target inference is only allowed during the isolated "
+                "target_inference phase."
+            )
+        with record_function("deepspec::target_forward"):
+            target_batch = self.online_target.forward_training_batch(batch)
+        # Keep generated supervision on the outer training-loop batch so its
+        # final GPU references can be dropped immediately after draft backward.
+        batch.clear()
+        batch.update(target_batch)
+        return batch
+
     def run_batch(self, batch):
-        if self.online_target_enabled:
-            with record_function("deepspec::target_forward"):
-                target_batch = self.online_target.forward_training_batch(batch)
-            # Keep the generated supervision on the outer training-loop batch.
-            # This lets BaseTrainer explicitly drop its final references as soon
-            # as this micro-batch's backward has consumed the tensors.
-            batch.clear()
-            batch.update(target_batch)
+        if self.online_target_enabled and self.data_batch_micro_batches is not None:
+            if self._data_batch_phase != "draft_training":
+                raise RuntimeError(
+                    "Draft forward is only allowed during the isolated "
+                    "draft_training phase."
+                )
+            if "target_hidden_states" not in batch:
+                raise RuntimeError(
+                    "Isolated draft training requires precomputed target hidden "
+                    "states; refusing to run target inference from run_batch."
+                )
+        elif self.online_target_enabled and "target_hidden_states" not in batch:
+            self.prepare_online_target_batch(batch)
         needs_target_logits = (
             float(self.args.model.l1_loss_alpha) > 0.0
             or float(self.args.model.confidence_head_alpha) > 0.0

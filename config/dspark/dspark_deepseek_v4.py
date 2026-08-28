@@ -39,9 +39,11 @@ train = dict(
     # Pure EP overlays the base CP * TP * FSDP topology and does not multiply it.
     # Routed experts are excluded from TP/FSDP parameter shards.
     global_batch_size=8,
-    # Online distillation evaluates the frozen target once immediately before
-    # each draft micro-batch. Keep one epoch so every sample needs one target
-    # forward rather than recomputing identical supervision across epochs.
+    # Split the planned training samples into this many near-equal disk-cache
+    # blocks. Each block ends on a complete optimizer step.
+    data_batch_size=3,
+    # Each target-first data window still evaluates every sample exactly once.
+    # Keep one epoch to avoid recomputing identical supervision across epochs.
     num_train_epochs=1,
     max_train_steps=None,
     max_grad_norm=1.0,
@@ -100,6 +102,8 @@ profiling = dict(
 data = dict(
     online_target=True,
     train_data_path=("train_data/spec_o3_coldstartsft.first8.repeat1.deepspec.jsonl"),
+    jsonl_index_cache_dir=None,
+    data_batch_cache_dir=None,
     target_cache_path=None,
     chat_template="deepseek_v4",
     max_length=131072,
