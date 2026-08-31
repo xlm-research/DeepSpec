@@ -1,0 +1,4 @@
+interface:
+  display_name: "Draft FSDP2 Overlap Optimizer"
+  short_description: "Optimize draft-model FSDP2 compute/communication overlap"
+  default_prompt: "Use $fsdp2-overlap to profile and optimize only this draft-model FSDP2 training path while preserving synchronous training semantics."

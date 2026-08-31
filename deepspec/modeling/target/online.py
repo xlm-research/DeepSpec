@@ -483,4 +483,76 @@ class DeepseekV4OnlineTarget:
         torch.cuda.empty_cache()
 
 
-__all__ = ["DeepseekV4OnlineTarget"]
+class Glm5NextOnlineTarget(DeepseekV4OnlineTarget):
+    """Frozen, truncated GLM-5.3 teacher for online DSpark distillation."""
+
+    def __init__(
+        self,
+        *,
+        model_name_or_path: str,
+        target_layer_ids,
+        topology,
+        device,
+        rank_local_cache_dir: str,
+    ):
+        if topology.expert_parallel_size != 1:
+            raise NotImplementedError(
+                "GLM-5.3 online target expert parallelism is not implemented; "
+                "set train.target_parallel.ep=1."
+            )
+        if topology.tensor_parallel_size != 1:
+            raise NotImplementedError(
+                "GLM-5.3 online target tensor parallelism is not implemented; "
+                "set train.parallel.tp=1."
+            )
+        if topology.context_parallel_size != 1:
+            raise NotImplementedError(
+                "GLM-5.3 hybrid-attention target context parallelism is not "
+                "implemented; set train.parallel.cp=1."
+            )
+
+        self.model_name_or_path = str(model_name_or_path)
+        self.target_layer_ids = [int(layer_id) for layer_id in target_layer_ids]
+        self.topology = topology
+        self.device = device
+        self.rank_local_cache_dir = str(rank_local_cache_dir)
+        target_config = AutoConfig.from_pretrained(self.model_name_or_path)
+        if str(target_config.model_type) != "glm5_next":
+            raise ValueError(
+                "Glm5NextOnlineTarget requires a glm5_next checkpoint, got "
+                f"{target_config.model_type!r}."
+            )
+        text_config = target_config.text_config
+        decoder_layer_ids = [
+            layer_id for layer_id in self.target_layer_ids if layer_id >= 0
+        ]
+        if not decoder_layer_ids:
+            raise ValueError("Online target requires at least one decoder layer.")
+        retained_layers = max(decoder_layer_ids) + 1
+        original_layers = int(text_config.num_hidden_layers)
+        if retained_layers > original_layers:
+            raise ValueError(
+                f"Requested target layer {retained_layers - 1}, but the checkpoint "
+                f"contains only {original_layers} decoder layers."
+            )
+        text_config.num_hidden_layers = retained_layers
+        # Text-only training never calls the vision tower. Avoid constructing
+        # its 24 transformer blocks while retaining the checkpoint's composite
+        # model wrapper and parameter names.
+        target_config.vision_config.depth = 0
+        self.target_num_hidden_layers = retained_layers
+
+        model = _build_rank_local_ep_target_model(
+            model_name_or_path=self.model_name_or_path,
+            target_config=target_config,
+            topology=topology,
+        ).eval()
+        model.requires_grad_(False)
+        self.model = _wrap_target_model_with_fsdp(
+            target_model=model,
+            device=device,
+            topology=topology,
+        ).eval()
+
+
+__all__ = ["DeepseekV4OnlineTarget", "Glm5NextOnlineTarget"]

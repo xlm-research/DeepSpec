@@ -12,6 +12,10 @@ from deepspec.modeling.dspark.qwen3_6 import Qwen3_6DSparkModel
 from deepspec.modeling.dspark.qwen3_6.config import (
     build_draft_config as build_qwen3_6_draft_config,
 )
+from deepspec.modeling.dspark.qwen3_8 import Qwen3_8DSparkModel
+from deepspec.modeling.dspark.qwen3_8.config import (
+    build_draft_config as build_qwen3_8_draft_config,
+)
 import os
 from torch.profiler import record_function
 
@@ -77,6 +81,15 @@ class Qwen3_6DSparkTrainer(Qwen3DSparkTrainer):
             model_args=model_args,
         )
         return Qwen3_6DSparkModel(draft_config)
+
+
+class Qwen3_8DSparkTrainer(Qwen3DSparkTrainer):
+    def _build_draft_model(self, *, target_config, model_args):
+        draft_config = build_qwen3_8_draft_config(
+            target_config=target_config,
+            model_args=model_args,
+        )
+        return Qwen3_8DSparkModel(draft_config)
 
 
 class DeepseekV4DSparkTrainer(Qwen3DSparkTrainer):
@@ -158,3 +171,28 @@ class DeepseekV4DSparkTrainer(Qwen3DSparkTrainer):
                 l1_loss_alpha=float(self.args.model.l1_loss_alpha),
                 confidence_head_alpha=float(self.args.model.confidence_head_alpha),
             )
+
+
+class Glm5NextDSparkTrainer(DeepseekV4DSparkTrainer):
+    def _build_draft_model(self, *, target_config, model_args):
+        from deepspec.modeling.dspark.glm5_next import (
+            Glm5NextDSparkModel,
+            build_draft_config,
+        )
+
+        return Glm5NextDSparkModel(
+            build_draft_config(target_config=target_config, model_args=model_args)
+        )
+
+    def build_online_target(self):
+        from deepspec.modeling.target import Glm5NextOnlineTarget
+
+        return Glm5NextOnlineTarget(
+            model_name_or_path=self.args.model.target_model_name_or_path,
+            target_layer_ids=self.args.model.target_layer_ids,
+            topology=self.target_parallel,
+            device=self.device,
+            rank_local_cache_dir=os.path.join(
+                self.checkpoint_dir_root, "target_rank_local"
+            ),
+        )

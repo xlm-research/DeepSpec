@@ -1,7 +1,9 @@
 # Install the CUDA build of torch that matches your machine if the default wheel
 # is not appropriate for your environment.
 torch==2.9.1
-transformers==5.10.2
+# GLM-5.3-Flash support landed after the 5.12 release. Pin the upstream
+# implementation used by the GLM DSpark adapter until the next release tag.
+transformers @ git+https://github.com/huggingface/transformers.git@42ca97014c85d71a88ad60d55f08cb9fb4d26e2c
 numpy==2.4.4
 PyYAML==6.0.3
 tqdm==4.67.3

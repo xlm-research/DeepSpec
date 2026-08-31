@@ -197,7 +197,7 @@ def _collect_local_terms(
 
     for pos_idx in range(block_size):
         add_metric(
-            f"accept_rate@{pos_idx}",
+            f"step_accept_rate@{pos_idx}",
             pos_accept_sums[pos_idx],
             den=pos_total_counts[pos_idx],
             tag="train",

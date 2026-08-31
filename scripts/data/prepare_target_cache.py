@@ -443,12 +443,26 @@ def _pad_native_cp_inputs(
     )
 
 
+def _validate_optional_cache_tensor(tensor):
+    if tensor is not None and not isinstance(tensor, torch.Tensor):
+        raise TypeError(
+            "CP cache transport expects a Tensor or None, got "
+            f"{type(tensor)!r}."
+        )
+    if tensor is not None and tensor.dtype not in _CACHE_DTYPES:
+        raise TypeError(f"Unsupported CP cache dtype: {tensor.dtype}")
+    if tensor is not None and tensor.device.type not in ("cpu", "cuda"):
+        raise TypeError(
+            "CP cache transport only supports CPU or CUDA tensors, got "
+            f"{tensor.device}."
+        )
+
+
 def _send_optional_cache_tensor(*, tensor, dst, gpu_group, cpu_group):
+    _validate_optional_cache_tensor(tensor)
     present = torch.tensor([int(tensor is not None)], dtype=torch.int64)
     dist.send(present, dst=dst, group=cpu_group)
     if tensor is not None:
-        if tensor.dtype not in _CACHE_DTYPES:
-            raise TypeError(f"Unsupported CP cache dtype: {tensor.dtype}")
         use_cpu_transport = tensor.device.type == "cpu"
         header = torch.tensor(
             [
@@ -501,151 +515,235 @@ def _send_linear_attention_cache_layer(
         raise TypeError(
             f"Target cache layer {layer_idx} is not a linear-attention cache."
         )
-    conv_states = (
-        layer.conv_states if layer.is_conv_states_initialized else None
-    )
-    recurrent_states = (
-        layer.recurrent_states
-        if layer.is_recurrent_states_initialized
-        else None
-    )
-    _send_optional_cache_tensor(
-        tensor=conv_states,
+    number_of_states = int(getattr(layer, "number_of_states", 1))
+    if number_of_states < 1:
+        raise ValueError(
+            f"Linear-attention layer {layer_idx} has no cache states."
+        )
+    if bool(getattr(layer, "record_past", False)):
+        raise ValueError(
+            "Native Qwen3.6 CP does not support record_past linear-attention "
+            f"cache state at layer {layer_idx}."
+        )
+
+    payloads = []
+    for state_idx in range(number_of_states):
+        conv_states = _get_linear_attention_cache_state(
+            layer=layer,
+            state_name="conv_states",
+            state_idx=state_idx,
+        )
+        recurrent_states = _get_linear_attention_cache_state(
+            layer=layer,
+            state_name="recurrent_states",
+            state_idx=state_idx,
+        )
+        if conv_states is None or recurrent_states is None:
+            raise RuntimeError(
+                "Missing Qwen3.6 linear-attention state for layer "
+                f"{layer_idx}, state {state_idx}."
+            )
+        if not _linear_attention_state_is_present(
+            layer=layer,
+            state_idx=state_idx,
+        ):
+            raise RuntimeError(
+                "Qwen3.6 linear-attention state is initialized but not marked "
+                f"as previous state for layer {layer_idx}, state {state_idx}."
+            )
+        _validate_optional_cache_tensor(conv_states)
+        _validate_optional_cache_tensor(recurrent_states)
+        payloads.append((conv_states.contiguous(), recurrent_states.contiguous()))
+
+    # The receiver drains the advertised payload count before validating its
+    # local cache layout.  A configuration mismatch therefore fails cleanly
+    # instead of leaving the sender blocked halfway through the protocol.
+    dist.send(
+        torch.tensor([number_of_states], dtype=torch.int64),
         dst=dst,
-        gpu_group=gpu_group,
-        cpu_group=cpu_group,
+        group=cpu_group,
     )
-    _send_optional_cache_tensor(
-        tensor=recurrent_states,
-        dst=dst,
-        gpu_group=gpu_group,
-        cpu_group=cpu_group,
-    )
+    for conv_states, recurrent_states in payloads:
+        _send_optional_cache_tensor(
+            tensor=conv_states,
+            dst=dst,
+            gpu_group=gpu_group,
+            cpu_group=cpu_group,
+        )
+        _send_optional_cache_tensor(
+            tensor=recurrent_states,
+            dst=dst,
+            gpu_group=gpu_group,
+            cpu_group=cpu_group,
+        )
+
+
+def _get_linear_attention_cache_state(*, layer, state_name: str, state_idx: int):
+    states = getattr(layer, state_name)
+    initialized = getattr(layer, f"is_{state_name}_initialized")
+    if isinstance(states, dict):
+        if not isinstance(initialized, dict):
+            raise TypeError(
+                f"{state_name} and is_{state_name}_initialized must use the "
+                "same container type."
+            )
+        state = (
+            states.get(int(state_idx))
+            if initialized.get(int(state_idx), False)
+            else None
+        )
+    else:
+        if int(state_idx) != 0:
+            raise ValueError(
+                f"Legacy scalar {state_name} cannot provide state {state_idx}."
+            )
+        state = states if bool(initialized) else None
+    if state is not None and not isinstance(state, torch.Tensor):
+        raise TypeError(
+            f"Linear-attention {state_name}[{state_idx}] must be a Tensor or "
+            f"None, got {type(state)!r}."
+        )
+    return state
+
+
+def _restore_linear_attention_cache_state(
+    *, layer, state_name: str, state_idx: int, tensor: torch.Tensor
+):
+    states = getattr(layer, state_name)
+    initialized_name = f"is_{state_name}_initialized"
+    initialized = getattr(layer, initialized_name)
+    init_kwarg = state_name
+
+    if isinstance(states, dict):
+        if not isinstance(initialized, dict):
+            raise TypeError(
+                f"{state_name} and {initialized_name} must use the same "
+                "container type."
+            )
+        if not initialized.get(int(state_idx), False):
+            layer.lazy_initialization(
+                **{init_kwarg: tensor, "state_idx": int(state_idx)}
+            )
+        restored = getattr(layer, state_name).get(int(state_idx))
+    else:
+        if int(state_idx) != 0:
+            raise ValueError(
+                f"Legacy scalar {state_name} cannot restore state {state_idx}."
+            )
+        if not bool(initialized):
+            layer.lazy_initialization(**{init_kwarg: tensor})
+        restored = getattr(layer, state_name)
+
+    if not isinstance(restored, torch.Tensor):
+        raise RuntimeError(
+            f"Failed to initialize linear-attention {state_name}[{state_idx}]."
+        )
+    if restored.shape != tensor.shape:
+        raise RuntimeError(
+            f"Received linear-attention {state_name}[{state_idx}] has a "
+            f"different shape: {tensor.shape} versus {restored.shape}."
+        )
+    if restored.dtype != tensor.dtype:
+        raise RuntimeError(
+            f"Received linear-attention {state_name}[{state_idx}] has a "
+            f"different dtype: {tensor.dtype} versus {restored.dtype}."
+        )
+    restored.copy_(tensor)
+
+
+def _mark_linear_attention_state_present(*, layer, state_idx: int):
+    has_previous_state = layer.has_previous_state
+    if isinstance(has_previous_state, dict):
+        has_previous_state[int(state_idx)] = True
+    else:
+        if int(state_idx) != 0:
+            raise ValueError(
+                "Legacy scalar has_previous_state cannot mark state "
+                f"{state_idx}."
+            )
+        layer.has_previous_state = True
+
+
+def _linear_attention_state_is_present(*, layer, state_idx: int):
+    has_previous_state = layer.has_previous_state
+    if isinstance(has_previous_state, dict):
+        return bool(has_previous_state.get(int(state_idx), False))
+    if int(state_idx) != 0:
+        raise ValueError(
+            "Legacy scalar has_previous_state cannot read state "
+            f"{state_idx}."
+        )
+    return bool(has_previous_state)
 
 
 def _recv_linear_attention_cache_layer(
     *, cache, layer_idx: int, src, device, gpu_group, cpu_group
 ):
-    conv_states = _recv_optional_cache_tensor(
-        src=src,
-        device=device,
-        gpu_group=gpu_group,
-        cpu_group=cpu_group,
-    )
-    recurrent_states = _recv_optional_cache_tensor(
-        src=src,
-        device=device,
-        gpu_group=gpu_group,
-        cpu_group=cpu_group,
-    )
-    if conv_states is None or recurrent_states is None:
-        raise RuntimeError(
-            f"Missing Qwen3.6 linear-attention state for layer {layer_idx}."
+    remote_state_count = torch.empty(1, dtype=torch.int64)
+    dist.recv(remote_state_count, src=src, group=cpu_group)
+    remote_state_count = int(remote_state_count.item())
+    if remote_state_count < 1 or remote_state_count > 1024:
+        raise ValueError(
+            "Received invalid linear-attention cache state count "
+            f"{remote_state_count} for layer {layer_idx}."
         )
+
+    payloads = []
+    for _state_idx in range(remote_state_count):
+        conv_states = _recv_optional_cache_tensor(
+            src=src,
+            device=device,
+            gpu_group=gpu_group,
+            cpu_group=cpu_group,
+        )
+        recurrent_states = _recv_optional_cache_tensor(
+            src=src,
+            device=device,
+            gpu_group=gpu_group,
+            cpu_group=cpu_group,
+        )
+        payloads.append((conv_states, recurrent_states))
+
     layer = cache.layers[int(layer_idx)]
     if not hasattr(layer, "is_conv_states_initialized"):
         raise TypeError(
             f"Target cache layer {layer_idx} is not a linear-attention cache."
         )
-    if not layer.is_conv_states_initialized:
-        layer.lazy_initialization(conv_states=conv_states)
-    if not layer.is_recurrent_states_initialized:
-        layer.lazy_initialization(recurrent_states=recurrent_states)
-    if layer.conv_states.shape != conv_states.shape:
+    number_of_states = int(getattr(layer, "number_of_states", 1))
+    if number_of_states != remote_state_count:
         raise RuntimeError(
-            "Received linear-attention conv state has a different shape: "
-            f"{conv_states.shape} versus {layer.conv_states.shape}."
+            "Linear-attention cache state-count mismatch for layer "
+            f"{layer_idx}: received {remote_state_count}, expected "
+            f"{number_of_states}."
         )
-    if layer.recurrent_states.shape != recurrent_states.shape:
-        raise RuntimeError(
-            "Received linear-attention recurrent state has a different shape: "
-            f"{recurrent_states.shape} versus {layer.recurrent_states.shape}."
+    if bool(getattr(layer, "record_past", False)):
+        raise ValueError(
+            "Native Qwen3.6 CP does not support record_past linear-attention "
+            f"cache state at layer {layer_idx}."
         )
-    layer.conv_states.copy_(conv_states)
-    layer.recurrent_states.copy_(recurrent_states)
-    layer.has_previous_state = True
 
-
-def _send_target_cache_state(*, cache, dst, gpu_group, cpu_group):
-    for layer in cache.layers:
-        if hasattr(layer, "conv_states") or hasattr(
-            layer, "is_conv_states_initialized"
-        ):
-            conv_states = (
-                getattr(layer, "conv_states", None)
-                if getattr(layer, "is_conv_states_initialized", False)
-                else None
+    for state_idx, (conv_states, recurrent_states) in enumerate(payloads):
+        if conv_states is None or recurrent_states is None:
+            raise RuntimeError(
+                "Missing Qwen3.6 linear-attention state for layer "
+                f"{layer_idx}, state {state_idx}."
             )
-            recurrent_states = (
-                getattr(layer, "recurrent_states", None)
-                if getattr(layer, "is_recurrent_states_initialized", False)
-                else None
-            )
-            _send_optional_cache_tensor(
-                tensor=conv_states,
-                dst=dst,
-                gpu_group=gpu_group,
-                cpu_group=cpu_group,
-            )
-            _send_optional_cache_tensor(
-                tensor=recurrent_states,
-                dst=dst,
-                gpu_group=gpu_group,
-                cpu_group=cpu_group,
-            )
-        else:
-            keys = (
-                getattr(layer, "keys", None)
-                if getattr(layer, "is_initialized", False)
-                else None
-            )
-            values = (
-                getattr(layer, "values", None)
-                if getattr(layer, "is_initialized", False)
-                else None
-            )
-            _send_optional_cache_tensor(
-                tensor=keys,
-                dst=dst,
-                gpu_group=gpu_group,
-                cpu_group=cpu_group,
-            )
-            _send_optional_cache_tensor(
-                tensor=values,
-                dst=dst,
-                gpu_group=gpu_group,
-                cpu_group=cpu_group,
-            )
-
-
-def _recv_target_cache_state(
-    *, cache, src, device, gpu_group, cpu_group
-):
-    for layer in cache.layers:
-        first = _recv_optional_cache_tensor(
-            src=src,
-            device=device,
-            gpu_group=gpu_group,
-            cpu_group=cpu_group,
+        _restore_linear_attention_cache_state(
+            layer=layer,
+            state_name="conv_states",
+            state_idx=state_idx,
+            tensor=conv_states,
         )
-        second = _recv_optional_cache_tensor(
-            src=src,
-            device=device,
-            gpu_group=gpu_group,
-            cpu_group=cpu_group,
+        _restore_linear_attention_cache_state(
+            layer=layer,
+            state_name="recurrent_states",
+            state_idx=state_idx,
+            tensor=recurrent_states,
         )
-        if hasattr(layer, "is_conv_states_initialized"):
-            if first is not None:
-                layer.lazy_initialization(conv_states=first)
-                layer.conv_states.copy_(first)
-                layer.has_previous_state = True
-            if second is not None:
-                layer.lazy_initialization(recurrent_states=second)
-                layer.recurrent_states.copy_(second)
-        elif first is not None:
-            layer.lazy_initialization(first, second)
-            layer.keys = first
-            layer.values = second
+        _mark_linear_attention_state_present(
+            layer=layer,
+            state_idx=state_idx,
+        )
 
 
 def _split_linear_attention_mask(attention_mask, split_size: int):
