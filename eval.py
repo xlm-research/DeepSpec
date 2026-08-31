@@ -7,6 +7,8 @@ from deepspec.eval.dspark import (
     Gemma4DSparkEvaluator,
     Qwen3DSparkEvaluator,
     Qwen3_6DSparkEvaluator,
+    Qwen3_8DSparkEvaluator,
+    Qwen3_8DFlash2Evaluator,
 )
 from deepspec.eval.eagle3 import Gemma4Eagle3Evaluator, Qwen3Eagle3Evaluator
 from deepspec.data.parser import parse_media_uri_map_entries
@@ -15,6 +17,9 @@ from deepspec.utils import CustomJSONEncoder
 EVALUATORS = {
     "Qwen3DSparkModel": Qwen3DSparkEvaluator,
     "Qwen3_6DSparkModel": Qwen3_6DSparkEvaluator,
+    "Qwen3_8DSparkModel": Qwen3_8DSparkEvaluator,
+    "DFlash2DraftModel": Qwen3_8DFlash2Evaluator,
+    "Qwen3_8DFlash2Model": Qwen3_8DFlash2Evaluator,
     "Gemma4DSparkModel": Gemma4DSparkEvaluator,
     "Qwen3Eagle3Model": Qwen3Eagle3Evaluator,
     "Gemma4Eagle3Model": Gemma4Eagle3Evaluator,
@@ -33,17 +38,116 @@ TASKS = [
     ("arena-hard-v2", 500),
 ]
 
+
+def _non_negative_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"Expected a non-negative integer, got {value!r}."
+        ) from exc
+    if parsed < 0:
+        raise argparse.ArgumentTypeError(
+            f"Expected a non-negative integer, got {value!r}."
+        )
+    return parsed
+
+
+def _non_negative_float(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"Expected a non-negative number, got {value!r}."
+        ) from exc
+    if parsed < 0.0:
+        raise argparse.ArgumentTypeError(
+            f"Expected a non-negative number, got {value!r}."
+        )
+    return parsed
+
+
+def _top_p_float(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"Expected top-p in (0, 1], got {value!r}."
+        ) from exc
+    if not 0.0 < parsed <= 1.0:
+        raise argparse.ArgumentTypeError(
+            f"Expected top-p in (0, 1], got {value!r}."
+        )
+    return parsed
+
+
+def _closed_unit_float(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"Expected a number in [0, 1], got {value!r}."
+        ) from exc
+    if not 0.0 <= parsed <= 1.0:
+        raise argparse.ArgumentTypeError(
+            f"Expected a number in [0, 1], got {value!r}."
+        )
+    return parsed
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--target_name_or_path", type=str, required=True)
     parser.add_argument("--draft_name_or_path",type=str,required=True)
-    parser.add_argument("--max-new-tokens", type=int, default=2048)
-    parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument("--max-new-tokens", type=_non_negative_int, default=2048)
+    parser.add_argument("--temperature", type=_non_negative_float, default=1.0)
+    parser.add_argument(
+        "--top-k",
+        type=_non_negative_int,
+        default=0,
+        help="Target-distribution top-k filter; 0 keeps the full vocabulary.",
+    )
+    parser.add_argument(
+        "--top-p",
+        type=_top_p_float,
+        default=1.0,
+        help="Target-distribution nucleus filter; 1.0 disables filtering.",
+    )
     parser.add_argument(
         "--confidence-threshold",
-        type=float,
+        type=_closed_unit_float,
         default=0.0,
         help=("Confidence-head early-stop threshold. Confidence calibration metrics are collected only when this is 0.0."),
+    )
+    parser.add_argument(
+        "--scheduler-mode",
+        choices=("static", "hardware-aware"),
+        default="static",
+        help=(
+            "Use the diagnostic static confidence threshold or the DSpark "
+            "hardware-aware prefix scheduler."
+        ),
+    )
+    parser.add_argument(
+        "--confidence-calibration-json",
+        type=str,
+        default=None,
+        help="Sequential Temperature Scaling artifact for confidence scheduling.",
+    )
+    parser.add_argument(
+        "--sps-profile-json",
+        type=str,
+        default=None,
+        help="Hardware SPS(B) profile required by --scheduler-mode hardware-aware.",
+    )
+    parser.add_argument(
+        "--confidence-observations-jsonl",
+        type=str,
+        default=None,
+        help=(
+            "Optional raw conditional-logit/prefix-label output for fitting "
+            "STS; requires static scheduling with threshold 0."
+        ),
     )
     parser.add_argument("--tensorboard-dir", type=str, default=None)
     parser.add_argument("--step", type=int, default=None,help=("step for tensorboard logging"),)

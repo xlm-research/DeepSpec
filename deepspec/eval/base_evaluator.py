@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable
@@ -133,7 +133,15 @@ def build_results_table(
 
     table = PrettyTable()
     max_positions = max(
-        (len(metrics["accept_rates_by_position"]) for metrics in rows),
+        (
+            len(
+                metrics.get(
+                    "conditional_accept_rates_by_position",
+                    metrics["accept_rates_by_position"],
+                )
+            )
+            for metrics in rows
+        ),
         default=0,
     )
     field_names = [
@@ -143,8 +151,12 @@ def build_results_table(
         "#propose",
         "accept_len",
         "verify_rate",
+        "scheduled_block",
+        "full_block",
     ]
-    field_names.extend(f"accept_rate@{pos_idx}" for pos_idx in range(max_positions))
+    field_names.extend(
+        f"step_accept@{pos_idx}" for pos_idx in range(max_positions)
+    )
     table.field_names = field_names
     table.header = header
 
@@ -164,12 +176,26 @@ def build_results_table(
             f"{metrics['draft_tokens_per_proposal']:.2f}+1",
             f"{metrics['acceptance_length']:.2f}",
             f"{metrics['verify_rate']:.4f}",
+            (
+                f"{float(metrics['scheduled_block_acceptance_rate']):.4f}"
+                if metrics.get("scheduled_block_acceptance_rate") is not None
+                else "-"
+            ),
+            (
+                f"{float(metrics['full_block_acceptance_rate']):.4f}"
+                if metrics.get("full_block_acceptance_rate") is not None
+                else "-"
+            ),
         ]
+        position_rates = metrics.get(
+            "conditional_accept_rates_by_position",
+            metrics["accept_rates_by_position"],
+        )
         row.extend(
             f"{accept_rate:.4f}" if accept_rate is not None else "-"
-            for accept_rate in metrics["accept_rates_by_position"]
+            for accept_rate in position_rates
         )
-        row.extend(["-"] * (max_positions - len(metrics["accept_rates_by_position"])))
+        row.extend(["-"] * (max_positions - len(position_rates)))
         table.add_row(row)
     return table.get_string()
 
@@ -205,6 +231,8 @@ def verify_draft_tokens(
     current_token_ids: torch.Tensor | None = None,
     stop_token_ids: list[int] | None = None,
     target_adapter=None,
+    top_k: int = 0,
+    top_p: float = 1.0,
 ) -> VerificationResult:
     """Verify draft tokens with the target model and rejection sampling."""
     if proposal.draft_token_count > max_proposal_tokens:
@@ -237,7 +265,12 @@ def verify_draft_tokens(
             "target model must return rank-3 logits [B, S, V], "
             f"got ndim={target_output.logits.ndim}."
         )
-    target_probs = logits_to_probs(target_output.logits, float(temperature))
+    target_probs = logits_to_probs(
+        target_output.logits,
+        float(temperature),
+        top_k=int(top_k),
+        top_p=float(top_p),
+    )
     if (
         draft_token_count > 0
         and proposal.draft_probs is not None
@@ -259,7 +292,12 @@ def verify_draft_tokens(
         selected_draft_probs = gather_token_probs(
             proposal.draft_probs,
             proposed_tokens,
-        ).clamp_min(1e-8)
+        )
+        if torch.any(selected_draft_probs <= 0.0):
+            raise ValueError(
+                "Every proposed token must have strictly positive probability "
+                "under DraftProposal.draft_probs."
+            )
         accept_prob = torch.clamp(
             selected_target_probs / selected_draft_probs,
             max=1.0,
@@ -315,6 +353,29 @@ def verify_draft_tokens(
     )
 
 
+def _limit_draft_proposal(
+    proposal: DraftProposal,
+    *,
+    max_draft_tokens: int,
+) -> DraftProposal:
+    """Limit a proposal so every verified token can contribute to the output."""
+    draft_token_count = int(proposal.draft_token_count)
+    limited_count = min(draft_token_count, int(max_draft_tokens))
+    if limited_count == draft_token_count:
+        return proposal
+    draft_probs = (
+        proposal.draft_probs[:, :limited_count, :]
+        if limited_count > 0 and proposal.draft_probs is not None
+        else None
+    )
+    return replace(
+        proposal,
+        draft_token_count=limited_count,
+        verify_input_ids=proposal.verify_input_ids[:, : limited_count + 1],
+        draft_probs=draft_probs,
+    )
+
+
 @torch.inference_mode()
 def generate_decoding_sample(
     *,
@@ -330,6 +391,8 @@ def generate_decoding_sample(
     post_verify: Callable[[DraftProposal, VerificationResult], None] | None = None,
     model_inputs: dict[str, torch.Tensor] | None = None,
     target_adapter=None,
+    top_k: int = 0,
+    top_p: float = 1.0,
 ) -> SimpleNamespace:
     """Speculative-decoding loop.
 
@@ -342,10 +405,23 @@ def generate_decoding_sample(
     """
     assert max_proposal_tokens >= 1
     assert input_ids.size(0) == 1, "only bsz=1 is supported"
+    if int(max_new_tokens) < 0:
+        raise ValueError("max_new_tokens must be non-negative")
 
     device = input_ids.device
     num_input_tokens = input_ids.shape[1]
     max_length = num_input_tokens + int(max_new_tokens)
+    if int(max_new_tokens) == 0:
+        return SimpleNamespace(
+            output_ids=input_ids.clone(),
+            num_input_tokens=num_input_tokens,
+            num_output_tokens=0,
+            acceptance_lengths=[],
+            proposal_lengths=[],
+            accepted_draft_lengths=[],
+            verify_count=0,
+        )
+
     target_adapter = target_adapter or get_target_adapter(target_model)
     if model_inputs is None:
         model_inputs = {"input_ids": input_ids}
@@ -371,7 +447,12 @@ def generate_decoding_sample(
 
     output_ids[:, :num_input_tokens] = input_ids
     output_ids[:, num_input_tokens : num_input_tokens + 1] = sample_from_probs(
-        logits_to_probs(output.logits, float(temperature))
+        logits_to_probs(
+            output.logits,
+            float(temperature),
+            top_k=int(top_k),
+            top_p=float(top_p),
+        )
     )
 
     start = input_ids.shape[1]
@@ -392,6 +473,17 @@ def generate_decoding_sample(
             accepted_draft_lengths=accepted_draft_lengths,
             verify_count=0,
         )
+    if start + 1 >= max_length:
+        output_ids = output_ids[:, :max_length]
+        return SimpleNamespace(
+            output_ids=output_ids,
+            num_input_tokens=num_input_tokens,
+            num_output_tokens=output_ids.shape[1] - num_input_tokens,
+            acceptance_lengths=acceptance_lengths,
+            proposal_lengths=proposal_lengths,
+            accepted_draft_lengths=accepted_draft_lengths,
+            verify_count=0,
+        )
 
     context = init_context(
         initial_output=output,
@@ -400,13 +492,29 @@ def generate_decoding_sample(
         num_input_tokens=num_input_tokens,
     )
 
-    while start < max_length:
+    while start + 1 < max_length:
         proposal = propose(
             context=context,
             output_ids=output_ids,
             position_ids=position_ids,
             start=start,
             stop_token_ids=stop_token_ids,
+        )
+        if int(proposal.draft_token_count) < 0:
+            raise ValueError(
+                "DraftProposal.draft_token_count must be non-negative, "
+                f"got {proposal.draft_token_count}."
+            )
+        if int(proposal.draft_token_count) > max_proposal_tokens:
+            raise ValueError(
+                "DraftProposal.draft_token_count must not exceed "
+                f"max_proposal_tokens={max_proposal_tokens}, "
+                f"got {proposal.draft_token_count}."
+            )
+        remaining_output_tokens = max_length - (start + 1)
+        proposal = _limit_draft_proposal(
+            proposal,
+            max_draft_tokens=max(0, remaining_output_tokens - 1),
         )
         verification = verify_draft_tokens(
             target_model=target_model,
@@ -419,6 +527,8 @@ def generate_decoding_sample(
             current_token_ids=output_ids[:, start : start + 1],
             stop_token_ids=stop_token_ids,
             target_adapter=target_adapter,
+            top_k=int(top_k),
+            top_p=float(top_p),
         )
         if post_verify is not None:
             post_verify(proposal, verification)
@@ -440,6 +550,8 @@ def generate_decoding_sample(
         new_token_ids = output_ids[:, start + 1 : start + accepted_draft_tokens + 2]
         acceptance_lengths.append(accepted_draft_tokens + 1)
         start += accepted_draft_tokens + 1
+        if has_stop_token(new_token_ids, stop_token_ids):
+            break
         past_key_values_target = target_adapter.reconcile_generation_cache(
             target_model=target_model,
             cache=past_key_values_target,
@@ -450,9 +562,6 @@ def generate_decoding_sample(
             draft_token_count=int(proposal.draft_token_count),
         )
         update(context, verification)
-
-        if has_stop_token(new_token_ids, stop_token_ids):
-            break
 
     output_ids = output_ids[:, : min(start + 1, max_length)]
     output_ids = trim_output_ids(output_ids, num_input_tokens, stop_token_ids)
@@ -502,11 +611,24 @@ class BaseEvaluator:
         metric_summary: dict[str, int | list[int]],
     ) -> dict[str, object]:
         proposal_count = int(metric_summary["proposal_count"])
+        proposals_at_pos = metric_summary["proposals_at_pos"]
+        accepted_at_pos = metric_summary["accepted_at_pos"]
+        conditional_opportunities_at_pos = metric_summary[
+            "conditional_opportunities_at_pos"
+        ]
+        assert isinstance(proposals_at_pos, list)
+        assert isinstance(accepted_at_pos, list)
+        assert isinstance(conditional_opportunities_at_pos, list)
+
+        def ratio(numerator: int, denominator: int) -> float | None:
+            if denominator == 0:
+                return None
+            return numerator / denominator
+
         if proposal_count == 0:
             acceptance_length = 0.0
             draft_tokens_per_proposal = 0.0
             verify_rate = 0.0
-            accept_rates_by_position = [None] * self.max_proposal_tokens
         else:
             acceptance_length = (
                 int(metric_summary["acceptance_length_sum"]) / proposal_count
@@ -517,26 +639,75 @@ class BaseEvaluator:
             verify_rate = int(metric_summary["acceptance_length_sum"]) / (
                 int(metric_summary["proposal_length_sum"]) + proposal_count
             )
-            proposals_at_pos = metric_summary["proposals_at_pos"]
-            accepted_at_pos = metric_summary["accepted_at_pos"]
-            assert isinstance(proposals_at_pos, list)
-            assert isinstance(accepted_at_pos, list)
-            accept_rates_by_position = []
-            for pos_idx in range(self.max_proposal_tokens):
-                position_proposal_count = proposals_at_pos[pos_idx]
-                if position_proposal_count == 0:
-                    accept_rates_by_position.append(None)
-                    continue
-                accept_rates_by_position.append(
-                    accepted_at_pos[pos_idx] / position_proposal_count
-                )
+        prefix_accept_rates_by_position = [
+            ratio(accepted_at_pos[pos_idx], proposals_at_pos[pos_idx])
+            for pos_idx in range(self.max_proposal_tokens)
+        ]
+        conditional_accept_rates_by_position = [
+            ratio(
+                accepted_at_pos[pos_idx],
+                conditional_opportunities_at_pos[pos_idx],
+            )
+            for pos_idx in range(self.max_proposal_tokens)
+        ]
+        scheduled_block_count = int(metric_summary["scheduled_block_count"])
+        scheduled_block_accepted_count = int(
+            metric_summary["scheduled_block_accepted_count"]
+        )
+        full_block_proposal_count = int(
+            metric_summary["full_block_proposal_count"]
+        )
+        full_block_accepted_count = int(
+            metric_summary["full_block_accepted_count"]
+        )
+        raw_counts = {
+            "sample_count": int(metric_summary["sample_count"]),
+            "proposal_count": proposal_count,
+            "acceptance_length_sum": int(
+                metric_summary["acceptance_length_sum"]
+            ),
+            "proposal_length_sum": int(metric_summary["proposal_length_sum"]),
+            "proposals_at_pos": list(proposals_at_pos),
+            "accepted_at_pos": list(accepted_at_pos),
+            "conditional_opportunities_at_pos": list(
+                conditional_opportunities_at_pos
+            ),
+            "scheduled_block_count": scheduled_block_count,
+            "scheduled_block_accepted_count": scheduled_block_accepted_count,
+            "full_block_proposal_count": full_block_proposal_count,
+            "full_block_accepted_count": full_block_accepted_count,
+        }
         return {
             "dataset": dataset_name,
             "num_samples": int(metric_summary["sample_count"]),
+            "proposal_count": proposal_count,
             "draft_tokens_per_proposal": draft_tokens_per_proposal,
             "acceptance_length": acceptance_length,
             "verify_rate": verify_rate,
-            "accept_rates_by_position": accept_rates_by_position,
+            # Compatibility alias: historically this field measured prefix
+            # survival among proposals scheduled through each position.
+            "accept_rates_by_position": prefix_accept_rates_by_position,
+            "prefix_accept_rates_by_position": prefix_accept_rates_by_position,
+            "conditional_accept_rates_by_position": (
+                conditional_accept_rates_by_position
+            ),
+            "scheduled_block_acceptance_rate": ratio(
+                scheduled_block_accepted_count,
+                scheduled_block_count,
+            ),
+            "full_block_acceptance_rate": ratio(
+                full_block_accepted_count,
+                full_block_proposal_count,
+            ),
+            "full_block_schedule_rate": ratio(
+                full_block_proposal_count,
+                proposal_count,
+            ),
+            "full_block_completion_rate": ratio(
+                full_block_accepted_count,
+                proposal_count,
+            ),
+            "raw_counts": raw_counts,
         }
 
     def run_dataset(
@@ -611,11 +782,20 @@ class BaseEvaluator:
             "proposal_length_sum": 0,
             "proposals_at_pos": [0] * self.max_proposal_tokens,
             "accepted_at_pos": [0] * self.max_proposal_tokens,
+            "conditional_opportunities_at_pos": [0] * self.max_proposal_tokens,
+            "scheduled_block_count": 0,
+            "scheduled_block_accepted_count": 0,
+            "full_block_proposal_count": 0,
+            "full_block_accepted_count": 0,
         }
         proposals_at_pos = metric_summary["proposals_at_pos"]
         accepted_at_pos = metric_summary["accepted_at_pos"]
+        conditional_opportunities_at_pos = metric_summary[
+            "conditional_opportunities_at_pos"
+        ]
         assert isinstance(proposals_at_pos, list)
         assert isinstance(accepted_at_pos, list)
+        assert isinstance(conditional_opportunities_at_pos, list)
 
         for response in responses:
             acceptance_lengths = getattr(response, "acceptance_lengths", None)
@@ -640,13 +820,24 @@ class BaseEvaluator:
                 proposal_lengths,
                 accepted_draft_lengths,
             ):
+                proposal_length = int(proposal_length)
+                accepted_draft_length = int(accepted_draft_length)
                 metric_summary["proposal_count"] += 1
                 metric_summary["acceptance_length_sum"] += int(acceptance_length)
-                metric_summary["proposal_length_sum"] += int(proposal_length)
-                accepted_draft_length = int(accepted_draft_length)
+                metric_summary["proposal_length_sum"] += proposal_length
+                if proposal_length > 0:
+                    metric_summary["scheduled_block_count"] += 1
+                    if accepted_draft_length >= proposal_length:
+                        metric_summary["scheduled_block_accepted_count"] += 1
+                if proposal_length == self.max_proposal_tokens:
+                    metric_summary["full_block_proposal_count"] += 1
+                    if accepted_draft_length >= proposal_length:
+                        metric_summary["full_block_accepted_count"] += 1
                 for pos_idx in range(self.max_proposal_tokens):
                     if proposal_length > pos_idx:
                         proposals_at_pos[pos_idx] += 1
+                        if accepted_draft_length >= pos_idx:
+                            conditional_opportunities_at_pos[pos_idx] += 1
                     if accepted_draft_length > pos_idx:
                         accepted_at_pos[pos_idx] += 1
 
@@ -656,6 +847,10 @@ class BaseEvaluator:
                 int(metric_summary["proposal_count"]),
                 int(metric_summary["acceptance_length_sum"]),
                 int(metric_summary["proposal_length_sum"]),
+                int(metric_summary["scheduled_block_count"]),
+                int(metric_summary["scheduled_block_accepted_count"]),
+                int(metric_summary["full_block_proposal_count"]),
+                int(metric_summary["full_block_accepted_count"]),
             ],
             device=self.device,
             dtype=torch.int64,
@@ -663,7 +858,9 @@ class BaseEvaluator:
         dist.all_reduce(scalar_tensor, op=dist.ReduceOp.SUM)
 
         position_tensor = torch.tensor(
-            proposals_at_pos + accepted_at_pos,
+            proposals_at_pos
+            + accepted_at_pos
+            + conditional_opportunities_at_pos,
             device=self.device,
             dtype=torch.int64,
         )
@@ -674,11 +871,18 @@ class BaseEvaluator:
             "proposal_count": int(scalar_tensor[1].item()),
             "acceptance_length_sum": int(scalar_tensor[2].item()),
             "proposal_length_sum": int(scalar_tensor[3].item()),
+            "scheduled_block_count": int(scalar_tensor[4].item()),
+            "scheduled_block_accepted_count": int(scalar_tensor[5].item()),
+            "full_block_proposal_count": int(scalar_tensor[6].item()),
+            "full_block_accepted_count": int(scalar_tensor[7].item()),
             "proposals_at_pos": position_tensor[
                 : self.max_proposal_tokens
             ].tolist(),
             "accepted_at_pos": position_tensor[
-                self.max_proposal_tokens :
+                self.max_proposal_tokens : 2 * self.max_proposal_tokens
+            ].tolist(),
+            "conditional_opportunities_at_pos": position_tensor[
+                2 * self.max_proposal_tokens :
             ].tolist(),
         }
 
@@ -706,12 +910,38 @@ class BaseEvaluator:
                 float(metrics["verify_rate"]),
                 global_step=self.args.step,
             )
-            for pos_idx, accept_rate in enumerate(metrics["accept_rates_by_position"]):
+            for pos_idx, accept_rate in enumerate(
+                metrics["prefix_accept_rates_by_position"]
+            ):
                 if accept_rate is None:
                     continue
                 writer.add_scalar(
-                    f"eval/{dataset_name}/accept_rate@{pos_idx}",
+                    f"eval/{dataset_name}/prefix_accept_rate@{pos_idx}",
                     float(accept_rate),
+                    global_step=self.args.step,
+                )
+            for pos_idx, accept_rate in enumerate(
+                metrics["conditional_accept_rates_by_position"]
+            ):
+                if accept_rate is None:
+                    continue
+                writer.add_scalar(
+                    f"eval/{dataset_name}/conditional_accept_rate@{pos_idx}",
+                    float(accept_rate),
+                    global_step=self.args.step,
+                )
+            for metric_name in (
+                "scheduled_block_acceptance_rate",
+                "full_block_acceptance_rate",
+                "full_block_schedule_rate",
+                "full_block_completion_rate",
+            ):
+                value = metrics[metric_name]
+                if value is None:
+                    continue
+                writer.add_scalar(
+                    f"eval/{dataset_name}/{metric_name}",
+                    float(value),
                     global_step=self.args.step,
                 )
         writer.close()
@@ -727,6 +957,90 @@ class BaseEvaluator:
             ),
             flush=True,
         )
+
+    def write_results_json(self) -> None:
+        results_json = getattr(self.args, "results_json", None)
+        if dist.get_rank() != 0 or results_json is None:
+            return
+        output_path = Path(results_json).expanduser().resolve()
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "schema_version": 2,
+            "target_model": self.args.target_name_or_path,
+            "draft_model": self.args.draft_name_or_path,
+            "temperature": float(self.args.temperature),
+            "top_k": int(getattr(self.args, "top_k", 0)),
+            "top_p": float(getattr(self.args, "top_p", 1.0)),
+            "confidence_threshold": float(
+                getattr(self.args, "confidence_threshold", 0.0)
+            ),
+            "confidence_scheduler": {
+                "mode": str(getattr(self.args, "scheduler_mode", "static")),
+                "calibration_json": getattr(
+                    self.args,
+                    "confidence_calibration_json",
+                    None,
+                ),
+                "sequential_temperatures": getattr(
+                    self.args,
+                    "confidence_temperatures",
+                    None,
+                ),
+                "sps_profile_json": getattr(
+                    self.args,
+                    "sps_profile_json",
+                    None,
+                ),
+                "steps_per_second": getattr(self.args, "sps_profile", None),
+                "observations_jsonl": getattr(
+                    self.args,
+                    "confidence_observations_jsonl",
+                    None,
+                ),
+            },
+            "max_new_tokens": int(self.args.max_new_tokens),
+            "max_proposal_tokens": self.max_proposal_tokens,
+            "seed": int(self.args.seed),
+            "tasks": [
+                {"dataset": dataset, "max_samples": max_samples}
+                for dataset, max_samples in self.tasks
+            ],
+            "metric_definitions": {
+                "accept_rates_by_position": (
+                    "Compatibility alias of prefix_accept_rates_by_position."
+                ),
+                "prefix_accept_rates_by_position": (
+                    "P(tokens 0..k accepted | proposal scheduled position k)."
+                ),
+                "conditional_accept_rates_by_position": (
+                    "P(token k accepted | position k scheduled and tokens "
+                    "0..k-1 accepted)."
+                ),
+                "scheduled_block_acceptance_rate": (
+                    "Fraction of positive-length proposals for which every "
+                    "scheduled draft token was accepted."
+                ),
+                "full_block_acceptance_rate": (
+                    "Fraction of max-length proposals for which every draft "
+                    "token was accepted."
+                ),
+                "full_block_schedule_rate": (
+                    "Fraction of verification rounds that scheduled the "
+                    "configured maximum proposal length."
+                ),
+                "full_block_completion_rate": (
+                    "Fraction of all verification rounds that accepted a "
+                    "configured maximum-length proposal."
+                ),
+            },
+            "metrics": self.metrics_rows,
+        }
+        tmp_path = output_path.with_name(f"{output_path.name}.tmp")
+        with tmp_path.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, output_path)
 
     def print_dataset_result(self, metrics_row: dict[str, object]) -> None:
         if dist.get_rank() != 0:

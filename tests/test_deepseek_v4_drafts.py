@@ -22,6 +22,7 @@ from deepspec.trainer.base_trainer import (
     _compute_data_batch_schedule,
     _release_target_features,
 )
+from deepspec.trainer.dflash2_trainer import DeepseekV4DFlash2Trainer
 from deepspec.trainer.dspark_trainer import DeepseekV4DSparkTrainer
 from deepspec.utils import load_config
 
@@ -319,6 +320,40 @@ class DeepseekV4DraftModelTest(unittest.TestCase):
         trainer._data_batch_phase = "draft_training"
         with self.assertRaisesRegex(RuntimeError, "only allowed"):
             trainer.prepare_online_target_batch({})
+
+    def test_dflash2_honors_isolated_target_and_draft_phases(self):
+        class FakeOnlineTarget:
+            def forward_training_batch(self, _batch):
+                raise AssertionError("target forward must not run in draft phase")
+
+        trainer = object.__new__(DeepseekV4DFlash2Trainer)
+        trainer.online_target_enabled = True
+        trainer.online_target = FakeOnlineTarget()
+        trainer.data_batch_micro_batches = (1,)
+        trainer._data_batch_phase = "draft_training"
+        trainer.args = SimpleNamespace(
+            model=load_config("config/dflash2/dflash2_deepseek_v4.py").model
+        )
+        trainer.forward_model = lambda **_kwargs: object()
+
+        with self.assertRaisesRegex(RuntimeError, "precomputed target hidden"):
+            trainer.run_batch({"input_ids": torch.ones(1, 1, dtype=torch.long)})
+
+        batch = {
+            "input_ids": torch.ones(1, 4, dtype=torch.long),
+            "loss_mask": torch.ones(1, 4, dtype=torch.bool),
+            "target_hidden_states": torch.randn(1, 4, 6),
+            "target_last_hidden_states": torch.randn(1, 4, 2),
+            "context_start": torch.tensor([0]),
+            "context_len": torch.tensor([4]),
+            "seq_len": torch.tensor([4]),
+        }
+        with patch(
+            "deepspec.trainer.dflash2_trainer.compute_dflash2_loss",
+            return_value=torch.ones((), requires_grad=True),
+        ):
+            trainer.run_batch(batch)
+        self.assertNotIn("target_last_hidden_states", batch)
 
     def test_interrupted_data_batch_keeps_its_disk_cache(self):
         class FakeOnlineTarget:

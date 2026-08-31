@@ -16,6 +16,7 @@ class ChatTemplate:
     end_of_turn_token: str | None
     assistant_loss_prefix: str | None = None
     tokenizer_chat_template: str | None = None
+    include_end_of_turn_in_loss: bool = True
 
 
 class TemplateRegistry:
@@ -57,6 +58,19 @@ TEMPLATE_REGISTRY.register(
             "{% elif message['role'] == 'assistant' %}<｜Assistant｜></think>"
             "{{ message['content'] }}{{ eos_token }}{% endif %}{% endfor %}"
         ),
+    ),
+)
+
+TEMPLATE_REGISTRY.register(
+    "glm5_next",
+    ChatTemplate(
+        assistant_header="<|assistant|>",
+        user_header="<|user|>",
+        system_prompt=None,
+        # GLM-5.3 separates turns with the next role marker rather than an EOS.
+        end_of_turn_token="<|user|>",
+        assistant_loss_prefix="<think></think>",
+        include_end_of_turn_in_loss=False,
     ),
 )
 
@@ -196,11 +210,13 @@ class GeneralParser:
         self.system_prompt = chat_template.system_prompt
         self.assistant_loss_prefix = chat_template.assistant_loss_prefix or ""
         self.assistant_message_separator = chat_template.assistant_header or ""
+        end_of_turn = re.escape(chat_template.end_of_turn_token or "")
+        if chat_template.include_end_of_turn_in_loss:
+            content_pattern = r"([\s\S]*?(?:" + end_of_turn + "|$))"
+        else:
+            content_pattern = r"([\s\S]*?)(?:" + end_of_turn + "|$)"
         self.assistant_pattern = (
-            re.escape(self.assistant_message_separator)
-            + r"([\s\S]*?(?:"
-            + re.escape(chat_template.end_of_turn_token or "")
-            + "|$))"
+            re.escape(self.assistant_message_separator) + content_pattern
         )
 
     def parse(

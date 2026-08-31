@@ -611,7 +611,13 @@ class BaseTrainer:
 
         # Training only uses the target checkpoint to initialize frozen draft
         # embeddings and lm_head weights.
-        if str(target_config.model_type) == "deepseek_v4":
+        target_model_path = os.fspath(model_args.target_model_name_or_path)
+        has_local_safetensors = os.path.isfile(
+            os.path.join(target_model_path, "model.safetensors.index.json")
+        ) or os.path.isfile(os.path.join(target_model_path, "model.safetensors"))
+        if str(target_config.model_type) in ("deepseek_v4", "glm5_next") or (
+            str(target_config.model_type) == "qwen3_5" and has_local_safetensors
+        ):
             embed_weight = _load_checkpoint_tensor(
                 model_args.target_model_name_or_path,
                 (

@@ -112,7 +112,7 @@ def main(local_rank):
 
 
 if __name__ == "__main__":
-    if os.path.exists(".git"):
+    if os.path.exists(".git") and int(os.environ.get("RANK", "0")) == 0:
         print("git status:", "\n\n".join(get_git_sha(detail_info=True)))
         print("git diff:", get_git_diff())
     if "LOCAL_RANK" in os.environ:

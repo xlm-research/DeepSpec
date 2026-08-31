@@ -185,6 +185,8 @@ class Qwen3Eagle3Evaluator(BaseEvaluator):
             init_context=self._init_context,
             propose=self._propose,
             update=self._update,
+            top_k=int(getattr(self.args, "top_k", 0)),
+            top_p=float(getattr(self.args, "top_p", 1.0)),
         )
 
 

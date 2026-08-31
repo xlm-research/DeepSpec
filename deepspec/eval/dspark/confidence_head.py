@@ -20,6 +20,7 @@ RELIABILITY_PLOT_FILENAME = "reliability_diagram.png"
 class ConfidenceProposal(Protocol):
     draft_token_count: int
     confidence_logits: torch.Tensor | None
+    confidence_probs: torch.Tensor | None
 
 
 def model_display_name(path: str) -> str:
@@ -322,6 +323,10 @@ class ConfidenceHeadRecorder:
         tensorboard_dir: str | None,
         step: int | None,
         artifact_root: Path | None,
+        observation_path: str | None = None,
+        observation_metadata: dict | None = None,
+        rank: int = 0,
+        world_size: int = 1,
     ):
         self.device = device
         self.max_proposal_tokens = int(max_proposal_tokens)
@@ -333,14 +338,59 @@ class ConfidenceHeadRecorder:
         self.artifact_root = artifact_root
         self.dataset_metrics: PerPositionConfidenceMetrics | None = None
         self.rows: list[dict] = []
+        self.observation_path = (
+            self._ranked_observation_path(
+                Path(observation_path).expanduser().resolve(),
+                rank=int(rank),
+                world_size=int(world_size),
+            )
+            if observation_path is not None
+            else None
+        )
+        self._observation_handle = None
+        self._observation_dataset: str | None = None
+        self.observation_metadata = dict(observation_metadata or {})
+        if self.observation_path is not None and not self.observation_metadata:
+            raise ValueError(
+                "observation_metadata is required when writing confidence "
+                "observations."
+            )
 
-    def start(self) -> None:
+    @staticmethod
+    def _ranked_observation_path(
+        path: Path,
+        *,
+        rank: int,
+        world_size: int,
+    ) -> Path:
+        if world_size <= 1:
+            return path
+        return path.with_name(
+            f"{path.stem}.rank{rank:05d}{path.suffix or '.jsonl'}"
+        )
+
+    def start(self, dataset_name: str | None = None) -> None:
         self.dataset_metrics = PerPositionConfidenceMetrics(
             block_size=self.max_proposal_tokens,
             num_coarse_bins=self.num_bins,
             num_fine_bins=self.num_fine_bins,
             device=self.device,
         )
+        self._observation_dataset = dataset_name
+        if self.observation_path is not None and self._observation_handle is None:
+            self.observation_path.parent.mkdir(parents=True, exist_ok=True)
+            self._observation_handle = self.observation_path.open(
+                "w",
+                encoding="utf-8",
+            )
+            metadata = {
+                "record_type": "metadata",
+                "schema_version": 1,
+                **self.observation_metadata,
+            }
+            self._observation_handle.write(
+                json.dumps(metadata, ensure_ascii=False) + "\n"
+            )
 
     def observe(
         self,
@@ -354,15 +404,34 @@ class ConfidenceHeadRecorder:
         effective_length = int(verification.effective_proposal_length)
         if effective_length <= 0:
             return
-        confidence_logits = proposal.confidence_logits
-        assert confidence_logits is not None
+        confidence_probs = proposal.confidence_probs
+        if confidence_probs is None:
+            confidence_logits = proposal.confidence_logits
+            assert confidence_logits is not None
+            confidence_probs = torch.sigmoid(confidence_logits)
         assert verification.accept_prefix_mask is not None
+        if self._observation_handle is not None:
+            confidence_logits = proposal.confidence_logits
+            assert confidence_logits is not None
+            observation = {
+                "record_type": "observation",
+                "dataset": self._observation_dataset,
+                "confidence_logits": confidence_logits[
+                    0,
+                    :effective_length,
+                ].detach().float().cpu().tolist(),
+                "prefix_targets": verification.accept_prefix_mask[
+                    0,
+                    :effective_length,
+                ].detach().to(torch.int64).cpu().tolist(),
+            }
+            self._observation_handle.write(
+                json.dumps(observation, ensure_ascii=False) + "\n"
+            )
         # BaseEvaluator.generate_one_sample enforces bsz=1, so this removes
         # only the single-sequence batch dimension. Truncate to
         # effective_proposal_length to skip positions past an accepted EOS.
-        step_probs = torch.sigmoid(
-            confidence_logits[:, :effective_length]
-        ).squeeze(0)
+        step_probs = confidence_probs[:, :effective_length].squeeze(0)
         cumprod_pred = step_probs.to(torch.float64).cumprod(dim=0)
         prefix_label = (
             verification.accept_prefix_mask[:, :effective_length]
@@ -384,6 +453,8 @@ class ConfidenceHeadRecorder:
         dataset_metrics = self.dataset_metrics
         dataset_metrics.all_reduce()
         self.dataset_metrics = None
+        if self._observation_handle is not None:
+            self._observation_handle.flush()
 
         if dist.get_rank() != 0 or int(metric_summary["sample_count"]) == 0:
             return None
@@ -395,6 +466,12 @@ class ConfidenceHeadRecorder:
         )
         self.rows.append(row)
         return row
+
+    def close(self) -> None:
+        if self._observation_handle is None:
+            return
+        self._observation_handle.close()
+        self._observation_handle = None
 
     def build_dataset_row(
         self,

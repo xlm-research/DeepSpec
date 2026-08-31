@@ -3,6 +3,7 @@ from pathlib import Path
 import tempfile
 from types import SimpleNamespace
 import unittest
+from unittest import mock
 
 import torch
 from torch import nn
@@ -30,6 +31,160 @@ from deepspec.data.target_cache_dataset import (
 )
 from deepspec.modeling.target.common import TargetForwardResult
 from deepspec.utils import load_config
+from scripts.data.prepare_target_cache import (
+    _recv_linear_attention_cache_layer,
+    _send_linear_attention_cache_layer,
+)
+
+
+class TargetCacheStateTransportTest(unittest.TestCase):
+    def test_qwen35_dict_linear_cache_round_trip(self):
+        messages = []
+        cpu_group = object()
+        gpu_group = object()
+
+        def send(tensor, *, dst, group):
+            messages.append((tensor.detach().clone(), dst, group))
+
+        def recv(tensor, *, src, group):
+            payload, dst, send_group = messages.pop(0)
+            self.assertEqual(dst, src)
+            self.assertIs(send_group, group)
+            self.assertEqual(payload.dtype, tensor.dtype)
+            self.assertEqual(tuple(payload.shape), tuple(tensor.shape))
+            tensor.copy_(payload)
+
+        class LinearAttentionLayer:
+            def __init__(self, *, conv_states, recurrent_states):
+                self.number_of_states = 2
+                self.conv_states = conv_states
+                self.recurrent_states = recurrent_states
+                self.is_conv_states_initialized = {
+                    index: state is not None
+                    for index, state in conv_states.items()
+                }
+                self.is_recurrent_states_initialized = {
+                    index: state is not None
+                    for index, state in recurrent_states.items()
+                }
+                self.has_previous_state = {
+                    index: (
+                        conv_states[index] is not None
+                        and recurrent_states[index] is not None
+                    )
+                    for index in conv_states
+                }
+
+            def lazy_initialization(
+                self,
+                *,
+                conv_states=None,
+                recurrent_states=None,
+                state_idx=0,
+            ):
+                if conv_states is not None:
+                    self.conv_states[state_idx] = torch.empty_like(conv_states)
+                    self.is_conv_states_initialized[state_idx] = True
+                if recurrent_states is not None:
+                    self.recurrent_states[state_idx] = torch.empty_like(
+                        recurrent_states
+                    )
+                    self.is_recurrent_states_initialized[state_idx] = True
+
+        expected_conv = {
+            0: torch.arange(6, dtype=torch.bfloat16).reshape(2, 3),
+            1: torch.arange(4, dtype=torch.float32).reshape(1, 4),
+        }
+        expected_recurrent = {
+            0: torch.arange(8, dtype=torch.float16).reshape(2, 4),
+            1: torch.arange(3, dtype=torch.bfloat16).reshape(1, 3),
+        }
+        send_cache = SimpleNamespace(
+            layers=[
+                LinearAttentionLayer(
+                    conv_states=expected_conv,
+                    recurrent_states=expected_recurrent,
+                )
+            ]
+        )
+        recv_layer = LinearAttentionLayer(
+            conv_states={0: None, 1: None},
+            recurrent_states={0: None, 1: None},
+        )
+        recv_cache = SimpleNamespace(layers=[recv_layer])
+        with (
+            mock.patch(
+                "scripts.data.prepare_target_cache.dist.send",
+                side_effect=send,
+            ),
+            mock.patch(
+                "scripts.data.prepare_target_cache.dist.recv",
+                side_effect=recv,
+            ),
+        ):
+            _send_linear_attention_cache_layer(
+                cache=send_cache,
+                layer_idx=0,
+                dst=7,
+                gpu_group=gpu_group,
+                cpu_group=cpu_group,
+            )
+            _recv_linear_attention_cache_layer(
+                cache=recv_cache,
+                layer_idx=0,
+                src=7,
+                device=torch.device("cpu"),
+                gpu_group=gpu_group,
+                cpu_group=cpu_group,
+            )
+
+        for state_idx in range(2):
+            torch.testing.assert_close(
+                recv_layer.conv_states[state_idx],
+                expected_conv[state_idx],
+            )
+            torch.testing.assert_close(
+                recv_layer.recurrent_states[state_idx],
+                expected_recurrent[state_idx],
+            )
+        self.assertEqual(recv_layer.is_conv_states_initialized, {0: True, 1: True})
+        self.assertEqual(
+            recv_layer.is_recurrent_states_initialized,
+            {0: True, 1: True},
+        )
+        self.assertEqual(recv_layer.has_previous_state, {0: True, 1: True})
+        self.assertFalse(messages)
+
+        missing_cache = SimpleNamespace(
+            layers=[
+                LinearAttentionLayer(
+                    conv_states={0: expected_conv[0], 1: None},
+                    recurrent_states=expected_recurrent,
+                )
+            ]
+        )
+        with (
+            mock.patch(
+                "scripts.data.prepare_target_cache.dist.send",
+                side_effect=send,
+            ),
+            mock.patch(
+                "scripts.data.prepare_target_cache.dist.recv",
+                side_effect=recv,
+            ),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "Missing .*linear-attention state",
+            ):
+                _send_linear_attention_cache_layer(
+                    cache=missing_cache,
+                    layer_idx=0,
+                    dst=7,
+                    gpu_group=gpu_group,
+                    cpu_group=cpu_group,
+                )
+        self.assertFalse(messages)
 
 
 class TargetCacheV4Test(unittest.TestCase):

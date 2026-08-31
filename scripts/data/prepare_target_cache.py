@@ -1,16 +1,37 @@
+# ruff: noqa: E402
+
 import argparse
+from contextlib import contextmanager
+from dataclasses import dataclass
 import json
 import os
+from pathlib import Path
+import sys
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 import torch
 import torch.distributed as dist
-from accelerate import init_empty_weights
-from deepspec.data import (
-    ConversationCollator,
-    MultimodalConversationCollator,
-)
+from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.fsdp import MixedPrecision, ShardingStrategy
+from torch.distributed.fsdp.wrap import ModuleWrapPolicy
+from torch.distributed.tensor.experimental import context_parallel as torch_context_parallel
+from torch.distributed.tensor.experimental._context_parallel import set_rotate_method
+from torch.utils.data import DataLoader, Subset
+from transformers import AutoConfig, AutoProcessor, AutoTokenizer, DynamicCache
+
+from deepspec.data import ConversationCollator, MultimodalConversationCollator
 from deepspec.data.parser import parse_media_uri_map_entries
-from deepspec.data.jsonl_dataset import JsonLineDataset
+from deepspec.modeling.target_adapter import (
+    get_decoder_layers,
+    get_final_norm,
+    get_target_hidden_size,
+    is_multimodal_config,
+    load_target_cache_model,
+)
 from deepspec.data.target_cache_dataset import (
     AsyncTargetCacheWriter,
     LocalCacheWriteSummary,
@@ -26,23 +47,9 @@ from deepspec.data.target_cache_dataset import (
     rename_local_target_cache_shards,
     write_target_cache_manifest,
 )
-from deepspec.modeling.target import (
-    TargetForwardResult,
-    install_target_context_parallel,
-)
-from deepspec.modeling.target_adapter import (
-    get_final_norm,
-    get_language_backbone,
-    get_target_hidden_size,
-    is_multimodal_config,
-)
-from deepspec.modeling.deepseek_v4_parallel import (
-    parallelize_deepseek_v4_model,
-)
+from deepspec.data.jsonl_dataset import JsonLineDataset
 from deepspec.utils import (
     CustomJSONEncoder,
-    build_parallel_topology,
-    compute_context_parallel_range,
     get_git_diff,
     get_git_sha,
     init_dist,
@@ -54,17 +61,7 @@ from deepspec.utils import (
     print_on_local_main,
     seed_all,
 )
-from torch import nn
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp import MixedPrecision, ShardingStrategy
-from torch.utils.data import DataLoader, Subset
-from transformers import (
-    AutoConfig,
-    AutoModel,
-    AutoProcessor,
-    AutoTokenizer,
-    FineGrainedFP8Config,
-)
+from deepspec.utils.parallel import build_parallel_topology
 
 os.environ["USE_TORCH"] = "true"
 os.environ["WANDB_DISABLED"] = "true"
@@ -74,12 +71,10 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 torch.set_float32_matmul_precision("high")
 
 
-def _get_target_backbone(target_model):
-    return get_language_backbone(target_model)
-
-
-def _get_target_hidden_size(target_model) -> int:
-    return get_target_hidden_size(target_model)
+@dataclass(frozen=True)
+class TargetForwardResult:
+    target_hidden_states: torch.Tensor
+    target_last_hidden_states: torch.Tensor
 
 
 def _get_hook_tensor(output):
@@ -97,9 +92,9 @@ def run_target_forward_with_hooks(
     target_model,
     model_inputs,
     target_layer_ids,
+    use_cache: bool = False,
 ):
-    backbone = _get_target_backbone(target_model)
-    layer_modules = backbone.layers
+    layer_modules = get_decoder_layers(target_model)
     final_norm = get_final_norm(target_model)
     target_layer_ids = [int(layer_id) for layer_id in target_layer_ids]
     captured_hidden_states = {}
@@ -114,7 +109,7 @@ def run_target_forward_with_hooks(
 
     def capture_decoder_input(_module, inputs):
         if not inputs:
-            raise ValueError("Decoder pre-hook did not receive hidden states.")
+            raise ValueError("Decoder layer pre-hook did not receive hidden states.")
         captured_hidden_states[-1] = _get_hook_tensor(inputs).detach()
 
     def capture_last_hidden_state(_module, _inputs, output):
@@ -136,33 +131,46 @@ def run_target_forward_with_hooks(
             handles.append(
                 layer_modules[layer_id].register_forward_hook(capture_layer(layer_id))
             )
-        handles.append(
-            final_norm.register_forward_hook(capture_last_hidden_state)
-        )
+        handles.append(final_norm.register_forward_hook(capture_last_hidden_state))
 
         with torch.no_grad():
             target_output = target_model(
                 **model_inputs,
                 output_hidden_states=False,
-                use_cache=False,
+                use_cache=use_cache,
                 return_dict=True,
             )
-            target_last_hidden_states = (
-                captured_last_hidden_state[-1]
-                if captured_last_hidden_state
-                else target_output.last_hidden_state.detach()
-            )
+            if captured_last_hidden_state:
+                target_last_hidden_states = captured_last_hidden_state[-1]
+            else:
+                target_last_hidden_states = target_output.last_hidden_state.detach()
             missing = [
                 layer_id
                 for layer_id in target_layer_ids
                 if layer_id not in captured_hidden_states
             ]
             if missing:
-                raise RuntimeError(f"Failed to capture target layers: {missing}.")
+                raise RuntimeError(f"Failed to capture target layers: {missing}")
             target_hidden_states = torch.cat(
                 [captured_hidden_states[layer_id] for layer_id in target_layer_ids],
                 dim=-1,
             )
+            sequence_tensor = model_inputs.get("input_ids")
+            if sequence_tensor is None:
+                sequence_tensor = model_inputs["inputs_embeds"]
+            expected_sequence_length = int(sequence_tensor.shape[1])
+            if (
+                int(target_hidden_states.shape[1]) != expected_sequence_length
+                or int(target_last_hidden_states.shape[1]) != expected_sequence_length
+            ):
+                raise RuntimeError(
+                    "Target decoder hidden-state length must match processor "
+                    f"input_ids length ({expected_sequence_length}), got "
+                    f"{target_hidden_states.shape[1]} and "
+                    f"{target_last_hidden_states.shape[1]}. This target family "
+                    "needs a custom TargetModelAdapter before it can use the "
+                    "shared multimodal cache pipeline."
+                )
     finally:
         for handle in handles:
             handle.remove()
@@ -172,313 +180,891 @@ def run_target_forward_with_hooks(
     return TargetForwardResult(
         target_hidden_states=target_hidden_states,
         target_last_hidden_states=target_last_hidden_states,
-        context_start=0,
     )
 
 
-def _dequantizing_config(target_config):
-    """Return an FP8 loading config that materializes ordinary BF16 weights."""
-
-    quantization_config = getattr(target_config, "quantization_config", None)
-    if quantization_config is None:
-        return None
-    if hasattr(quantization_config, "to_dict"):
-        quantization_config = quantization_config.to_dict()
-    else:
-        quantization_config = dict(quantization_config)
-    quant_method = str(quantization_config.get("quant_method", "")).lower()
-    if quant_method not in ("fp8", "quantizationmethod.fp8"):
-        return None
-    quantization_config["dequantize"] = True
-    return FineGrainedFP8Config(**quantization_config)
-
-
-def _normalize_target_parameter_dtype(target_model) -> None:
-    """FSDP1 requires a uniform floating-point dtype within each flat shard."""
-
-    for parameter in target_model.parameters():
-        if parameter.is_floating_point() and parameter.dtype != torch.bfloat16:
-            parameter.data = parameter.data.to(dtype=torch.bfloat16)
-
-
-def _build_fsdp_target_model(
-    *, model_name_or_path: str, target_config, fsdp_rank: int
+def _wrap_target_model_with_fsdp(
+    *, target_model, device, process_group, layerwise_only: bool = False
 ):
-    """Load one CPU checkpoint per FSDP group and use meta tensors elsewhere.
-
-    DeepSeek-V4-Flash is roughly 149 GB in its source FP8 checkpoint and about
-    300 GB after BF16 dequantization.  Loading it independently in every local
-    process would multiply host memory by the number of GPUs before FSDP even
-    starts.  Only FSDP group rank zero reads/dequantizes the checkpoint; the
-    other ranks construct the identical module graph on ``meta``.  Layer-wise
-    FSDP then materializes, broadcasts, and shards one decoder block at a time.
-    """
-
-    if int(fsdp_rank) == 0:
-        quantization_config = _dequantizing_config(target_config)
-        load_kwargs = {
-            "config": target_config,
-            "dtype": torch.bfloat16,
-            "low_cpu_mem_usage": True,
-        }
-        if str(target_config.model_type).lower() in (
-            "qwen3_5",
-            "qwen3_5_text",
-        ):
-            load_kwargs["attn_implementation"] = "sdpa"
-        if quantization_config is not None:
-            load_kwargs["quantization_config"] = quantization_config
-        target_model = AutoModel.from_pretrained(
-            model_name_or_path,
-            **load_kwargs,
-        )
-        _normalize_target_parameter_dtype(target_model)
-        return target_model
-
-    with init_empty_weights(include_buffers=True):
-        config_kwargs = {"dtype": torch.bfloat16}
-        if str(target_config.model_type).lower() in (
-            "qwen3_5",
-            "qwen3_5_text",
-        ):
-            config_kwargs["attn_implementation"] = "sdpa"
-        target_model = AutoModel.from_config(target_config, **config_kwargs)
-    # Some custom modules allocate parameters on the current CUDA device even
-    # inside init_empty_weights(). FSDP rejects a mixed CUDA/meta layer before
-    # invoking param_init_fn, so normalize every non-source tensor to meta.
-    target_model.to_empty(device=torch.device("meta"), recurse=True)
-    _normalize_target_parameter_dtype(target_model)
-    return target_model
-
-
-def _materialize_tensor_on_device(
-    *, module: nn.Module, tensor_name: str, device, is_parameter: bool
-) -> torch.Tensor:
-    """Move a real tensor or allocate its meta peer while preserving metadata."""
-
-    registry = module._parameters if is_parameter else module._buffers
-    tensor = registry[tensor_name]
-    if tensor is None:
-        raise RuntimeError(f"Cannot materialize missing tensor {tensor_name!r}.")
-    if tensor.is_meta:
-        materialized = torch.empty_like(tensor, device=device)
-    else:
-        materialized = tensor.to(device=device)
-    if is_parameter:
-        materialized = nn.Parameter(
-            materialized,
-            requires_grad=bool(tensor.requires_grad),
-        )
-    registry[tensor_name] = materialized
-    return materialized
-
-
-def _materialize_and_sync_replicated_target_state(
-    *, target_model, decoder_layers, device, process_group
-) -> None:
-    """Replicate only embedding/final-state tensors across an FSDP group."""
-
-    decoder_parameter_ids = {
-        id(parameter)
-        for decoder_layer in decoder_layers
-        for parameter in decoder_layer.parameters()
-    }
-    decoder_buffer_ids = {
-        id(buffer)
-        for decoder_layer in decoder_layers
-        for buffer in decoder_layer.buffers()
-    }
-    source_rank = (
-        int(dist.get_global_rank(process_group, 0))
-        if hasattr(dist, "get_global_rank")
-        else int(dist.get_process_group_ranks(process_group)[0])
-    )
-    for qualified_name, parameter in list(target_model.named_parameters()):
-        if id(parameter) in decoder_parameter_ids:
-            continue
-        module_name, _, tensor_name = qualified_name.rpartition(".")
-        module = (
-            target_model.get_submodule(module_name)
-            if module_name
-            else target_model
-        )
-        materialized = _materialize_tensor_on_device(
-            module=module,
-            tensor_name=tensor_name,
-            device=device,
-            is_parameter=True,
-        )
-        dist.broadcast(materialized.data, src=source_rank, group=process_group)
-    for qualified_name, buffer in list(target_model.named_buffers()):
-        if id(buffer) in decoder_buffer_ids:
-            continue
-        module_name, _, tensor_name = qualified_name.rpartition(".")
-        module = (
-            target_model.get_submodule(module_name)
-            if module_name
-            else target_model
-        )
-        materialized = _materialize_tensor_on_device(
-            module=module,
-            tensor_name=tensor_name,
-            device=device,
-            is_parameter=False,
-        )
-        dist.broadcast(materialized, src=source_rank, group=process_group)
-
-
-def _materialize_meta_module(module: nn.Module, *, device) -> None:
-    if any(
-        tensor is not None and tensor.is_meta
-        for tensor in (
-            *module.parameters(recurse=False),
-            *module.buffers(recurse=False),
-        )
-    ):
-        module.to_empty(device=device, recurse=False)
-
-
-def _wrap_target_model_with_fsdp(*, target_model, device, process_group):
-    """FULL_SHARD the target model one decoder layer at a time.
-
-    Layer-wise units bound the transient all-gather to one target layer.  The
-    model is wrapped while still on CPU, so the full checkpoint is never moved
-    to a single GPU before sharding.
-    """
-
-    backbone = _get_target_backbone(target_model)
-    decoder_layers = list(backbone.layers)
+    """Shard target parameters layer-by-layer for forward-only cache generation."""
+    decoder_layers = list(get_decoder_layers(target_model))
     if not decoder_layers:
-        raise ValueError("Target model does not expose decoder layers for FSDP.")
-    _materialize_and_sync_replicated_target_state(
-        target_model=target_model,
-        decoder_layers=decoder_layers,
-        device=device,
+        raise ValueError("Target model does not expose any decoder layers for FSDP.")
+    common_kwargs = dict(
         process_group=process_group,
-    )
-    fsdp_kwargs = {
-        "process_group": process_group,
-        "device_id": device,
-        "limit_all_gathers": True,
-        "mixed_precision": MixedPrecision(
+        device_id=device,
+        limit_all_gathers=True,
+        mixed_precision=MixedPrecision(
             param_dtype=torch.bfloat16,
             buffer_dtype=torch.bfloat16,
         ),
-        "sharding_strategy": ShardingStrategy.FULL_SHARD,
-        "sync_module_states": True,
-        "use_orig_params": True,
-        "param_init_fn": lambda module: _materialize_meta_module(
-            module, device=device
-        ),
+        sharding_strategy=ShardingStrategy.FULL_SHARD,
+        use_orig_params=True,
+    )
+    if layerwise_only:
+        # Keep embeddings and the vision tower directly callable so CP can
+        # build full multimodal embeddings/MRoPE positions before slicing.
+        layer_container = get_decoder_layers(target_model)
+        for layer_idx, layer in enumerate(list(layer_container)):
+            layer_container[layer_idx] = FSDP(layer, **common_kwargs)
+        return target_model
+
+    decoder_layer_classes = {type(layer) for layer in decoder_layers}
+    return FSDP(
+        target_model,
+        auto_wrap_policy=ModuleWrapPolicy(decoder_layer_classes),
+        **common_kwargs,
+    )
+
+
+def _build_dummy_model_inputs(*, device):
+    """Keep FSDP collectives aligned when another rank has no valid record."""
+    return {
+        "input_ids": torch.zeros((1, 1), dtype=torch.long, device=device),
+        "attention_mask": torch.ones((1, 1), dtype=torch.long, device=device),
     }
-    # Keep the model root unwrapped so a model-native CP entry point can drive
-    # the decoder.  Only decoder blocks contain the large trainable parameter
-    # sets; wrapping them individually bounds each parameter all-gather to one
-    # layer while embeddings and final normalization stay replicated.
-    for layer_idx, decoder_layer in enumerate(decoder_layers):
-        backbone.layers[layer_idx] = FSDP(decoder_layer, **fsdp_kwargs)
-    return target_model
 
 
-def _run_target_forward_context_parallel(
+def _prepare_cp_embeddings_and_positions(*, target_model, model_inputs):
+    """Reproduce the Qwen3.6 outer-model preprocessing before CP slicing."""
+    input_ids = model_inputs["input_ids"]
+    inputs_embeds = target_model.get_input_embeddings()(input_ids)
+
+    pixel_values = model_inputs.get("pixel_values")
+    if pixel_values is not None:
+        image_outputs = target_model.get_image_features(
+            pixel_values,
+            model_inputs.get("image_grid_thw"),
+            return_dict=True,
+        )
+        image_embeds = torch.cat(image_outputs.pooler_output, dim=0).to(
+            inputs_embeds.device, inputs_embeds.dtype
+        )
+        image_mask, _ = target_model.get_placeholder_mask(
+            input_ids,
+            inputs_embeds=inputs_embeds,
+            image_features=image_embeds,
+        )
+        inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+
+    pixel_values_videos = model_inputs.get("pixel_values_videos")
+    if pixel_values_videos is not None:
+        video_outputs = target_model.get_video_features(
+            pixel_values_videos,
+            model_inputs.get("video_grid_thw"),
+            return_dict=True,
+        )
+        video_embeds = torch.cat(video_outputs.pooler_output, dim=0).to(
+            inputs_embeds.device, inputs_embeds.dtype
+        )
+        _, video_mask = target_model.get_placeholder_mask(
+            input_ids,
+            inputs_embeds=inputs_embeds,
+            video_features=video_embeds,
+        )
+        inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
+
+    compute_3d_position_ids = getattr(target_model, "compute_3d_position_ids", None)
+    if compute_3d_position_ids is not None:
+        position_ids = compute_3d_position_ids(
+            input_ids=input_ids,
+            image_grid_thw=model_inputs.get("image_grid_thw"),
+            video_grid_thw=model_inputs.get("video_grid_thw"),
+            inputs_embeds=inputs_embeds,
+            attention_mask=model_inputs.get("attention_mask"),
+            past_key_values=None,
+            mm_token_type_ids=model_inputs.get("mm_token_type_ids"),
+        )
+    else:
+        position_ids = None
+    # Qwen3.6 intentionally returns None for text-only records and lets its
+    # text backbone infer flat positions. CP slicing needs an explicit global
+    # tensor, so construct the equivalent flat positions here.
+    if position_ids is None:
+        position_ids = torch.arange(
+            input_ids.shape[1], dtype=torch.long, device=input_ids.device
+        ).unsqueeze(0).expand(input_ids.shape[0], -1)
+    return inputs_embeds, position_ids
+
+
+_CACHE_DTYPES = {
+    torch.bfloat16: 0,
+    torch.float32: 1,
+    torch.float16: 2,
+}
+_CACHE_DTYPES_BY_CODE = {value: key for key, value in _CACHE_DTYPES.items()}
+
+
+class _FullAttentionCPUOffloadDynamicCache(DynamicCache):
+    """Keep growing full-attention KV tensors on CPU between layer calls.
+
+    Transformers' generic cache offloader assumes adjacent attention layers:
+    one layer prefetches the next. Qwen3.6 has three DeltaNet layers between
+    full-attention layers, so synchronously stage the current KV layer instead.
+    The GPU tensors returned from ``update`` remain alive for the current SDPA
+    call, while the cache-owned copy is moved back to CPU for later forwards.
+    """
+
+    def update(self, key_states, value_states, layer_idx, *args, **kwargs):
+        layer = self.layers[layer_idx]
+        if getattr(layer, "is_initialized", False):
+            if layer.keys.device != key_states.device:
+                layer.keys = layer.keys.to(key_states.device)
+                layer.values = layer.values.to(value_states.device)
+                # Cache layers remember their execution device for later moves.
+                layer.device = key_states.device
+
+        keys, values = super().update(
+            key_states, value_states, layer_idx, *args, **kwargs
+        )
+        layer.keys = keys.detach().to("cpu", non_blocking=False)
+        layer.values = values.detach().to("cpu", non_blocking=False)
+        return keys, values
+
+
+def _build_target_cache(*, config, cpu_offload: bool):
+    cache_cls = (
+        _FullAttentionCPUOffloadDynamicCache if cpu_offload else DynamicCache
+    )
+    return cache_cls(config=config)
+
+
+class _NativeContextParallelCache(DynamicCache):
+    """Keep only Qwen3.6 linear-attention state during native CP prefill.
+
+    PyTorch Context Parallel rotates each full-attention layer's local K/V
+    shards while that layer is running. Retaining those same K/V tensors in a
+    ``DynamicCache`` until the end of the model would make memory grow once per
+    full-attention layer and defeat CP. Linear-attention conv/recurrent states
+    are still cached because they are the compact prefix summary handed across
+    the head/tail CP schedule.
+    """
+
+    def __init__(self, *, config):
+        super().__init__(config=config)
+        decoder_config = config.get_text_config(decoder=True)
+        self._full_attention_layers = {
+            layer_idx
+            for layer_idx, layer_type in enumerate(decoder_config.layer_types)
+            if layer_type == "full_attention"
+        }
+
+    def update(self, key_states, value_states, layer_idx, *args, **kwargs):
+        if int(layer_idx) in self._full_attention_layers:
+            return key_states, value_states
+        return super().update(
+            key_states,
+            value_states,
+            layer_idx,
+            *args,
+            **kwargs,
+        )
+
+
+def _pad_native_cp_inputs(
+    *, inputs_embeds, position_ids, attention_mask, context_parallel_size: int
+):
+    """Pad to the head/tail Ring-Attention alignment without masking the tail.
+
+    Appended tokens are causally after every real token, so they cannot alter
+    real-token outputs. They intentionally remain unmasked: PyTorch's native
+    causal CP path requires ``is_causal=True`` and equal head/tail shards.
+    """
+
+    sequence_length = int(inputs_embeds.shape[1])
+    if attention_mask is None:
+        attention_mask = torch.ones(
+            (inputs_embeds.shape[0], sequence_length),
+            dtype=torch.long,
+            device=inputs_embeds.device,
+        )
+    if int(attention_mask.shape[-1]) != sequence_length:
+        raise ValueError(
+            "Native target CP requires attention_mask to match inputs_embeds: "
+            f"{attention_mask.shape} versus {inputs_embeds.shape}."
+        )
+    if not bool(torch.all(attention_mask != 0).item()):
+        raise ValueError(
+            "Native target CP currently requires an unpadded local_batch_size=1 "
+            "record. Compact padding before target-cache preparation."
+        )
+
+    alignment = 2 * int(context_parallel_size)
+    padded_length = (
+        (sequence_length + alignment - 1) // alignment
+    ) * alignment
+    pad_tokens = padded_length - sequence_length
+    if pad_tokens:
+        inputs_embeds = torch.cat(
+            [
+                inputs_embeds,
+                torch.zeros(
+                    (
+                        inputs_embeds.shape[0],
+                        pad_tokens,
+                        inputs_embeds.shape[-1],
+                    ),
+                    dtype=inputs_embeds.dtype,
+                    device=inputs_embeds.device,
+                ),
+            ],
+            dim=1,
+        )
+        position_pad_shape = list(position_ids.shape)
+        position_pad_shape[-1] = pad_tokens
+        position_ids = torch.cat(
+            [
+                position_ids,
+                torch.zeros(
+                    position_pad_shape,
+                    dtype=position_ids.dtype,
+                    device=position_ids.device,
+                ),
+            ],
+            dim=-1,
+        )
+        attention_mask = torch.cat(
+            [
+                attention_mask,
+                torch.ones(
+                    (attention_mask.shape[0], pad_tokens),
+                    dtype=attention_mask.dtype,
+                    device=attention_mask.device,
+                ),
+            ],
+            dim=-1,
+        )
+    return (
+        inputs_embeds.contiguous(),
+        position_ids.contiguous(),
+        attention_mask.contiguous(),
+        sequence_length,
+        padded_length,
+    )
+
+
+def _validate_optional_cache_tensor(tensor):
+    if tensor is not None and not isinstance(tensor, torch.Tensor):
+        raise TypeError(
+            "CP cache transport expects a Tensor or None, got "
+            f"{type(tensor)!r}."
+        )
+    if tensor is not None and tensor.dtype not in _CACHE_DTYPES:
+        raise TypeError(f"Unsupported CP cache dtype: {tensor.dtype}")
+    if tensor is not None and tensor.device.type not in ("cpu", "cuda"):
+        raise TypeError(
+            "CP cache transport only supports CPU or CUDA tensors, got "
+            f"{tensor.device}."
+        )
+
+
+def _send_optional_cache_tensor(*, tensor, dst, gpu_group, cpu_group):
+    _validate_optional_cache_tensor(tensor)
+    present = torch.tensor([int(tensor is not None)], dtype=torch.int64)
+    dist.send(present, dst=dst, group=cpu_group)
+    if tensor is not None:
+        use_cpu_transport = tensor.device.type == "cpu"
+        header = torch.tensor(
+            [
+                tensor.ndim,
+                _CACHE_DTYPES[tensor.dtype],
+                int(use_cpu_transport),
+            ],
+            dtype=torch.int64,
+        )
+        shape = torch.tensor(tensor.shape, dtype=torch.int64)
+        dist.send(header, dst=dst, group=cpu_group)
+        dist.send(shape, dst=dst, group=cpu_group)
+        dist.send(
+            tensor.contiguous(),
+            dst=dst,
+            group=cpu_group if use_cpu_transport else gpu_group,
+        )
+
+
+def _recv_optional_cache_tensor(*, src, device, gpu_group, cpu_group):
+    present = torch.empty(1, dtype=torch.int64)
+    dist.recv(present, src=src, group=cpu_group)
+    if int(present.item()) == 0:
+        return None
+    header = torch.empty(3, dtype=torch.int64)
+    dist.recv(header, src=src, group=cpu_group)
+    ndim, dtype_code, use_cpu_transport = (
+        int(value) for value in header.tolist()
+    )
+    shape = torch.empty(ndim, dtype=torch.int64)
+    dist.recv(shape, src=src, group=cpu_group)
+    tensor = torch.empty(
+        tuple(int(value) for value in shape.tolist()),
+        dtype=_CACHE_DTYPES_BY_CODE[dtype_code],
+        device="cpu" if use_cpu_transport else device,
+    )
+    dist.recv(
+        tensor,
+        src=src,
+        group=cpu_group if use_cpu_transport else gpu_group,
+    )
+    return tensor
+
+
+def _send_linear_attention_cache_layer(
+    *, cache, layer_idx: int, dst, gpu_group, cpu_group
+):
+    layer = cache.layers[int(layer_idx)]
+    if not hasattr(layer, "is_conv_states_initialized"):
+        raise TypeError(
+            f"Target cache layer {layer_idx} is not a linear-attention cache."
+        )
+    number_of_states = int(getattr(layer, "number_of_states", 1))
+    if number_of_states < 1:
+        raise ValueError(
+            f"Linear-attention layer {layer_idx} has no cache states."
+        )
+    if bool(getattr(layer, "record_past", False)):
+        raise ValueError(
+            "Native Qwen3.6 CP does not support record_past linear-attention "
+            f"cache state at layer {layer_idx}."
+        )
+
+    payloads = []
+    for state_idx in range(number_of_states):
+        conv_states = _get_linear_attention_cache_state(
+            layer=layer,
+            state_name="conv_states",
+            state_idx=state_idx,
+        )
+        recurrent_states = _get_linear_attention_cache_state(
+            layer=layer,
+            state_name="recurrent_states",
+            state_idx=state_idx,
+        )
+        if conv_states is None or recurrent_states is None:
+            raise RuntimeError(
+                "Missing Qwen3.6 linear-attention state for layer "
+                f"{layer_idx}, state {state_idx}."
+            )
+        if not _linear_attention_state_is_present(
+            layer=layer,
+            state_idx=state_idx,
+        ):
+            raise RuntimeError(
+                "Qwen3.6 linear-attention state is initialized but not marked "
+                f"as previous state for layer {layer_idx}, state {state_idx}."
+            )
+        _validate_optional_cache_tensor(conv_states)
+        _validate_optional_cache_tensor(recurrent_states)
+        payloads.append((conv_states.contiguous(), recurrent_states.contiguous()))
+
+    # The receiver drains the advertised payload count before validating its
+    # local cache layout.  A configuration mismatch therefore fails cleanly
+    # instead of leaving the sender blocked halfway through the protocol.
+    dist.send(
+        torch.tensor([number_of_states], dtype=torch.int64),
+        dst=dst,
+        group=cpu_group,
+    )
+    for conv_states, recurrent_states in payloads:
+        _send_optional_cache_tensor(
+            tensor=conv_states,
+            dst=dst,
+            gpu_group=gpu_group,
+            cpu_group=cpu_group,
+        )
+        _send_optional_cache_tensor(
+            tensor=recurrent_states,
+            dst=dst,
+            gpu_group=gpu_group,
+            cpu_group=cpu_group,
+        )
+
+
+def _get_linear_attention_cache_state(*, layer, state_name: str, state_idx: int):
+    states = getattr(layer, state_name)
+    initialized = getattr(layer, f"is_{state_name}_initialized")
+    if isinstance(states, dict):
+        if not isinstance(initialized, dict):
+            raise TypeError(
+                f"{state_name} and is_{state_name}_initialized must use the "
+                "same container type."
+            )
+        state = (
+            states.get(int(state_idx))
+            if initialized.get(int(state_idx), False)
+            else None
+        )
+    else:
+        if int(state_idx) != 0:
+            raise ValueError(
+                f"Legacy scalar {state_name} cannot provide state {state_idx}."
+            )
+        state = states if bool(initialized) else None
+    if state is not None and not isinstance(state, torch.Tensor):
+        raise TypeError(
+            f"Linear-attention {state_name}[{state_idx}] must be a Tensor or "
+            f"None, got {type(state)!r}."
+        )
+    return state
+
+
+def _restore_linear_attention_cache_state(
+    *, layer, state_name: str, state_idx: int, tensor: torch.Tensor
+):
+    states = getattr(layer, state_name)
+    initialized_name = f"is_{state_name}_initialized"
+    initialized = getattr(layer, initialized_name)
+    init_kwarg = state_name
+
+    if isinstance(states, dict):
+        if not isinstance(initialized, dict):
+            raise TypeError(
+                f"{state_name} and {initialized_name} must use the same "
+                "container type."
+            )
+        if not initialized.get(int(state_idx), False):
+            layer.lazy_initialization(
+                **{init_kwarg: tensor, "state_idx": int(state_idx)}
+            )
+        restored = getattr(layer, state_name).get(int(state_idx))
+    else:
+        if int(state_idx) != 0:
+            raise ValueError(
+                f"Legacy scalar {state_name} cannot restore state {state_idx}."
+            )
+        if not bool(initialized):
+            layer.lazy_initialization(**{init_kwarg: tensor})
+        restored = getattr(layer, state_name)
+
+    if not isinstance(restored, torch.Tensor):
+        raise RuntimeError(
+            f"Failed to initialize linear-attention {state_name}[{state_idx}]."
+        )
+    if restored.shape != tensor.shape:
+        raise RuntimeError(
+            f"Received linear-attention {state_name}[{state_idx}] has a "
+            f"different shape: {tensor.shape} versus {restored.shape}."
+        )
+    if restored.dtype != tensor.dtype:
+        raise RuntimeError(
+            f"Received linear-attention {state_name}[{state_idx}] has a "
+            f"different dtype: {tensor.dtype} versus {restored.dtype}."
+        )
+    restored.copy_(tensor)
+
+
+def _mark_linear_attention_state_present(*, layer, state_idx: int):
+    has_previous_state = layer.has_previous_state
+    if isinstance(has_previous_state, dict):
+        has_previous_state[int(state_idx)] = True
+    else:
+        if int(state_idx) != 0:
+            raise ValueError(
+                "Legacy scalar has_previous_state cannot mark state "
+                f"{state_idx}."
+            )
+        layer.has_previous_state = True
+
+
+def _linear_attention_state_is_present(*, layer, state_idx: int):
+    has_previous_state = layer.has_previous_state
+    if isinstance(has_previous_state, dict):
+        return bool(has_previous_state.get(int(state_idx), False))
+    if int(state_idx) != 0:
+        raise ValueError(
+            "Legacy scalar has_previous_state cannot read state "
+            f"{state_idx}."
+        )
+    return bool(has_previous_state)
+
+
+def _recv_linear_attention_cache_layer(
+    *, cache, layer_idx: int, src, device, gpu_group, cpu_group
+):
+    remote_state_count = torch.empty(1, dtype=torch.int64)
+    dist.recv(remote_state_count, src=src, group=cpu_group)
+    remote_state_count = int(remote_state_count.item())
+    if remote_state_count < 1 or remote_state_count > 1024:
+        raise ValueError(
+            "Received invalid linear-attention cache state count "
+            f"{remote_state_count} for layer {layer_idx}."
+        )
+
+    payloads = []
+    for _state_idx in range(remote_state_count):
+        conv_states = _recv_optional_cache_tensor(
+            src=src,
+            device=device,
+            gpu_group=gpu_group,
+            cpu_group=cpu_group,
+        )
+        recurrent_states = _recv_optional_cache_tensor(
+            src=src,
+            device=device,
+            gpu_group=gpu_group,
+            cpu_group=cpu_group,
+        )
+        payloads.append((conv_states, recurrent_states))
+
+    layer = cache.layers[int(layer_idx)]
+    if not hasattr(layer, "is_conv_states_initialized"):
+        raise TypeError(
+            f"Target cache layer {layer_idx} is not a linear-attention cache."
+        )
+    number_of_states = int(getattr(layer, "number_of_states", 1))
+    if number_of_states != remote_state_count:
+        raise RuntimeError(
+            "Linear-attention cache state-count mismatch for layer "
+            f"{layer_idx}: received {remote_state_count}, expected "
+            f"{number_of_states}."
+        )
+    if bool(getattr(layer, "record_past", False)):
+        raise ValueError(
+            "Native Qwen3.6 CP does not support record_past linear-attention "
+            f"cache state at layer {layer_idx}."
+        )
+
+    for state_idx, (conv_states, recurrent_states) in enumerate(payloads):
+        if conv_states is None or recurrent_states is None:
+            raise RuntimeError(
+                "Missing Qwen3.6 linear-attention state for layer "
+                f"{layer_idx}, state {state_idx}."
+            )
+        _restore_linear_attention_cache_state(
+            layer=layer,
+            state_name="conv_states",
+            state_idx=state_idx,
+            tensor=conv_states,
+        )
+        _restore_linear_attention_cache_state(
+            layer=layer,
+            state_name="recurrent_states",
+            state_idx=state_idx,
+            tensor=recurrent_states,
+        )
+        _mark_linear_attention_state_present(
+            layer=layer,
+            state_idx=state_idx,
+        )
+
+
+def _split_linear_attention_mask(attention_mask, split_size: int):
+    if attention_mask is None:
+        return None, None
+    if attention_mask.ndim != 2 or int(attention_mask.shape[-1]) != 2 * split_size:
+        raise ValueError(
+            "Native Qwen3.6 CP expects a 2-D linear-attention mask with "
+            f"local length {2 * split_size}, got {attention_mask.shape}."
+        )
+    return (
+        attention_mask[:, :split_size],
+        attention_mask[:, split_size:],
+    )
+
+
+def _run_native_cp_linear_attention(
+    *,
+    original_forward,
+    layer_idx: int,
+    hidden_states,
+    cache_params,
+    attention_mask,
+    topology,
+    device,
+    forward_kwargs,
+):
+    """Run one FLA layer in causal head/tail order across the CP mesh.
+
+    PyTorch's causal CP load balancer gives rank ``r`` original chunk ``r``
+    followed by chunk ``2 * CP - r - 1``. Qwen3.6's recurrent DeltaNet state
+    therefore scans ranks forward for the first half and backward for the
+    second half. Full-attention layers remain concurrent and use native Ring
+    Attention; only this compact FLA state is serialized.
+    """
+
+    local_length = int(hidden_states.shape[1])
+    if local_length % 2 != 0:
+        raise ValueError(
+            "Native causal CP requires two equal local head/tail chunks, got "
+            f"local sequence length {local_length}."
+        )
+    if not isinstance(cache_params, _NativeContextParallelCache):
+        raise TypeError(
+            "Native target CP requires _NativeContextParallelCache for FLA."
+        )
+    split_size = local_length // 2
+    head_hidden = hidden_states[:, :split_size]
+    tail_hidden = hidden_states[:, split_size:]
+    head_mask, tail_mask = _split_linear_attention_mask(
+        attention_mask,
+        split_size,
+    )
+
+    cp_rank = topology.context_parallel_rank
+    cp_size = topology.context_parallel_size
+    if cp_rank > 0:
+        _recv_linear_attention_cache_layer(
+            cache=cache_params,
+            layer_idx=layer_idx,
+            src=topology.global_rank - topology.fsdp_size,
+            device=device,
+            gpu_group=topology.context_parallel_group,
+            cpu_group=topology.context_parallel_cpu_group,
+        )
+    head_output = original_forward(
+        hidden_states=head_hidden,
+        cache_params=cache_params,
+        attention_mask=head_mask,
+        **forward_kwargs,
+    )
+    if cp_rank < cp_size - 1:
+        _send_linear_attention_cache_layer(
+            cache=cache_params,
+            layer_idx=layer_idx,
+            dst=topology.global_rank + topology.fsdp_size,
+            gpu_group=topology.context_parallel_group,
+            cpu_group=topology.context_parallel_cpu_group,
+        )
+
+    if cp_rank < cp_size - 1:
+        _recv_linear_attention_cache_layer(
+            cache=cache_params,
+            layer_idx=layer_idx,
+            src=topology.global_rank + topology.fsdp_size,
+            device=device,
+            gpu_group=topology.context_parallel_group,
+            cpu_group=topology.context_parallel_cpu_group,
+        )
+    tail_output = original_forward(
+        hidden_states=tail_hidden,
+        cache_params=cache_params,
+        attention_mask=tail_mask,
+        **forward_kwargs,
+    )
+    if cp_rank > 0:
+        _send_linear_attention_cache_layer(
+            cache=cache_params,
+            layer_idx=layer_idx,
+            dst=topology.global_rank - topology.fsdp_size,
+            gpu_group=topology.context_parallel_group,
+            cpu_group=topology.context_parallel_cpu_group,
+        )
+    return torch.cat([head_output, tail_output], dim=1)
+
+
+@contextmanager
+def _patch_native_cp_linear_attention(*, target_model, topology, device):
+    patched_modules = []
+    for decoder_layer in get_decoder_layers(target_model):
+        unwrapped_layer = (
+            decoder_layer.module
+            if isinstance(decoder_layer, FSDP)
+            else decoder_layer
+        )
+        linear_attention = getattr(unwrapped_layer, "linear_attn", None)
+        if linear_attention is None:
+            continue
+        original_forward = linear_attention.forward
+        layer_idx = int(linear_attention.layer_idx)
+
+        def cp_forward(
+            hidden_states,
+            cache_params=None,
+            attention_mask=None,
+            _original_forward=original_forward,
+            _layer_idx=layer_idx,
+            **kwargs,
+        ):
+            return _run_native_cp_linear_attention(
+                original_forward=_original_forward,
+                layer_idx=_layer_idx,
+                hidden_states=hidden_states,
+                cache_params=cache_params,
+                attention_mask=attention_mask,
+                topology=topology,
+                device=device,
+                forward_kwargs=kwargs,
+            )
+
+        linear_attention.forward = cp_forward
+        patched_modules.append((linear_attention, original_forward))
+    try:
+        yield
+    finally:
+        for linear_attention, original_forward in patched_modules:
+            linear_attention.forward = original_forward
+
+
+def _run_target_forward_native_cp(
     *,
     target_model,
-    model_inputs,
+    full_embeddings,
+    full_position_ids,
+    attention_mask,
     target_layer_ids,
+    topology,
+    context_parallel_mesh,
+    device,
+):
+    (
+        full_embeddings,
+        full_position_ids,
+        attention_mask,
+        _original_sequence_length,
+        _padded_sequence_length,
+    ) = _pad_native_cp_inputs(
+        inputs_embeds=full_embeddings,
+        position_ids=full_position_ids,
+        attention_mask=attention_mask,
+        context_parallel_size=topology.context_parallel_size,
+    )
+    buffers = [full_embeddings, full_position_ids, attention_mask]
+    buffer_seq_dims = [1, full_position_ids.ndim - 1, 1]
+    target_cache = _NativeContextParallelCache(config=target_model.config)
+
+    with torch_context_parallel(
+        context_parallel_mesh,
+        buffers=buffers,
+        buffer_seq_dims=buffer_seq_dims,
+        no_restore_buffers=set(buffers),
+    ):
+        # ``resize_`` keeps the original full-sequence CUDA storage capacity.
+        # Rebind each no-restore buffer to compact local-shard storage before
+        # the decoder starts so CP also releases the full embedding allocation.
+        for buffer in buffers:
+            buffer.set_(buffer.clone())
+        with _patch_native_cp_linear_attention(
+            target_model=target_model,
+            topology=topology,
+            device=device,
+        ):
+            target_result = run_target_forward_with_hooks(
+                target_model=target_model,
+                model_inputs={
+                    "inputs_embeds": full_embeddings,
+                    "position_ids": full_position_ids,
+                    "attention_mask": attention_mask,
+                    "past_key_values": target_cache,
+                },
+                target_layer_ids=target_layer_ids,
+                use_cache=True,
+            )
+
+    del target_cache, full_embeddings, full_position_ids, attention_mask
+    # Keep the native head/tail shard on its owning CP rank.  Stage 2 opens
+    # the matching per-rank cache index and consumes this tensor directly.
+    return target_result
+
+
+def _run_target_forward_micro_chunked(
+    *,
+    target_model,
+    local_embeddings,
+    local_position_ids,
+    attention_mask,
+    global_chunk_start: int,
+    target_layer_ids,
+    target_cache,
+    micro_chunk_size: int,
     topology,
     device,
 ):
-    """Dispatch to a model family's exact ring-context implementation.
+    """Prefill one CP shard through bounded target workspaces.
 
-    The parallel plumbing intentionally does not reconstruct the full sequence
-    or gather hidden states on a leader. A model adapter returns only the token
-    shard consumed by the matching draft CP rank.
+    FSDP ranks are allowed to own different-length samples, but every rank in
+    an FSDP group must enter every wrapped decoder layer the same number of
+    times. The maximum micro-step count is therefore agreed by the FSDP group;
+    ranks that finish early execute one-token forwards on a private dummy cache.
     """
 
-    cp_forward = getattr(target_model, "forward_context_parallel", None)
-    if cp_forward is None:
-        model_type = str(target_model.config.model_type)
-        raise NotImplementedError(
-            f"Target model type {model_type!r} does not expose "
-            "forward_context_parallel(). Add that model-specific ring "
-            "attention adapter before running with --context-parallel-size > 1."
-        )
-    # Native CP may shard aligned input buffers in place. Retain the global
-    # mask for validation and for the cache writer that follows this call.
-    global_attention_mask = model_inputs["attention_mask"].clone()
-    sequence_length = int(global_attention_mask.sum(dim=1)[0].item())
-    result = cp_forward(
-        model_inputs=model_inputs,
-        target_layer_ids=target_layer_ids,
-        context_parallel_group=topology.context_parallel_group,
-        context_parallel_rank=topology.context_parallel_rank,
-        context_parallel_size=topology.context_parallel_size,
-        tensor_parallel_group=topology.tensor_parallel_group,
-        tensor_parallel_rank=topology.tensor_parallel_rank,
-        tensor_parallel_size=topology.tensor_parallel_size,
-        device=device,
+    local_length = int(local_embeddings.shape[1])
+    local_micro_steps = (
+        local_length + int(micro_chunk_size) - 1
+    ) // int(micro_chunk_size)
+    aligned_micro_steps = torch.tensor(
+        [local_micro_steps], dtype=torch.int64, device=device
     )
-    model_inputs["attention_mask"] = global_attention_mask
-    if not isinstance(result, TargetForwardResult):
-        raise TypeError(
-            "forward_context_parallel() must return TargetForwardResult, got "
-            f"{type(result)!r}."
+    if topology.fsdp_size > 1:
+        dist.all_reduce(
+            aligned_micro_steps,
+            op=dist.ReduceOp.MAX,
+            group=topology.fsdp_group,
         )
-    local_length = int(result.target_hidden_states.shape[1])
-    context_layout = str(
-        getattr(target_model, "_deepspec_context_layout", "contiguous")
+    aligned_micro_steps = int(aligned_micro_steps.item())
+
+    hidden_pieces = []
+    last_hidden_pieces = []
+    dummy_cache = None
+    dummy_steps = 0
+    hidden_size = int(local_embeddings.shape[-1])
+    for micro_idx in range(aligned_micro_steps):
+        local_start = micro_idx * int(micro_chunk_size)
+        local_end = min(local_start + int(micro_chunk_size), local_length)
+        if local_start < local_length:
+            # FSDP layer all-gathers and growing causal-attention buffers leave
+            # differently sized cached blocks behind. Return unused blocks at
+            # the micro-forward boundary so the next large SDPA allocation has
+            # contiguous driver-visible headroom.
+            torch.cuda.empty_cache()
+            global_end = global_chunk_start + local_end
+            micro_embeddings = local_embeddings[
+                :, local_start:local_end
+            ].to(device, non_blocking=False)
+            micro_position_ids = local_position_ids[
+                ..., local_start:local_end
+            ].to(device, non_blocking=False)
+            micro_inputs = {
+                "inputs_embeds": micro_embeddings,
+                "position_ids": micro_position_ids,
+                "attention_mask": attention_mask[:, :global_end],
+                "past_key_values": target_cache,
+            }
+            micro_result = run_target_forward_with_hooks(
+                target_model=target_model,
+                model_inputs=micro_inputs,
+                target_layer_ids=target_layer_ids,
+                use_cache=True,
+            )
+            hidden_pieces.append(
+                micro_result.target_hidden_states.detach().to("cpu")
+            )
+            last_hidden_pieces.append(
+                micro_result.target_last_hidden_states.detach().to("cpu")
+            )
+            del micro_result, micro_inputs, micro_embeddings, micro_position_ids
+        else:
+            if dummy_cache is None:
+                dummy_cache = DynamicCache(config=target_model.config)
+            dummy_steps += 1
+            dummy_inputs = {
+                "inputs_embeds": torch.zeros(
+                    (1, 1, hidden_size),
+                    dtype=local_embeddings.dtype,
+                    device=device,
+                ),
+                "position_ids": torch.full(
+                    (1, 1),
+                    fill_value=dummy_steps - 1,
+                    dtype=torch.long,
+                    device=device,
+                ),
+                "attention_mask": torch.ones(
+                    (1, dummy_steps), dtype=torch.long, device=device
+                ),
+                "past_key_values": dummy_cache,
+            }
+            # The output and dummy cache never enter the real sample state.
+            run_target_forward_with_hooks(
+                target_model=target_model,
+                model_inputs=dummy_inputs,
+                target_layer_ids=target_layer_ids,
+                use_cache=True,
+            )
+
+    if not hidden_pieces:
+        raise RuntimeError("A CP shard cannot be empty.")
+    return TargetForwardResult(
+        target_hidden_states=torch.cat(hidden_pieces, dim=1),
+        target_last_hidden_states=torch.cat(last_hidden_pieces, dim=1),
     )
-    if context_layout == "contiguous":
-        expected_start, expected_end = compute_context_parallel_range(
-            sequence_length=sequence_length,
-            context_parallel_rank=topology.context_parallel_rank,
-            context_parallel_size=topology.context_parallel_size,
-        )
-        if (
-            result.context_start != expected_start
-            or local_length != expected_end - expected_start
-        ):
-            raise RuntimeError(
-                "Target CP adapter returned the wrong contiguous shard: "
-                f"expected [{expected_start}, {expected_end}), got "
-                f"start={result.context_start}, length={local_length}."
-            )
-    elif context_layout == "native_head_tail":
-        alignment = 2 * int(topology.context_parallel_size)
-        padded_length = (
-            (sequence_length + alignment - 1) // alignment
-        ) * alignment
-        expected_length = padded_length // int(topology.context_parallel_size)
-        if result.context_start != 0 or local_length != expected_length:
-            raise RuntimeError(
-                "Qwen3.6 target CP returned the wrong native head/tail shard: "
-                f"expected start=0, length={expected_length}; got "
-                f"start={result.context_start}, length={local_length}."
-            )
-    else:
-        raise RuntimeError(
-            f"Target CP adapter declared unsupported layout {context_layout!r}."
-        )
-    if int(result.target_last_hidden_states.shape[1]) != local_length:
-        raise RuntimeError("Target CP hidden-state tensors have different lengths.")
-    return result
-
-
-def _build_dummy_batch(*, device, sequence_length: int = 1):
-    """Return one valid token so padded FSDP steps enter every layer."""
-
-    sequence_length = max(int(sequence_length), 1)
-    return {
-        "input_ids": torch.zeros(
-            (1, sequence_length), dtype=torch.long, device=device
-        ),
-        "attention_mask": torch.ones(
-            (1, sequence_length), dtype=torch.long, device=device
-        ),
-        "loss_mask": torch.zeros(
-            (1, sequence_length), dtype=torch.long, device=device
-        ),
-    }
 
 
 def parse_args():
@@ -499,44 +1085,48 @@ def parse_args():
     parser.add_argument(
         "--fsdp",
         action="store_true",
-        help="Shard target-model parameters with layer-wise FSDP FULL_SHARD.",
+        help=(
+            "Use layer-wise FSDP FULL_SHARD for target-model forward passes. "
+            "All ranks remain sample-parallel but execute each forward step "
+            "collectively."
+        ),
     )
     parser.add_argument(
         "--fsdp-size",
         type=int,
         default=None,
         help=(
-            "Ranks per target FSDP group. Defaults to train.fsdp_size, then "
-            "world_size / (context_parallel_size * expert_parallel_size * "
-            "tensor_parallel_size)."
+            "Number of ranks in each target FSDP shard group. Defaults to "
+            "world_size / context_parallel_size."
         ),
     )
     parser.add_argument(
         "--context-parallel-size",
         type=int,
-        default=None,
+        default=1,
         help=(
-            "Ranks cooperating on one sequence with model-native ring CP. "
-            "Defaults to train.context_parallel_size, then 1."
+            "Use this many ranks for PyTorch native causal Context Parallel. "
+            "Full-attention K/V shards rotate with Ring Attention; Qwen3.6 "
+            "DeltaNet passes only compact recurrent state."
         ),
     )
     parser.add_argument(
-        "--expert-parallel-size",
+        "--target-micro-chunk-size",
         type=int,
-        default=None,
+        default=0,
         help=(
-            "Shard DeepSeek-V4 routed experts across this many ranks. "
-            "Defaults to train.expert_parallel_size, then 1."
+            "Legacy cached-prefill micro chunk size. Native Context Parallel "
+            "requires 0 because Ring Attention already shards the sequence."
         ),
     )
     parser.add_argument(
-        "--tensor-parallel-size",
-        type=int,
-        default=None,
+        "--target-cache-cpu-offload",
+        choices=("true", "false"),
+        default="false",
         help=(
-            "Shard DeepSeek-V4 attention heads, expert intermediate channels, "
-            "and vocabulary tensors across this many ranks. Defaults to "
-            "train.tensor_parallel_size, then 1."
+            "Keep growing full-attention KV cache layers on CPU between "
+            "target forwards. This trades PCIe traffic for lower peak CUDA "
+            "memory and is recommended for 256K target-cache generation."
         ),
     )
     parser.add_argument(
@@ -550,15 +1140,13 @@ def parse_args():
         default=[],
         metavar="SOURCE_PREFIX=REPLACEMENT_PREFIX",
         help=(
-            "Rewrite image/video URI prefixes before loading media. Repeat "
-            "for multiple mappings; the longest matching prefix wins."
+            "Rewrite image/video URI prefixes before loading media. Repeat for "
+            "multiple mappings; the longest matching prefix wins."
         ),
     )
     cli_args = parser.parse_args()
     try:
-        cli_args.media_uri_map = parse_media_uri_map_entries(
-            cli_args.media_uri_map
-        )
+        cli_args.media_uri_map = parse_media_uri_map_entries(cli_args.media_uri_map)
     except (TypeError, ValueError) as exc:
         parser.error(str(exc))
     config = parse_opts_to_config(cli_args.opts, load_config(cli_args.config))
@@ -580,10 +1168,9 @@ def _write_manifest(
     media_root: str | None,
     media_uri_map,
     context_parallel_size: int,
-    context_layout: str,
-    expert_parallel_size: int,
-    tensor_parallel_size: int,
     fsdp_size: int,
+    target_micro_chunk_size: int,
+    target_cache_cpu_offload: bool,
     stores_target_last_hidden_states: bool,
     shards,
 ):
@@ -605,21 +1192,21 @@ def _write_manifest(
             "processor_class": processor_class,
             "media_root": media_root,
             "media_uri_map": media_uri_map,
+            "target_context_parallel_size": int(context_parallel_size),
             "cache_context_parallel_size": int(context_parallel_size),
-            "context_layout": str(context_layout),
+            "context_layout": (
+                "native_head_tail" if context_parallel_size > 1 else "contiguous"
+            ),
             "index_files": [str(file_name) for file_name in index_files],
             "target_context_parallel_implementation": (
-                "model_native_ring" if context_parallel_size > 1 else "disabled"
+                "pytorch_native" if context_parallel_size > 1 else "disabled"
             ),
             "target_fsdp_size": int(fsdp_size),
+            "target_micro_chunk_size": int(target_micro_chunk_size),
+            "target_cache_cpu_offload": bool(target_cache_cpu_offload),
             "stores_target_last_hidden_states": bool(
                 stores_target_last_hidden_states
             ),
-            "target_expert_parallel_size": int(expert_parallel_size),
-            "target_expert_parallel_implementation": (
-                "token_all_to_all" if expert_parallel_size > 1 else "disabled"
-            ),
-            "target_tensor_parallel_size": int(tensor_parallel_size),
             "project_name": (
                 str(config.get("project_name"))
                 if config.get("project_name") is not None
@@ -636,9 +1223,7 @@ def _write_manifest(
     write_target_cache_manifest(output_dir=output_dir, manifest=manifest)
 
 
-def _print_prepare_progress(
-    *, global_rank: int, processed_samples: int, total_samples: int
-):
+def _print_prepare_progress(*, global_rank: int, processed_samples: int, total_samples: int):
     print(
         f"[prepare rank {global_rank}] {processed_samples}/{total_samples} samples",
         flush=True,
@@ -650,97 +1235,61 @@ def main(local_rank: int):
     train_data_paths = list(cli_args.train_data_path)
     target_layer_ids = [int(layer_id) for layer_id in config.model.target_layer_ids]
     min_loss_tokens = int(cli_args.min_loss_tokens)
-    stores_target_last_hidden_states = bool(
-        config.data.get("store_target_last_hidden_states", True)
+    media_root = (
+        os.path.abspath(cli_args.media_root) if cli_args.media_root is not None else None
     )
+    media_uri_map = cli_args.media_uri_map
     target_config = AutoConfig.from_pretrained(
         config.model.target_model_name_or_path,
     )
     configured_multimodal = config.data.get("multimodal")
     multimodal = (
-        (
-            str(target_config.model_type).lower()
-            in ("qwen3_5", "qwen3_5_text")
-            and is_multimodal_config(target_config)
-        )
+        is_multimodal_config(target_config)
         if configured_multimodal is None
         else bool(configured_multimodal)
     )
-    media_root = (
-        os.path.abspath(cli_args.media_root)
-        if cli_args.media_root is not None
-        else None
-    )
-    media_uri_map = cli_args.media_uri_map
     seed_all(int(config.seed))
     device, global_rank, world_size = init_dist(local_rank)
-    configured_context_parallel_size = cli_args.context_parallel_size
-    if configured_context_parallel_size is None:
-        configured_context_parallel_size = config.train.get(
-            "context_parallel_size", 1
-        )
-    context_parallel_size = int(configured_context_parallel_size)
-    if context_parallel_size < 1:
-        raise ValueError("--context-parallel-size must be positive.")
-    configured_expert_parallel_size = cli_args.expert_parallel_size
-    if configured_expert_parallel_size is None:
-        configured_expert_parallel_size = config.train.get(
-            "expert_parallel_size", 1
-        )
-    expert_parallel_size = int(configured_expert_parallel_size)
-    configured_tensor_parallel_size = cli_args.tensor_parallel_size
-    if configured_tensor_parallel_size is None:
-        configured_tensor_parallel_size = config.train.get(
-            "tensor_parallel_size", 1
-        )
-    tensor_parallel_size = int(configured_tensor_parallel_size)
-    if expert_parallel_size < 1 or tensor_parallel_size < 1:
-        raise ValueError("EP and TP sizes must both be positive.")
-    if str(target_config.model_type).lower() in ("qwen3_5", "qwen3_5_text") and (
-        expert_parallel_size > 1 or tensor_parallel_size > 1
-    ):
-        raise ValueError(
-            "Qwen3.6 target-cache generation supports CP and FSDP; set "
-            "expert_parallel_size=1 and tensor_parallel_size=1."
-        )
+    context_parallel_size = int(cli_args.context_parallel_size)
+    target_micro_chunk_size = int(cli_args.target_micro_chunk_size)
+    target_cache_cpu_offload = cli_args.target_cache_cpu_offload == "true"
+    stores_target_last_hidden_states = bool(
+        config.data.get("store_target_last_hidden_states", True)
+    )
+    if target_micro_chunk_size < 0:
+        raise ValueError("--target-micro-chunk-size cannot be negative.")
     if context_parallel_size > 1 and not cli_args.fsdp:
-        raise ValueError("Target Context Parallel currently requires --fsdp.")
-    if cli_args.fsdp:
-        configured_fsdp_size = cli_args.fsdp_size
-        if configured_fsdp_size is None:
-            configured_fsdp_size = config.train.get("fsdp_size")
-        fsdp_size = (
-            world_size
-            // (
-                context_parallel_size
-                * expert_parallel_size
-                * tensor_parallel_size
-            )
-            if configured_fsdp_size is None
-            else int(configured_fsdp_size)
+        raise ValueError("Target context parallelism requires --fsdp.")
+    if context_parallel_size > 1 and target_micro_chunk_size != 0:
+        raise ValueError(
+            "PyTorch native target Context Parallel requires "
+            "--target-micro-chunk-size 0."
         )
-    else:
-        if cli_args.fsdp_size is not None:
-            raise ValueError("--fsdp-size requires --fsdp.")
-        fsdp_size = 1
+    if context_parallel_size > 1 and target_cache_cpu_offload:
+        raise ValueError(
+            "PyTorch native target Context Parallel keeps full-attention K/V "
+            "sequence-sharded and requires --target-cache-cpu-offload false."
+        )
+    fsdp_size = (
+        world_size // context_parallel_size
+        if cli_args.fsdp_size is None
+        else int(cli_args.fsdp_size)
+    )
     topology = build_parallel_topology(
         context_parallel_size=context_parallel_size,
-        expert_parallel_size=expert_parallel_size,
-        tensor_parallel_size=tensor_parallel_size,
         fsdp_size=fsdp_size,
-        create_fsdp_groups=bool(cli_args.fsdp),
+        create_fsdp_groups=True,
     )
-    local_batch_size = int(cli_args.local_batch_size)
-    if (
-        cli_args.fsdp
-        or context_parallel_size > 1
-        or expert_parallel_size > 1
-        or tensor_parallel_size > 1
-    ) and local_batch_size != 1:
-        raise ValueError(
-            "Target-cache FSDP/CP/EP/TP currently requires "
-            "--local-batch-size 1."
+    context_parallel_mesh = None
+    if context_parallel_size > 1:
+        context_parallel_mesh = DeviceMesh.from_group(
+            topology.context_parallel_group,
+            "cuda",
+            mesh_dim_names=("context",),
         )
+        # alltoall rotates one K/V shard at a time. The default allgather
+        # materializes all shards and recreates the long-context memory peak.
+        set_rotate_method("alltoall")
     output_dir = os.path.abspath(cli_args.output_dir)
     print_on_local_main(json.dumps(config, indent=4, cls=CustomJSONEncoder), flush=True)
     print_on_local_main(
@@ -756,15 +1305,13 @@ def main(local_rank: int):
                 "fsdp": bool(cli_args.fsdp),
                 "fsdp_size": fsdp_size,
                 "context_parallel_size": context_parallel_size,
-                "expert_parallel_size": expert_parallel_size,
-                "tensor_parallel_size": tensor_parallel_size,
+                "context_parallel_implementation": (
+                    "pytorch_native" if context_parallel_size > 1 else "disabled"
+                ),
+                "target_micro_chunk_size": target_micro_chunk_size,
+                "target_cache_cpu_offload": target_cache_cpu_offload,
                 "stores_target_last_hidden_states": (
                     stores_target_last_hidden_states
-                ),
-                "context_parallel_implementation": (
-                    "model_native_ring"
-                    if context_parallel_size > 1
-                    else "disabled"
                 ),
                 "sample_parallel_size": topology.sample_parallel_size,
                 "multimodal": multimodal,
@@ -784,21 +1331,20 @@ def main(local_rank: int):
 
     with main_process_first():
         dataset = JsonLineDataset(data_paths=train_data_paths)
-    dataset_size = len(dataset)
 
     local_start, local_end = compute_local_sample_range(
-        num_samples=dataset_size,
+        num_samples=len(dataset),
         rank=topology.sample_parallel_rank,
         world_size=topology.sample_parallel_size,
     )
     local_total_samples = local_end - local_start
+    if cli_args.fsdp and int(cli_args.local_batch_size) != 1:
+        raise ValueError("Target-cache FSDP currently requires --local-batch-size 1.")
     local_indices = list(range(local_start, local_end))
     if cli_args.fsdp:
-        # Ranks in an FSDP group may own different samples, but they must enter
-        # the same number of wrapped-layer collectives.  Duplicate one local
-        # index only as a non-writing padding step on shorter ranks.
+        # Every rank must issue the same number of FSDP parameter collectives.
         max_local_steps = (
-            dataset_size + topology.sample_parallel_size - 1
+            len(dataset) + topology.sample_parallel_size - 1
         ) // topology.sample_parallel_size
         padding_steps = max_local_steps - len(local_indices)
         if padding_steps:
@@ -831,47 +1377,20 @@ def main(local_rank: int):
             max_length=config.data.max_length,
             min_loss_tokens=min_loss_tokens,
         )
-    if cli_args.fsdp:
-        target_model = _build_fsdp_target_model(
-            model_name_or_path=config.model.target_model_name_or_path,
-            target_config=target_config,
-            fsdp_rank=topology.fsdp_rank,
-        ).eval()
-    else:
-        load_kwargs = {
-            "config": target_config,
-            "dtype": torch.bfloat16,
-        }
-        if str(target_config.model_type).lower() in (
-            "qwen3_5",
-            "qwen3_5_text",
-        ):
-            load_kwargs["attn_implementation"] = "sdpa"
-        target_model = AutoModel.from_pretrained(
-            config.model.target_model_name_or_path,
-            **load_kwargs,
-        ).eval()
+    target_model = load_target_cache_model(
+        config.model.target_model_name_or_path,
+        dtype=torch.bfloat16,
+        attn_implementation="sdpa",
+    ).to(device=device).eval()
     target_model.requires_grad_(False)
-    if expert_parallel_size > 1 or tensor_parallel_size > 1:
-        target_model = parallelize_deepseek_v4_model(
-            target_model,
-            topology=topology,
-            draft=False,
-        )
-    if context_parallel_size > 1:
-        target_model = install_target_context_parallel(target_model)
-    context_layout = str(
-        getattr(target_model, "_deepspec_context_layout", "contiguous")
-    )
-    target_hidden_size = _get_target_hidden_size(target_model)
+    target_hidden_size = get_target_hidden_size(target_model)
     if cli_args.fsdp:
         target_model = _wrap_target_model_with_fsdp(
             target_model=target_model,
             device=device,
             process_group=topology.fsdp_group,
+            layerwise_only=context_parallel_size > 1,
         ).eval()
-    else:
-        target_model = target_model.to(device=device)
     dataloader = DataLoader(
         local_subset,
         batch_size=int(cli_args.local_batch_size),
@@ -884,7 +1403,6 @@ def main(local_rank: int):
         rank_dir=rank_dir,
         max_shard_bytes=int(cli_args.max_shard_bytes),
         max_queue_size=int(cli_args.local_batch_size) * 4,
-        context_layout=context_layout,
     )
 
     processed_local_samples = 0
@@ -896,19 +1414,12 @@ def main(local_rank: int):
                     (batch_idx + 1) * int(cli_args.local_batch_size),
                     local_total_samples,
                 )
+                is_padding_step = cli_args.fsdp and batch_idx >= local_total_samples
                 should_print_progress = (
                     processed_local_samples - last_progress_printed >= 100
                     or processed_local_samples == local_total_samples
                 )
-                is_padding_step = bool(cli_args.fsdp) and (
-                    batch_idx >= local_total_samples
-                )
-                should_write_batch = (
-                    batch is not None
-                    and not is_padding_step
-                    and topology.expert_parallel_rank == 0
-                    and topology.tensor_parallel_rank == 0
-                )
+                should_write_batch = batch is not None and not is_padding_step
                 if batch is None and not cli_args.fsdp:
                     if should_print_progress:
                         _print_prepare_progress(
@@ -918,44 +1429,47 @@ def main(local_rank: int):
                         )
                         last_progress_printed = processed_local_samples
                     continue
-                if batch is None or is_padding_step:
-                    batch = _build_dummy_batch(
-                        device=device,
-                        sequence_length=context_parallel_size,
-                    )
+                if batch is None:
+                    batch = _build_dummy_model_inputs(device=device)
                 batch = {
-                    key: value.to(device, non_blocking=True)
+                    key: (
+                        value.to(device, non_blocking=True)
+                        if isinstance(value, torch.Tensor)
+                        else value
+                    )
                     for key, value in batch.items()
                 }
-                loss_mask = batch.pop("loss_mask")
-                model_inputs = batch
+                model_inputs = {
+                    key: value for key, value in batch.items() if key != "loss_mask"
+                }
                 if context_parallel_size > 1:
-                    if int(batch["input_ids"].shape[0]) != 1:
-                        raise ValueError("Target CP only supports batch size 1.")
-                    attention_mask = batch["attention_mask"]
-                    sequence_length = int(attention_mask.sum(dim=1)[0].item())
-                    if sequence_length < 1:
-                        raise ValueError("Target CP received an empty sequence.")
-                    if (
-                        not bool(attention_mask[0, :sequence_length].all())
-                        or bool(attention_mask[0, sequence_length:].any())
-                    ):
-                        raise ValueError("Target CP requires right-padded inputs.")
-                    padded_length = int(batch["input_ids"].shape[1])
-                    for key in ("input_ids", "attention_mask", "mm_token_type_ids"):
-                        tensor = batch.get(key)
-                        if (
-                            tensor is not None
-                            and tensor.ndim >= 2
-                            and int(tensor.shape[-1]) == padded_length
-                        ):
-                            batch[key] = tensor[..., :sequence_length]
-                    loss_mask = loss_mask[..., :sequence_length]
-                    target_result = _run_target_forward_context_parallel(
+                    if int(cli_args.local_batch_size) != 1:
+                        raise ValueError(
+                            "Target CP currently requires --local-batch-size 1."
+                        )
+                    full_embeddings, full_position_ids = (
+                        _prepare_cp_embeddings_and_positions(
+                            target_model=target_model,
+                            model_inputs=model_inputs,
+                        )
+                    )
+                    cp_attention_mask = model_inputs["attention_mask"].clone()
+                    # Vision tensors are no longer needed after multimodal
+                    # embeddings/M-RoPE positions have been constructed.
+                    del model_inputs
+                    for key in tuple(batch):
+                        if key not in ("input_ids", "attention_mask", "loss_mask"):
+                            del batch[key]
+                    torch.cuda.empty_cache()
+                    assert context_parallel_mesh is not None
+                    target_result = _run_target_forward_native_cp(
                         target_model=target_model,
-                        model_inputs=model_inputs,
+                        full_embeddings=full_embeddings,
+                        full_position_ids=full_position_ids,
+                        attention_mask=cp_attention_mask,
                         target_layer_ids=target_layer_ids,
                         topology=topology,
+                        context_parallel_mesh=context_parallel_mesh,
                         device=device,
                     )
                 else:
@@ -972,46 +1486,46 @@ def main(local_rank: int):
                             total_samples=local_total_samples,
                         )
                         last_progress_printed = processed_local_samples
-                    del target_result, model_inputs, batch, loss_mask
                     continue
+                assert target_result is not None
                 for sample_idx_in_batch in range(batch["input_ids"].shape[0]):
                     valid_tokens = batch["attention_mask"][sample_idx_in_batch].bool()
                     if context_parallel_size > 1:
-                        if sample_idx_in_batch != 0:
-                            raise RuntimeError("Target CP only supports batch size 1.")
-                        local_hidden_states = target_result.target_hidden_states[0]
-                        local_last_hidden_states = (
-                            target_result.target_last_hidden_states[0]
+                        local_target_hidden_states = (
+                            target_result.target_hidden_states[sample_idx_in_batch]
+                        )
+                        local_target_last_hidden_states = (
+                            target_result.target_last_hidden_states[
+                                sample_idx_in_batch
+                            ]
                             if stores_target_last_hidden_states
                             else None
                         )
-                        context_start = int(target_result.context_start)
                     else:
                         output_valid_tokens = valid_tokens.to(
                             target_result.target_hidden_states.device
                         )
-                        local_hidden_states = target_result.target_hidden_states[
-                            sample_idx_in_batch
-                        ][output_valid_tokens]
-                        local_last_hidden_states = (
+                        local_target_hidden_states = (
+                            target_result.target_hidden_states[sample_idx_in_batch][
+                                output_valid_tokens
+                            ]
+                        )
+                        local_target_last_hidden_states = (
                             target_result.target_last_hidden_states[
                                 sample_idx_in_batch
                             ][output_valid_tokens]
                             if stores_target_last_hidden_states
                             else None
                         )
-                        context_start = 0
                     writer.write_sample(
-                        context_start=context_start,
                         input_ids=batch["input_ids"][sample_idx_in_batch][valid_tokens],
                         attention_mask=batch["attention_mask"][sample_idx_in_batch][
                             valid_tokens
                         ],
-                        loss_mask=loss_mask[sample_idx_in_batch][valid_tokens],
-                        target_hidden_states=local_hidden_states,
-                        target_last_hidden_states=local_last_hidden_states,
+                        loss_mask=batch["loss_mask"][sample_idx_in_batch][valid_tokens],
+                        target_hidden_states=local_target_hidden_states,
+                        target_last_hidden_states=local_target_last_hidden_states,
                     )
-                del target_result, model_inputs, batch, loss_mask
                 if should_print_progress:
                     _print_prepare_progress(
                         global_rank=global_rank,
@@ -1065,7 +1579,6 @@ def main(local_rank: int):
             summaries=summaries,
             shard_map=shard_map,
             context_parallel_size=context_parallel_size,
-            context_layout=context_layout,
         )
         _write_manifest(
             output_dir=output_dir,
@@ -1077,25 +1590,20 @@ def main(local_rank: int):
             hidden_size=target_hidden_size,
             min_loss_tokens=min_loss_tokens,
             multimodal=multimodal,
-            processor_class=(
-                type(processor).__name__ if processor is not None else None
-            ),
+            processor_class=(type(processor).__name__ if processor is not None else None),
             media_root=media_root,
             media_uri_map=media_uri_map,
             context_parallel_size=context_parallel_size,
-            context_layout=context_layout,
-            expert_parallel_size=expert_parallel_size,
-            tensor_parallel_size=tensor_parallel_size,
             fsdp_size=fsdp_size,
-            stores_target_last_hidden_states=(
-                stores_target_last_hidden_states
-            ),
+            target_micro_chunk_size=target_micro_chunk_size,
+            target_cache_cpu_offload=target_cache_cpu_offload,
+            stores_target_last_hidden_states=stores_target_last_hidden_states,
             shards=shards,
         )
         cleanup_target_cache_tmp_dir(output_dir)
         print_on_global_main(
             f"Prepared target cache at {output_dir} with "
-            f"{num_valid_samples}/{dataset_size} valid samples."
+            f"{num_valid_samples}/{len(dataset)} valid samples."
         )
     dist.barrier()
     dist.destroy_process_group()

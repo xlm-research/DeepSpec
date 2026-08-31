@@ -187,9 +187,11 @@ class TargetModelAdapter:
 
 
 class Qwen3_6TargetAdapter(TargetModelAdapter):
-    """Adapter for the Qwen3.6 checkpoint's Qwen3.5 hybrid VLM architecture."""
+    """Adapter for Qwen3.6/Qwen3.8 checkpoints' Qwen3.5 hybrid architecture."""
 
     name = "qwen3_6"
+
+    _CACHE_SNAPSHOT_ATTR = "_deepspec_qwen36_verification_snapshot"
 
     @classmethod
     def matches(cls, config, model_name_or_path: str | None = None) -> bool:
@@ -212,7 +214,18 @@ class Qwen3_6TargetAdapter(TargetModelAdapter):
         model_inputs: dict[str, torch.Tensor],
         cache,
     ) -> dict[str, Any]:
-        del target_model
+        # ``rope_deltas`` lives on the multimodal backbone and is mutated by a
+        # multimodal prefill.  A later text-only prefill does not overwrite it,
+        # so incremental decoding would otherwise reuse the previous sample's
+        # MRoPE offset.
+        candidate = target_model
+        for _ in range(3):
+            if hasattr(candidate, "rope_deltas"):
+                candidate.rope_deltas = None
+            nested = getattr(candidate, "model", None)
+            if nested is None or nested is candidate:
+                break
+            candidate = nested
         # Qwen3.6 computes multimodal MRoPE positions from token types and
         # image/video grids. A flat text position tensor would be incorrect.
         return {
@@ -251,6 +264,7 @@ class Qwen3_6TargetAdapter(TargetModelAdapter):
         cache,
     ) -> dict[str, Any]:
         del position_ids, start
+        self._snapshot_linear_cache(cache)
         # The model reuses rope_deltas computed during multimodal prefill.
         return {
             "input_ids": verify_input_ids,
@@ -271,11 +285,31 @@ class Qwen3_6TargetAdapter(TargetModelAdapter):
         draft_token_count: int,
     ):
         if int(accepted_draft_tokens) == int(draft_token_count):
+            self._discard_linear_cache_snapshot(cache)
+            return cache
+
+        replay_start = int(committed_length) - int(accepted_draft_tokens) - 1
+        if self._restore_verified_prefix(cache, replay_start):
+            # Verification advanced every recurrent layer through the complete
+            # proposal.  Restore the state before verification, crop only the
+            # ordinary attention KV layers, then replay the committed current
+            # token and accepted draft prefix.  This is O(block_size), unlike
+            # rebuilding the complete prompt and generated prefix.
+            replay_input_ids = output_ids[:, replay_start:committed_length]
+            target_model(
+                input_ids=replay_input_ids,
+                past_key_values=cache,
+                use_cache=True,
+                output_hidden_states=False,
+                logits_to_keep=1,
+            )
             return cache
 
         # Qwen3.6 interleaves full-attention KV layers with recurrent
         # DeltaNet layers. DynamicCache.crop cannot roll recurrent states back
-        # after a rejected proposal, so rebuild the cache from committed tokens.
+        # after a rejected proposal.  If the installed cache implementation is
+        # not snapshot-compatible, preserve correctness by rebuilding from the
+        # committed tokens.
         rebuilt_inputs = {}
         original_length = int(model_inputs["input_ids"].shape[1])
         for key, value in model_inputs.items():
@@ -315,6 +349,111 @@ class Qwen3_6TargetAdapter(TargetModelAdapter):
         rebuild_kwargs["output_hidden_states"] = False
         target_model(**rebuild_kwargs)
         return rebuilt_cache
+
+    @classmethod
+    def _discard_linear_cache_snapshot(cls, cache) -> None:
+        if hasattr(cache, cls._CACHE_SNAPSHOT_ATTR):
+            delattr(cache, cls._CACHE_SNAPSHOT_ATTR)
+
+    @classmethod
+    def _snapshot_linear_cache(cls, cache) -> None:
+        layers = getattr(cache, "layers", None)
+        if layers is None or not hasattr(cache, "get_seq_length"):
+            cls._discard_linear_cache_snapshot(cache)
+            return
+
+        linear_layers = {}
+        for layer_idx, layer in enumerate(layers):
+            if not hasattr(layer, "recurrent_states"):
+                continue
+            linear_layers[layer_idx] = {
+                "conv_states": {
+                    state_idx: (
+                        state.detach().clone()
+                        if isinstance(state, torch.Tensor)
+                        else None
+                    )
+                    for state_idx, state in layer.conv_states.items()
+                },
+                "recurrent_states": {
+                    state_idx: (
+                        state.detach().clone()
+                        if isinstance(state, torch.Tensor)
+                        else None
+                    )
+                    for state_idx, state in layer.recurrent_states.items()
+                },
+                "has_previous_state": dict(layer.has_previous_state),
+                "is_conv_states_initialized": dict(
+                    layer.is_conv_states_initialized
+                ),
+                "is_recurrent_states_initialized": dict(
+                    layer.is_recurrent_states_initialized
+                ),
+            }
+
+        setattr(
+            cache,
+            cls._CACHE_SNAPSHOT_ATTR,
+            {
+                "prefix_length": int(cache.get_seq_length()),
+                "linear_layers": linear_layers,
+            },
+        )
+
+    @classmethod
+    def _restore_verified_prefix(cls, cache, prefix_length: int) -> bool:
+        snapshot = getattr(cache, cls._CACHE_SNAPSHOT_ATTR, None)
+        cls._discard_linear_cache_snapshot(cache)
+        if snapshot is None or int(snapshot["prefix_length"]) != int(prefix_length):
+            return False
+
+        layers = getattr(cache, "layers", None)
+        linear_layers = snapshot["linear_layers"]
+        if layers is None or not linear_layers:
+            return False
+
+        # Validate the complete operation before mutating any cache layer.  An
+        # unfamiliar future Transformers cache safely falls back to rebuilding.
+        for layer_idx, layer in enumerate(layers):
+            if layer_idx in linear_layers:
+                saved = linear_layers[layer_idx]
+                if not all(hasattr(layer, field) for field in saved):
+                    return False
+                continue
+            if not hasattr(layer, "get_seq_length") or not hasattr(layer, "crop"):
+                return False
+            if int(layer.get_seq_length()) < int(prefix_length):
+                return False
+
+        for layer_idx, layer in enumerate(layers):
+            if layer_idx in linear_layers:
+                saved = linear_layers[layer_idx]
+                for field in ("conv_states", "recurrent_states"):
+                    current_states = getattr(layer, field)
+                    for state_idx, saved_state in saved[field].items():
+                        current_state = current_states.get(state_idx)
+                        if (
+                            isinstance(current_state, torch.Tensor)
+                            and isinstance(saved_state, torch.Tensor)
+                            and current_state.shape == saved_state.shape
+                        ):
+                            current_state.copy_(saved_state)
+                        else:
+                            current_states[state_idx] = saved_state
+                layer.has_previous_state = dict(saved["has_previous_state"])
+                layer.is_conv_states_initialized = dict(
+                    saved["is_conv_states_initialized"]
+                )
+                layer.is_recurrent_states_initialized = dict(
+                    saved["is_recurrent_states_initialized"]
+                )
+                continue
+
+            tokens_to_remove = int(layer.get_seq_length()) - int(prefix_length)
+            if tokens_to_remove > 0:
+                layer.crop(-tokens_to_remove)
+        return True
 
 
 _TARGET_ADAPTERS = [Qwen3_6TargetAdapter, TargetModelAdapter]

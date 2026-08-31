@@ -6,6 +6,10 @@ import torch
 from transformers import DynamicCache
 
 from deepspec.eval.base_evaluator import DraftProposal
+from deepspec.eval.dspark.scheduler import (
+    HardwareAwarePrefixScheduler,
+    SequentialTemperatureScaler,
+)
 from deepspec.utils.sampling import logits_to_probs
 from deepspec.modeling.dspark.gemma4 import Gemma4DSparkModel
 from deepspec.modeling.dspark.qwen3 import Qwen3DSparkModel
@@ -17,6 +21,7 @@ DSparkModel = Qwen3DSparkModel | Gemma4DSparkModel
 @dataclass
 class DSparkDraftProposal(DraftProposal):
     confidence_logits: torch.Tensor | None = None
+    confidence_probs: torch.Tensor | None = None
 
 
 def forward_dspark_draft_block(
@@ -51,6 +56,7 @@ def _empty_dspark_proposal(draft_input_ids: torch.Tensor) -> DSparkDraftProposal
         verify_input_ids=draft_input_ids[:, :1],
         draft_probs=None,
         confidence_logits=None,
+        confidence_probs=None,
     )
 
 
@@ -80,14 +86,14 @@ def _predict_confidence_logits(
 
 
 def _confident_prefix_length(
-    confidence_logits: torch.Tensor,
+    confidence_probs: torch.Tensor,
     *,
     block_size: int,
     threshold: float,
 ) -> int:
     if threshold <= 0.0:
         return int(block_size)
-    below_threshold = confidence_logits.sigmoid() < threshold
+    below_threshold = confidence_probs < threshold
     if not bool(below_threshold[0].any().item()):
         return int(block_size)
     return int(torch.nonzero(below_threshold[0], as_tuple=False)[0].item())
@@ -101,6 +107,8 @@ def build_dspark_proposal(
     block_size: int,
     temperature: float,
     confidence_threshold: float,
+    confidence_scaler: SequentialTemperatureScaler | None = None,
+    prefix_scheduler: HardwareAwarePrefixScheduler | None = None,
 ) -> DSparkDraftProposal:
     assert draft_input_ids.size(0) == 1, "build_dspark_proposal requires batch_size=1"
     proposal_hidden_states = block_hidden[:, :block_size, :]
@@ -114,6 +122,7 @@ def build_dspark_proposal(
 
     proposal_draft_tokens = int(block_size)
     confidence_logits = None
+    confidence_probs = None
     if model.confidence_head is not None:
         confidence_logits = _predict_confidence_logits(
             model,
@@ -124,11 +133,21 @@ def build_dspark_proposal(
         )
         if confidence_logits is None:
             return _empty_dspark_proposal(draft_input_ids)
-        proposal_draft_tokens = _confident_prefix_length(
-            confidence_logits,
-            block_size=block_size,
-            threshold=float(confidence_threshold),
+        confidence_probs = (
+            confidence_scaler.calibrate_logits(confidence_logits)
+            if confidence_scaler is not None
+            else confidence_logits.sigmoid()
         )
+        if prefix_scheduler is None:
+            proposal_draft_tokens = _confident_prefix_length(
+                confidence_probs,
+                block_size=block_size,
+                threshold=float(confidence_threshold),
+            )
+        else:
+            proposal_draft_tokens = int(
+                prefix_scheduler.select_prefix_lengths(confidence_probs)[0].item()
+            )
 
     if proposal_draft_tokens == 0:
         return _empty_dspark_proposal(draft_input_ids)
@@ -148,6 +167,11 @@ def build_dspark_proposal(
         confidence_logits=(
             confidence_logits[:, :proposal_draft_tokens]
             if confidence_logits is not None
+            else None
+        ),
+        confidence_probs=(
+            confidence_probs[:, :proposal_draft_tokens]
+            if confidence_probs is not None
             else None
         ),
     )
