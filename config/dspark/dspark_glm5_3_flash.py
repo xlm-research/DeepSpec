@@ -1,4 +1,5 @@
 import os
+import math
 
 from deepspec.trainer import Glm5NextDSparkTrainer
 from deepspec.utils.constant import BASE_CKPT_DIR, BASE_TB_DIR
@@ -6,6 +7,25 @@ from deepspec.utils.constant import BASE_CKPT_DIR, BASE_TB_DIR
 project_name = "deepspec_glm5"
 exp_name = "dspark_glm5_3_flash_128k"
 seed = 42
+
+# Torchrun exports the GPU-process world size before each worker imports this
+# config. Keep the historical 8-GPU values when the file is inspected outside
+# a distributed launch, while deriving node-local HSDP/EP defaults at runtime.
+runtime_world_size = int(os.environ.get("WORLD_SIZE", "8"))
+runtime_local_world_size = int(
+    os.environ.get("LOCAL_WORLD_SIZE", str(runtime_world_size))
+)
+runtime_node_count = max(runtime_world_size // runtime_local_world_size, 1)
+runtime_draft_ep = math.gcd(runtime_local_world_size, 288)
+runtime_target_is_node_local = runtime_local_world_size % 4 == 0
+runtime_target_dp_replicate = (
+    runtime_node_count if runtime_target_is_node_local else 1
+)
+runtime_target_dp_shard = (
+    runtime_local_world_size // 4
+    if runtime_target_is_node_local
+    else max(runtime_world_size // 4, 1)
+)
 
 model = dict(
     target_model_name_or_path=(
@@ -34,20 +54,23 @@ train = dict(
     weight_decay=0.0,
     precision="bf16",
     local_batch_size=1,
-    global_batch_size=8,
-    # One target-first partition is convenient for the bundled 8-sample smoke
-    # set. Production launchers should increase this to bound cache disk use.
-    data_batch_size=1,
+    global_batch_size=max(runtime_world_size, 8),
+    # Requested optimizer-aligned target-cache partition count. The trainer
+    # caps it at the remaining optimizer steps so short runs and resumes keep
+    # every partition non-empty.
+    data_batch_size=256,
     num_train_epochs=1,
-    max_train_steps=1,
+    # Derive the full schedule from the usable dataset by default. Launchers
+    # may set a positive max_train_steps for bounded diagnostics.
+    max_train_steps=None,
     max_grad_norm=1.0,
     sharding_strategy="full_shard",
     parallel=dict(
-        dp_replicate=1,
-        dp_shard=8,
+        dp_replicate=runtime_node_count,
+        dp_shard=runtime_local_world_size,
         cp=1,
         tp=1,
-        ep=8,
+        ep=runtime_draft_ep,
         expert_tp=1,
         use_fsdp=True,
         context_parallel_backend="model_native",
@@ -59,9 +82,23 @@ train = dict(
         reduce_dtype="bf16",
         fsdp_wrap_granularity="block",
     ),
-    # The retained GLM target layers are dense and FSDP-sharded. The draft's
-    # 288 routed experts use the independent EP=8 sparse view above.
+    # target_layer_ids=[0, 1, 2] truncates GLM before its first MoE layer
+    # (index 3), so the retained target has no experts to partition. Keep EP=1;
+    # the draft's 288 routed experts use the independent EP=8 view above.
     target_parallel=dict(ep=1),
+    # Both the reusable full-cache runner and bounded offline data batches use
+    # a target mesh independent of draft training. TP remains fixed at four;
+    # the DP-replicate/FSDP dimensions scale with the torchrun node layout.
+    # EP remains 1 because the truncated target is dense.
+    offline_target_parallel=dict(
+        dp_replicate=runtime_target_dp_replicate,
+        dp_shard=runtime_target_dp_shard,
+        cp=1,
+        tp=4,
+        ep=1,
+        expert_tp=1,
+        use_fsdp=True,
+    ),
     torch_compile=False,
 )
 
@@ -74,11 +111,20 @@ logging = dict(
 profiling = dict(enabled=False)
 
 data = dict(
-    online_target=True,
-    train_data_path="train_data/spec_o3_coldstartsft.first8.repeat1.deepspec.jsonl",
+    online_target=False,
+    # Preserve target-first/offline semantics without materializing the full
+    # dataset: generate one bounded cache partition, train it, then delete it.
+    offline_target_data_batches=True,
+    train_data_path=(
+        "train_data/spec_o3_coldstartsft.first8.repeat1.deepspec.jsonl"
+    ),
+    source_jsonl_path=(
+        "train_data/spec_o3_coldstartsft.first8.repeat1.deepspec.jsonl"
+    ),
     jsonl_index_cache_dir=None,
-    data_batch_cache_dir=None,
+    data_batch_cache_dir=os.environ.get("DEEPSPEC_DATA_BATCH_CACHE_DIR"),
     target_cache_path=None,
+    store_target_last_hidden_states=True,
     chat_template="glm5_next",
     max_length=131072,
     min_loss_tokens=14,
@@ -88,6 +134,16 @@ data = dict(
 
 
 def finalize_cfg(cfg):
+    for runtime_key in (
+        "runtime_world_size",
+        "runtime_local_world_size",
+        "runtime_node_count",
+        "runtime_draft_ep",
+        "runtime_target_is_node_local",
+        "runtime_target_dp_replicate",
+        "runtime_target_dp_shard",
+    ):
+        cfg.pop(runtime_key, None)
     logging_cfg = dict(cfg["logging"])
     output_root = os.environ.get("DEEPSPEC_OUTPUT_ROOT")
     checkpoint_root = (

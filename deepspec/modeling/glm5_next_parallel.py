@@ -1,18 +1,81 @@
-"""Tensor/expert parallel adapter for the GLM-5.3 DSpark draft."""
+"""Tensor/expert parallel adapters for GLM-5.3 target and DSpark draft models."""
+
+import torch
 
 from deepspec.modeling.deepseek_v4_parallel import (
     _column_parallel_linear,
     _parallelize_moe,
+    _parallelize_shared_mlp,
     _parallelize_vocab_embedding,
     _parallelize_vocab_projection,
     _register_replicated_output_gradient,
+    _replace_parameter,
     _require_divisible,
     _row_parallel_linear,
     _slice_parameter,
 )
 
 
-def _parallelize_attention(attention, *, topology) -> None:
+def _slice_packed_heads(
+    module, name: str, *, segments: int, rank: int, size: int
+) -> None:
+    parameter = module._parameters[name]
+    segment_width = _require_divisible(
+        int(parameter.shape[0]), segments, f"{type(module).__name__}.{name}"
+    )
+    local_width = _require_divisible(segment_width, size, name)
+    local_segments = [
+        parameter.narrow(0, segment * segment_width + rank * local_width, local_width)
+        for segment in range(segments)
+    ]
+    _replace_parameter(module, name, torch.cat(local_segments, dim=0))
+
+
+def _parallelize_linear_attention(attention, *, topology) -> None:
+    size = int(topology.tensor_parallel_size)
+    if size == 1:
+        return
+    rank = int(topology.tensor_parallel_rank)
+    group = topology.tensor_parallel_group
+    local_heads = _require_divisible(attention.num_heads, size, "linear_num_heads")
+
+    for projection in (attention.q_proj, attention.k_proj, attention.v_proj):
+        _column_parallel_linear(projection, group=group, rank=rank, size=size)
+    _slice_packed_heads(
+        attention.conv1d,
+        "weight",
+        segments=3,
+        rank=rank,
+        size=size,
+    )
+    attention.conv1d.in_channels //= size
+    attention.conv1d.out_channels //= size
+    attention.conv1d.groups //= size
+
+    forget_gate = attention.forget_gate
+    _column_parallel_linear(
+        forget_gate.f_b_proj, group=group, rank=rank, size=size
+    )
+    _slice_parameter(forget_gate, "dt_bias", dim=0, rank=rank, size=size)
+    _slice_parameter(forget_gate, "A_log", dim=0, rank=rank, size=size)
+    forget_gate.num_heads = local_heads
+    forget_gate.qkv_dim //= size
+
+    _column_parallel_linear(attention.b_proj, group=group, rank=rank, size=size)
+    _column_parallel_linear(attention.g_b_proj, group=group, rank=rank, size=size)
+    _row_parallel_linear(
+        attention.o_proj,
+        group=group,
+        rank=rank,
+        size=size,
+        split_input=False,
+    )
+    attention.num_heads = local_heads
+    attention.qkv_dim //= size
+    attention.conv_dim //= size
+
+
+def _parallelize_sparse_attention(attention, *, topology) -> None:
     size = int(topology.tensor_parallel_size)
     if size == 1:
         return
@@ -38,8 +101,15 @@ def _parallelize_attention(attention, *, topology) -> None:
     )
 
 
+def _parallelize_attention(attention, *, topology) -> None:
+    if hasattr(attention, "q_proj"):
+        _parallelize_linear_attention(attention, topology=topology)
+    else:
+        _parallelize_sparse_attention(attention, topology=topology)
+
+
 def parallelize_glm5_next_model(model, *, topology, draft: bool = False):
-    """Apply GLM-5.3 draft TP and pure expert parallelism in-place."""
+    """Apply GLM-5.3 TP and pure expert parallelism in-place."""
 
     if getattr(model, "_deepspec_ep_tp_installed", False):
         return model
@@ -50,7 +120,10 @@ def parallelize_glm5_next_model(model, *, topology, draft: bool = False):
         )
     for layer in model.layers:
         _parallelize_attention(layer.self_attn, topology=topology)
-        _parallelize_moe(layer.mlp, topology=topology)
+        if hasattr(layer.mlp, "experts"):
+            _parallelize_moe(layer.mlp, topology=topology)
+        else:
+            _parallelize_shared_mlp(layer.mlp, topology=topology)
 
     _parallelize_vocab_embedding(model.embed_tokens, topology=topology)
     if draft:

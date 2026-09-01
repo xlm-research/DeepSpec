@@ -19,6 +19,7 @@ from transformers.distributed.configuration_utils import DistributedConfig
 from deepspec.modeling.deepseek_v4_parallel import (
     parallelize_deepseek_v4_model,
 )
+from deepspec.modeling.glm5_next_parallel import parallelize_glm5_next_model
 from deepspec.modeling.pure_ep import (
     get_pure_expert_modules,
     materialize_modules_locally,
@@ -523,11 +524,6 @@ class Glm5NextOnlineTarget(DeepseekV4OnlineTarget):
                 "GLM-5.3 online target expert parallelism is not implemented; "
                 "set train.target_parallel.ep=1."
             )
-        if topology.tensor_parallel_size != 1:
-            raise NotImplementedError(
-                "GLM-5.3 online target tensor parallelism is not implemented; "
-                "set train.parallel.tp=1."
-            )
         if topology.context_parallel_size != 1:
             raise NotImplementedError(
                 "GLM-5.3 hybrid-attention target context parallelism is not "
@@ -571,6 +567,12 @@ class Glm5NextOnlineTarget(DeepseekV4OnlineTarget):
             topology=topology,
         ).eval()
         model.requires_grad_(False)
+        if topology.tensor_parallel_size > 1:
+            parallelize_glm5_next_model(
+                _get_target_backbone(model),
+                topology=topology,
+                draft=False,
+            )
         self.model = _wrap_target_model_with_fsdp(
             target_model=model,
             device=device,

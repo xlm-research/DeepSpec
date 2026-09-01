@@ -12,7 +12,7 @@ from deepspec.distributed.runtime import initialize_runtime
 _cleanup_registered = False
 
 
-def require_torchrun(test_case, *, world_size: int = 2):
+def require_torchrun(test_case, *, world_size: int | None = 2):
     global _cleanup_registered
     if "LOCAL_RANK" not in os.environ:
         test_case.skipTest("run with torchrun")
@@ -23,7 +23,7 @@ def require_torchrun(test_case, *, world_size: int = 2):
                 dist.destroy_process_group()
         atexit.register(cleanup)
         _cleanup_registered = True
-    if runtime.world_size != world_size:
+    if world_size is not None and runtime.world_size != world_size:
         test_case.skipTest(f"requires world_size={world_size}")
     return runtime
 

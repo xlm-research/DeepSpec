@@ -149,6 +149,24 @@ def _compute_data_batch_schedule(
     return micro_batches, optimizer_steps
 
 
+def _resolve_data_batch_partition_count(
+    configured_data_batch_size,
+    *,
+    remaining_optimizer_steps: int,
+) -> int:
+    """Resolve a requested count to non-empty remaining-step partitions."""
+
+    remaining_optimizer_steps = int(remaining_optimizer_steps)
+    if remaining_optimizer_steps < 0:
+        raise ValueError("remaining_optimizer_steps must be non-negative.")
+    if str(configured_data_batch_size).strip().lower() == "auto":
+        return remaining_optimizer_steps
+    resolved = int(configured_data_batch_size)
+    if resolved <= 0:
+        raise ValueError("data_batch_size must be positive or 'auto'.")
+    return min(resolved, remaining_optimizer_steps)
+
+
 def _compute_samples_per_epoch(*, dataset_size: int, global_batch_size: int) -> int:
     samples_per_epoch = (dataset_size // global_batch_size) * global_batch_size
     assert samples_per_epoch > 0, (
@@ -230,6 +248,18 @@ class BaseTrainer:
     def __init__(self, local_rank, args):
         self.args = args
         self.device, self.global_rank, self.world_size = init_dist(local_rank)
+        self.online_target_enabled = bool(self.args.data.get("online_target", False))
+        self.offline_target_data_batches_enabled = bool(
+            self.args.data.get("offline_target_data_batches", False)
+        )
+        if (
+            self.online_target_enabled
+            and self.offline_target_data_batches_enabled
+        ):
+            raise ValueError(
+                "data.online_target and data.offline_target_data_batches are "
+                "mutually exclusive."
+            )
         self.parallel_config = ParallelConfig.from_mapping(
             self.args.train,
             world_size=self.world_size,
@@ -245,8 +275,31 @@ class BaseTrainer:
         # anchor-sized draft model.
         self.target_parallel_config = self.parallel_config
         self.target_parallel = self.parallel
-        target_parallel_overrides = self.args.train.get("target_parallel")
-        if target_parallel_overrides is not None:
+        self.heterogeneous_target_data_batches = False
+        offline_target_parallel = self.args.train.get("offline_target_parallel")
+        if self.offline_target_data_batches_enabled:
+            if offline_target_parallel is None:
+                raise ValueError(
+                    "Offline target data batches require "
+                    "train.offline_target_parallel."
+                )
+            self.target_parallel_config = ParallelConfig.from_mapping(
+                {"parallel": dict(offline_target_parallel)},
+                world_size=self.world_size,
+            )
+            self.target_parallel = ParallelContext.build(
+                self.target_parallel_config,
+                device_type=self.device.type,
+            )
+            self.heterogeneous_target_data_batches = (
+                self.target_parallel_config != self.parallel_config
+            )
+        else:
+            target_parallel_overrides = self.args.train.get("target_parallel")
+        if (
+            not self.offline_target_data_batches_enabled
+            and target_parallel_overrides is not None
+        ):
             merged_target_parallel = self.parallel_config.to_dict()
             merged_target_parallel.update(dict(target_parallel_overrides))
             self.target_parallel_config = ParallelConfig.from_mapping(
@@ -299,10 +352,11 @@ class BaseTrainer:
         )
         self.suspend_controller = SuspendController(device=self.device)
         self.next_micro_step = 0
-        self.online_target_enabled = bool(self.args.data.get("online_target", False))
         self.online_target = None
-        if self.online_target_enabled and int(self.args.train.local_batch_size) != 1:
-            raise ValueError("Online target training requires local_batch_size=1.")
+        if self.target_runtime_enabled and int(self.args.train.local_batch_size) != 1:
+            raise ValueError(
+                "Runtime target inference requires local_batch_size=1."
+            )
         configured_data_batch_size = self.args.train.get("data_batch_size")
         self.data_batch_size = None
         self.data_batch_micro_batches = None
@@ -313,11 +367,15 @@ class BaseTrainer:
         self._data_batch_phase = None
         self._data_batch_end_after_current = False
         if configured_data_batch_size is not None:
-            if not self.online_target_enabled:
-                raise ValueError("data_batch_size requires online target training.")
-            self.data_batch_size = int(configured_data_batch_size)
-            if self.data_batch_size <= 0:
-                raise ValueError("data_batch_size must be positive.")
+            if not self.target_runtime_enabled:
+                raise ValueError(
+                    "data_batch_size requires online target training or "
+                    "offline target data batches."
+                )
+            self.data_batch_size = _resolve_data_batch_partition_count(
+                configured_data_batch_size,
+                remaining_optimizer_steps=1,
+            )
             self.data_batch_cache_root = os.path.abspath(
                 os.fspath(
                     self.args.data.get("data_batch_cache_dir")
@@ -328,8 +386,14 @@ class BaseTrainer:
                 )
             )
             self._initialize_data_batch_cache()
+        elif self.offline_target_data_batches_enabled:
+            raise ValueError(
+                "data.offline_target_data_batches requires train.data_batch_size."
+            )
+        if self.heterogeneous_target_data_batches:
+            self._validate_heterogeneous_target_data_batch_layout()
         self.target_cache_path = self.args.data.get("target_cache_path")
-        if not self.online_target_enabled and not self.target_cache_path:
+        if not self.target_runtime_enabled and not self.target_cache_path:
             raise ValueError(
                 "Offline target training requires data.target_cache_path. "
                 "Precompute it before launching draft training."
@@ -378,7 +442,7 @@ class BaseTrainer:
         )
         self._pure_expert_modules = get_pure_expert_modules(self.draft_model)
 
-        if self.online_target_enabled:
+        if self.target_runtime_enabled:
             paths = self.args.data.get("train_data_path")
             paths = (
                 [os.fspath(paths)]
@@ -387,7 +451,7 @@ class BaseTrainer:
             )
             if not paths:
                 raise ValueError(
-                    "Online target training requires data.train_data_path."
+                    "Runtime target inference requires data.train_data_path."
                 )
             # A large JSONL needs one full sequential scan to build its line
             # index. Build it once on global rank 0 in a shared cache, then let
@@ -421,7 +485,7 @@ class BaseTrainer:
         # filesystem traffic. Validate the complete cache identity once, then
         # broadcast any error so all ranks fail together before training.
         cache_validation_error = [None]
-        if not self.online_target_enabled and is_global_main_process():
+        if not self.target_runtime_enabled and is_global_main_process():
             source_jsonl_path = self.args.data.get("source_jsonl_path")
             try:
                 validate_train_cache(
@@ -521,6 +585,10 @@ class BaseTrainer:
                     f"gradient_accumulation_steps={self.gradient_accumulation_steps}."
                 )
             remaining_optimizer_steps = self.max_train_steps - self.global_step
+            self.data_batch_size = _resolve_data_batch_partition_count(
+                configured_data_batch_size,
+                remaining_optimizer_steps=remaining_optimizer_steps,
+            )
             if remaining_optimizer_steps == 0:
                 self.data_batch_micro_batches = ()
                 self.optimizer_steps_per_data_batch = ()
@@ -538,13 +606,54 @@ class BaseTrainer:
                     data_parallel_size=self.data_parallel_size,
                     local_batch_size=int(self.args.train.local_batch_size),
                 )
-        if self.online_target_enabled:
+        if self.target_runtime_enabled:
             self.online_target = self.build_online_target()
         self.info_board()
 
     @property
+    def target_runtime_enabled(self) -> bool:
+        return bool(
+            getattr(self, "online_target_enabled", False)
+            or getattr(self, "offline_target_data_batches_enabled", False)
+        )
+
+    @property
     def global_step(self):
         return self.next_micro_step // self.gradient_accumulation_steps
+
+    def _validate_heterogeneous_target_data_batch_layout(self) -> None:
+        draft = self.parallel_config
+        target = self.target_parallel_config
+        if draft.cp != 1 or draft.tp != 1:
+            raise NotImplementedError(
+                "Heterogeneous target data batches currently require draft "
+                "CP=1 and TP=1."
+            )
+        if target.cp != 1:
+            raise NotImplementedError(
+                "Heterogeneous target data batches currently require target CP=1."
+            )
+        if self.data_parallel_size != self.world_size:
+            raise ValueError(
+                "Every draft rank must own one source sample in heterogeneous "
+                "target data-batch mode."
+            )
+        if self.data_parallel_rank != self.global_rank:
+            raise ValueError(
+                "Heterogeneous target data batches require draft data-parallel "
+                "rank order to match global rank order."
+            )
+        target_sample_slots = (
+            self.target_parallel.data_parallel_size
+            * self.target_parallel.tensor_parallel_size
+        )
+        if target_sample_slots != self.world_size:
+            raise ValueError(
+                "Target DP x TP must cover every draft sample owner: "
+                f"{self.target_parallel.data_parallel_size} x "
+                f"{self.target_parallel.tensor_parallel_size} != "
+                f"{self.world_size}."
+            )
 
     def info_board(self):
         print_on_local_main("***** Running training *****")
@@ -554,7 +663,9 @@ class BaseTrainer:
             f"CP {self.context_parallel_size} x FSDP {self.fsdp_size} "
             f"(effective data replicas {self.data_parallel_size}), "
             f"draft EP {self.parallel_config.ep}, "
-            f"target EP {self.target_parallel_config.ep}"
+            f"target FSDP {self.target_parallel_config.fsdp_shard_size} x "
+            f"TP {self.target_parallel_config.tp} x "
+            f"EP {self.target_parallel_config.ep}"
         )
         print_on_local_main(f"  Num train epochs = {self.args.train.num_train_epochs}")
         print_on_local_main(f"  Samples per epoch = {self.samples_per_epoch}")
@@ -566,10 +677,26 @@ class BaseTrainer:
             f"  Gradient accumulation steps = {self.gradient_accumulation_steps}"
         )
         if self.data_batch_size is not None:
+            target_mode = (
+                "bounded offline"
+                if self.offline_target_data_batches_enabled
+                else "online"
+            )
+            print_on_local_main(f"  Target data-batch mode = {target_mode}")
             print_on_local_main(f"  Data batch partitions = {self.data_batch_size}")
+            if len(self.optimizer_steps_per_data_batch) <= 16:
+                optimizer_step_summary = str(
+                    self.optimizer_steps_per_data_batch
+                )
+            else:
+                optimizer_step_summary = (
+                    f"{len(self.optimizer_steps_per_data_batch)} partitions, "
+                    f"range=[{min(self.optimizer_steps_per_data_batch)}, "
+                    f"{max(self.optimizer_steps_per_data_batch)}]"
+                )
             print_on_local_main(
                 "  Optimizer steps per data batch = "
-                f"{self.optimizer_steps_per_data_batch}"
+                f"{optimizer_step_summary}"
             )
             global_samples_per_data_batch = tuple(
                 micro_batches
@@ -577,9 +704,17 @@ class BaseTrainer:
                 * int(self.args.train.local_batch_size)
                 for micro_batches in self.data_batch_micro_batches
             )
+            if len(global_samples_per_data_batch) <= 16:
+                global_sample_summary = str(global_samples_per_data_batch)
+            else:
+                global_sample_summary = (
+                    f"{len(global_samples_per_data_batch)} partitions, "
+                    f"range=[{min(global_samples_per_data_batch)}, "
+                    f"{max(global_samples_per_data_batch)}]"
+                )
             print_on_local_main(
                 "  Global samples per data batch = "
-                f"{global_samples_per_data_batch}"
+                f"{global_sample_summary}"
             )
             print_on_local_main(
                 f"  Transient target cache = {self.data_batch_cache_root}"
@@ -698,13 +833,47 @@ class BaseTrainer:
             handle.write(_DATA_BATCH_CACHE_MARKER_CONTENT)
         self.data_batch_rank_cache_dir = rank_dir
 
-    def _write_data_batch_cache_file(self, batch, *, batch_index, sample_index):
+    def _data_batch_cache_file_path(
+        self,
+        *,
+        batch_index: int,
+        sample_index: int,
+    ) -> str:
+        rank_dir = self.data_batch_rank_cache_dir
+        batch_dir = os.path.join(rank_dir, f"data_batch_{batch_index:08d}")
+        return os.path.join(batch_dir, f"sample_{sample_index:08d}.pt")
+
+    def _write_data_batch_cache_file(
+        self,
+        batch,
+        *,
+        batch_index,
+        sample_index,
+    ):
+        path = self._data_batch_cache_file_path(
+            batch_index=batch_index,
+            sample_index=sample_index,
+        )
+        batch_dir = os.path.dirname(path)
+        rank_dir = os.path.dirname(batch_dir)
+        marker_path = os.path.join(rank_dir, _DATA_BATCH_CACHE_MARKER)
+        try:
+            with open(marker_path, "r", encoding="utf-8") as handle:
+                marker = handle.read()
+        except FileNotFoundError as exc:
+            raise RuntimeError(
+                "Destination data-batch cache is not initialized: "
+                f"{rank_dir}"
+            ) from exc
+        if marker != _DATA_BATCH_CACHE_MARKER_CONTENT:
+            raise RuntimeError(
+                f"Invalid data-batch cache ownership marker: {marker_path}"
+            )
         batch_dir = os.path.join(
-            self.data_batch_rank_cache_dir,
+            rank_dir,
             f"data_batch_{batch_index:08d}",
         )
         os.makedirs(batch_dir, exist_ok=True)
-        path = os.path.join(batch_dir, f"sample_{sample_index:08d}.pt")
         tmp_path = f"{path}.tmp"
         cpu_batch = {
             key: value.detach().to(device="cpu") for key, value in batch.items()
@@ -713,6 +882,92 @@ class BaseTrainer:
         os.replace(tmp_path, path)
         batch.clear()
         return path
+
+    def _broadcast_target_input_from_tp_owner(self, local_batch, owner_index: int):
+        """Replicate one draft rank's raw sample across its target TP group."""
+
+        group = self.target_parallel.tensor_parallel_group
+        group_ranks = tuple(int(rank) for rank in dist.get_process_group_ranks(group))
+        if len(group_ranks) != self.target_parallel.tensor_parallel_size:
+            raise RuntimeError(
+                "Target TP group size does not match its configured degree."
+            )
+        owner_global_rank = group_ranks[int(owner_index)]
+        is_owner = self.global_rank == owner_global_rank
+        local_input_ids = local_batch["input_ids"]
+        shape = torch.tensor(
+            list(local_input_ids.shape) if is_owner else [0, 0],
+            dtype=torch.long,
+            device=self.device,
+        )
+        dist.broadcast(shape, src=owner_global_rank, group=group)
+        batch_size, sequence_length = (int(value) for value in shape.tolist())
+        if batch_size != 1 or sequence_length < 1:
+            raise RuntimeError(
+                "Heterogeneous target data batches require one non-empty sample "
+                f"per draft rank, got shape={(batch_size, sequence_length)}."
+            )
+
+        replicated = {}
+        for key in ("input_ids", "attention_mask", "loss_mask"):
+            source_value = local_batch[key]
+            if is_owner:
+                value = source_value.contiguous()
+            else:
+                value = torch.empty(
+                    (batch_size, sequence_length),
+                    dtype=source_value.dtype,
+                    device=self.device,
+                )
+            dist.broadcast(value, src=owner_global_rank, group=group)
+            replicated[key] = value
+        return owner_global_rank, replicated
+
+    def _cache_heterogeneous_target_data_batch(
+        self,
+        batches,
+        *,
+        data_batch_index: int,
+        micro_batch_count: int,
+        cached_paths: list[str],
+    ) -> None:
+        target_tp_size = self.target_parallel.tensor_parallel_size
+        for sample_index in range(micro_batch_count):
+            try:
+                local_batch = next(batches)
+            except StopIteration:
+                return
+
+            # Register the expected local file before target collectives start.
+            # If a rank fails midway, cleanup retains the partial block for
+            # diagnosis instead of mistaking the rank directory for an idle one.
+            cached_paths.append(
+                self._data_batch_cache_file_path(
+                    batch_index=data_batch_index,
+                    sample_index=sample_index,
+                )
+            )
+            for owner_index in range(target_tp_size):
+                owner_global_rank, target_input = (
+                    self._broadcast_target_input_from_tp_owner(
+                        local_batch,
+                        owner_index,
+                    )
+                )
+                prepared = self.prepare_online_target_batch(target_input)
+                # TP row-parallel outputs are replicated. Let the draft rank
+                # that owns this sample persist its own copy, so transient
+                # caches may live on node-local disks in a multi-node job.
+                if self.global_rank == owner_global_rank:
+                    with record_function("deepspec::target_cache_disk_write"):
+                        self._write_data_batch_cache_file(
+                            prepared,
+                            batch_index=data_batch_index,
+                            sample_index=sample_index,
+                        )
+                else:
+                    prepared.clear()
+            local_batch.clear()
 
     def _delete_data_batch_cache(self, paths):
         if not paths:
@@ -773,25 +1028,33 @@ class BaseTrainer:
                     f"{len(self.data_batch_micro_batches)}: "
                     "starting isolated target inference; draft training is idle."
                 )
-            for sample_index in range(micro_batch_count):
-                try:
-                    batch = next(batches)
-                except StopIteration:
-                    break
-                prepared = self.prepare_online_target_batch(batch)
-                with record_function("deepspec::target_cache_disk_write"):
-                    cached_paths.append(
-                        self._write_data_batch_cache_file(
-                            prepared,
-                            batch_index=data_batch_index,
-                            sample_index=sample_index,
+            if getattr(self, "heterogeneous_target_data_batches", False):
+                self._cache_heterogeneous_target_data_batch(
+                    batches,
+                    data_batch_index=data_batch_index,
+                    micro_batch_count=micro_batch_count,
+                    cached_paths=cached_paths,
+                )
+            else:
+                for sample_index in range(micro_batch_count):
+                    try:
+                        batch = next(batches)
+                    except StopIteration:
+                        break
+                    prepared = self.prepare_online_target_batch(batch)
+                    with record_function("deepspec::target_cache_disk_write"):
+                        cached_paths.append(
+                            self._write_data_batch_cache_file(
+                                prepared,
+                                batch_index=data_batch_index,
+                                sample_index=sample_index,
+                            )
                         )
-                    )
-                    self._synchronize_target_inference_progress(
-                        data_batch_index=data_batch_index,
-                        processed_samples=sample_index + 1,
-                        total_samples=micro_batch_count,
-                    )
+                        self._synchronize_target_inference_progress(
+                            data_batch_index=data_batch_index,
+                            processed_samples=sample_index + 1,
+                            total_samples=micro_batch_count,
+                        )
 
             if not cached_paths:
                 self._active_data_batch_cache = None
