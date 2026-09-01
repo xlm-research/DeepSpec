@@ -88,7 +88,7 @@ if ((NNODES > 1)) && [[ "${MASTER_ADDR}" == "localhost" || "${MASTER_ADDR}" == "
 fi
 
 MAX_LENGTH=${MAX_LENGTH:-4096}
-CONTEXT_PARALLEL_SIZE=${CONTEXT_PARALLEL_SIZE:-${CP:-1}}
+CONTEXT_PARALLEL_SIZE=${CONTEXT_PARALLEL_SIZE:-${CP:-4}}
 if [[ ! "${CONTEXT_PARALLEL_SIZE}" =~ ^[1-9][0-9]*$ ]]; then
     echo "CONTEXT_PARALLEL_SIZE must be a positive integer; got ${CONTEXT_PARALLEL_SIZE}." >&2
     exit 1
