@@ -47,8 +47,8 @@ CONTEXT_PARALLEL_SIZE=2
 FSDP_SIZE=$((NPROC_PER_NODE / CONTEXT_PARALLEL_SIZE))
 DATA_PARALLEL_SIZE=$((NPROC_PER_NODE / CONTEXT_PARALLEL_SIZE))
 SMOKE_DATA_PATH=${SMOKE_DATA_PATH:-${SMOKE_ROOT}/data/packed_128k_first${DATA_PARALLEL_SIZE}.jsonl}
-TARGET_CACHE_PATH=${TARGET_CACHE_PATH:-${SMOKE_ROOT}/target_cache/${NPROC_PER_NODE}gpu_cp2_128k_${DATA_PARALLEL_SIZE}samples}
 OUTPUT_ROOT=${OUTPUT_ROOT:-${SMOKE_ROOT}/run_${NPROC_PER_NODE}gpu}
+DATA_BATCH_CACHE_DIR=${DATA_BATCH_CACHE_DIR:-${OUTPUT_ROOT}/target_data_batch_cache}
 
 "${PYTHON_BIN}" scripts/data/subset_jsonl.py \
     --input-path "${PACKED_SOURCE_PATH}" \
@@ -60,7 +60,7 @@ echo "Prepared real-128K smoke input:"
 echo "  visible GPUs=${NPROC_PER_NODE}, CP=2, DP=${DATA_PARALLEL_SIZE}, DP_SHARD=${FSDP_SIZE}"
 echo "  packed records=${DATA_PARALLEL_SIZE}, max length=131072, optimizer steps=1"
 echo "  source=${SMOKE_DATA_PATH}"
-echo "  target cache=${TARGET_CACHE_PATH}"
+echo "  transient target cache=${DATA_BATCH_CACHE_DIR}"
 echo "  output=${OUTPUT_ROOT}"
 
 exec env \
@@ -72,8 +72,10 @@ exec env \
     FSDP_SIZE="${FSDP_SIZE}" \
     MAX_LENGTH=131072 \
     SOURCE_JSONL_PATH="${SMOKE_DATA_PATH}" \
-    TARGET_CACHE_PATH="${TARGET_CACHE_PATH}" \
     OUTPUT_ROOT="${OUTPUT_ROOT}" \
+    ONLINE_TARGET=true \
+    DATA_BATCH_SIZE=1 \
+    DATA_BATCH_CACHE_DIR="${DATA_BATCH_CACHE_DIR}" \
     LOCAL_BATCH_SIZE=1 \
     GLOBAL_BATCH_SIZE="${DATA_PARALLEL_SIZE}" \
     NUM_TRAIN_EPOCHS=1 \
@@ -83,8 +85,6 @@ exec env \
     SAVE_CHECKPOINTS=false \
     TORCH_COMPILE=false \
     TARGET_CACHE_FSDP=true \
-    AUTO_PREPARE_CACHE=true \
-    PREPARE_NUM_WORKERS=1 \
     PRODUCTION_RUN=false \
     DRY_RUN="${DRY_RUN}" \
     bash scripts/train/train_qwen3_8_27b_dspark_128gpu.sh

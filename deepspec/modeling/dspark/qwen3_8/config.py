@@ -95,6 +95,7 @@ def build_draft_config(target_config, model_args):
     draft_config.deepspec_draft_architecture = "qwen3_full_attention"
     draft_config.deepspec_draft_rope = "full_head"
     draft_config.deepspec_target_model_type = text_model_type
+    draft_config.target_context_layout = "native_head_tail"
     return draft_config
 
 

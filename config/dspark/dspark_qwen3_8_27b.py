@@ -37,6 +37,8 @@ train = dict(
     precision="bf16",
     local_batch_size=1,
     global_batch_size=512,
+    # Number of target-first disk-cache partitions, not samples per partition.
+    data_batch_size=256,
     # Match the canonical DSpark training protocol used by the other Qwen runs.
     num_train_epochs=10,
     max_train_steps=None,
@@ -57,6 +59,10 @@ logging = dict(
 )
 
 data = dict(
+    online_target=True,
+    train_data_path="train_data/spec_o3_coldstartsft.repeat60.deepspec.jsonl",
+    jsonl_index_cache_dir=None,
+    data_batch_cache_dir=None,
     target_cache_path=None,
     chat_template="qwen",
     max_length=4096,
