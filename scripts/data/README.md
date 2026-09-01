@@ -161,6 +161,86 @@ the DeepSeek-V4 DFlash/DFlash2 scripts under `scripts/fsdp/`. Their caches omit
 the unused final hidden state. DSpark uses `DATA_BATCH_CACHE_DIR` only for its
 bounded transient blocks; it does not require a completed offline manifest.
 
+GLM-5.3 DSpark uses the same bounded target-first lifecycle, but retains the
+final hidden state required by its L1 and confidence losses. It keeps
+`data.online_target=false`: each target partition is completed on disk before
+the draft consumes it, and the partition is deleted before the next one is
+generated. Configure the partition count and transient location with:
+
+```bash
+MAX_TRAIN_STEPS=100 DATA_BATCH_SIZE=100 \
+DATA_BATCH_CACHE_DIR=/local-nvme/glm5-target-blocks \
+  bash scripts/fsdp/train_glm5_3_flash_dspark_fsdp2.sh
+```
+
+`DATA_BATCH_SIZE` is the number of optimizer-aligned partitions. Its default is
+256. If fewer than 256 optimizer steps remain, the effective count is capped at
+the remaining step count so every partition stays non-empty. A partition cannot
+split below an optimizer boundary. With the current three selected
+states plus final-state supervision, eight exact-128K BF16 samples occupy about
+32 GiB, which is therefore the minimum transient-cache peak for
+`GLOBAL_BATCH_SIZE=8`; shorter records scale with their actual token counts.
+When `MAX_TRAIN_STEPS` is unset, the launcher trains the full usable dataset for
+`NUM_TRAIN_EPOCHS` (default 1). Increase `DATA_BATCH_SIZE` for a smaller cache
+footprint, or decrease it for fewer target/draft phase switches.
+`MAX_TRAIN_STEPS` is an optional diagnostic override and is not imposed by the
+multi-node launcher.
+On an eight-GPU node, the target phase uses `FSDP2 x TP4`, providing two
+effective sample replicas with CP disabled. Four serial target passes cover the
+eight draft sample owners per micro-step. EP stays at 1 because
+`target_layer_ids=[0,1,2]` truncates GLM before its first MoE layer (index 3).
+The draft uses `FSDP8 x EP8` on that node. With multiple eight-GPU nodes, both
+meshes become HSDP automatically: they shard within a node and replicate across
+nodes, while keeping target TP at 4.
+
+For a scheduler-managed SenseCore or Slurm multi-node job, configure this exact
+command once; the scheduler runs it on every node and the wrapper consumes the
+injected topology automatically:
+
+```bash
+bash scripts/fsdp/train_glm5_3_flash_dspark_fsdp2.sh
+```
+
+No DP/FSDP/TP/EP variables are required. On multi-node jobs, the bundled full
+training JSONL is selected automatically; `TRAIN_DATA_PATH` remains an optional
+dataset override. A scheduler must provide a reachable `MASTER_ADDR` (Slurm
+node lists are resolved automatically), because independent machines cannot
+discover a rendezvous endpoint themselves. The transient target cache defaults
+to a node-local directory under `TMPDIR` (or `/tmp`) and materializes only one
+of the effective, at-most-256 partitions at a time; checkpoints and the JSONL
+index remain under the shared `OUTPUT_ROOT`.
+
+For a non-scheduler manual torchrun deployment, launch the wrapper once on every
+node with the same rendezvous address. For two eight-GPU nodes, use
+`NODE_RANK=0` on the first node and `NODE_RANK=1` on the second:
+
+```bash
+NNODES=2 NODE_RANK=0 NPROC_PER_NODE=8 \
+MASTER_ADDR=10.0.0.10 MASTER_PORT=29501 \
+TRAIN_DATA_PATH=/shared/data/glm5-train.jsonl \
+OUTPUT_ROOT=/shared/jobs/glm5-dspark \
+JSONL_INDEX_CACHE_DIR=/shared/jobs/glm5-dspark/jsonl-index \
+DATA_BATCH_CACHE_DIR=/local-nvme/glm5-target-blocks \
+  bash scripts/fsdp/train_glm5_3_flash_dspark_fsdp2.sh
+```
+
+The launcher also accepts scheduler-provided `WORLD_SIZE`/`RANK` or
+`SENSECORE_PYTORCH_NNODES`/`SENSECORE_PYTORCH_NODE_RANK`. It does not fix the
+node count or GPUs per node. The total GPU count must be divisible by 4 because
+the requested target TP degree is 4. Draft EP is selected as the greatest
+common divisor of the node-local FSDP width and GLM's 288 experts; explicit
+`DP_REPLICATE`, `DP_SHARD`, `DRAFT_EP`, `TARGET_DP_REPLICATE`, and
+`TARGET_DP_SHARD` overrides remain available.
+
+The model, training JSONL, `OUTPUT_ROOT`, and `JSONL_INDEX_CACHE_DIR` must be
+visible at the same path on every node (or identically provisioned where
+applicable). `DATA_BATCH_CACHE_DIR` may be node-local: every draft owner writes,
+reads, and deletes only its own rank directory. This avoids requiring shared
+disk capacity for transient target activations.
+
+For workflows that have ample disk and want a reusable full cache, the separate
+`prepare_glm5_next_target_cache.py` runner remains available.
+
 ### Multimodal targets
 
 `prepare_target_cache.py` detects image-text target configurations such as

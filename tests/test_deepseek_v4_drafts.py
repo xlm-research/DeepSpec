@@ -21,6 +21,7 @@ from deepspec.modeling.dspark.deepseek_v4 import (
 from deepspec.trainer.base_trainer import (
     _compute_data_batch_schedule,
     _release_target_features,
+    _resolve_data_batch_partition_count,
 )
 from deepspec.trainer.dflash2_trainer import DeepseekV4DFlash2Trainer
 from deepspec.trainer.dspark_trainer import DeepseekV4DSparkTrainer
@@ -59,6 +60,48 @@ def model_args(path):
 
 
 class DeepseekV4DraftModelTest(unittest.TestCase):
+    def test_data_batch_size_is_capped_by_remaining_optimizer_steps(self):
+        self.assertEqual(
+            _resolve_data_batch_partition_count(
+                "auto",
+                remaining_optimizer_steps=125,
+            ),
+            125,
+        )
+        self.assertEqual(
+            _resolve_data_batch_partition_count(
+                "AUTO",
+                remaining_optimizer_steps=7,
+            ),
+            7,
+        )
+        self.assertEqual(
+            _resolve_data_batch_partition_count(
+                3,
+                remaining_optimizer_steps=7,
+            ),
+            3,
+        )
+        self.assertEqual(
+            _resolve_data_batch_partition_count(
+                256,
+                remaining_optimizer_steps=1,
+            ),
+            1,
+        )
+        self.assertEqual(
+            _resolve_data_batch_partition_count(
+                256,
+                remaining_optimizer_steps=0,
+            ),
+            0,
+        )
+        with self.assertRaisesRegex(ValueError, "positive or 'auto'"):
+            _resolve_data_batch_partition_count(
+                0,
+                remaining_optimizer_steps=7,
+            )
+
     def test_data_batch_schedule_splits_total_samples_by_ratio(self):
         micro_batches, optimizer_steps = _compute_data_batch_schedule(
             data_batch_size=3,
