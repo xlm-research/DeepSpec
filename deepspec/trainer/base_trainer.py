@@ -730,6 +730,30 @@ class BaseTrainer:
             os.unlink(path)
         os.rmdir(batch_dir)
 
+    def _synchronize_target_inference_progress(
+        self,
+        *,
+        data_batch_index: int,
+        processed_samples: int,
+        total_samples: int,
+    ) -> None:
+        """Bound rank skew while a large target-cache partition is produced."""
+
+        if (
+            not dist.is_initialized()
+            or processed_samples >= total_samples
+            or processed_samples % self.gradient_accumulation_steps != 0
+        ):
+            return
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        dist.barrier()
+        print_on_global_main(
+            f"Data batch {data_batch_index}/"
+            f"{len(self.data_batch_micro_batches)} target inference progress: "
+            f"{processed_samples}/{total_samples} local samples cached."
+        )
+
     def iter_training_batches(self, batches):
         if self.data_batch_micro_batches is None:
             yield from batches
@@ -762,6 +786,11 @@ class BaseTrainer:
                             batch_index=data_batch_index,
                             sample_index=sample_index,
                         )
+                    )
+                    self._synchronize_target_inference_progress(
+                        data_batch_index=data_batch_index,
+                        processed_samples=sample_index + 1,
+                        total_samples=micro_batch_count,
                     )
 
             if not cached_paths:

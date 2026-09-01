@@ -309,6 +309,32 @@ class DeepseekV4DraftModelTest(unittest.TestCase):
             self.assertIsNone(trainer._active_data_batch_cache)
             self.assertIsNone(trainer._data_batch_phase)
 
+    def test_target_inference_progress_synchronizes_each_optimizer_window(self):
+        trainer = object.__new__(DeepseekV4DSparkTrainer)
+        trainer.gradient_accumulation_steps = 2
+        trainer.data_batch_micro_batches = (5,)
+        trainer.device = torch.device("cpu")
+
+        with (
+            patch(
+                "deepspec.trainer.base_trainer.dist.is_initialized",
+                return_value=True,
+            ),
+            patch("deepspec.trainer.base_trainer.dist.barrier") as barrier,
+            patch("deepspec.trainer.base_trainer.print_on_global_main") as log,
+        ):
+            for processed_samples in range(1, 6):
+                trainer._synchronize_target_inference_progress(
+                    data_batch_index=1,
+                    processed_samples=processed_samples,
+                    total_samples=5,
+                )
+
+        self.assertEqual(barrier.call_count, 2)
+        self.assertEqual(log.call_count, 2)
+        self.assertIn("2/5 local samples", log.call_args_list[0].args[0])
+        self.assertIn("4/5 local samples", log.call_args_list[1].args[0])
+
     def test_isolated_draft_phase_refuses_inline_target_inference(self):
         trainer = object.__new__(DeepseekV4DSparkTrainer)
         trainer.online_target_enabled = True
