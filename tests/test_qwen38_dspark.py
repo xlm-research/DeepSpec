@@ -16,6 +16,8 @@ from deepspec.modeling.dspark.qwen3_8 import (
     build_draft_config,
 )
 from deepspec.modeling.dspark.loss import compute_dspark_loss
+from deepspec.modeling.target import online
+from deepspec.modeling.target.common import TargetForwardResult
 from deepspec.trainer import Qwen3_8DSparkTrainer
 from deepspec.utils.config import ConfigNode, load_config
 
@@ -77,6 +79,7 @@ class Qwen3_8DSparkConfigTest(unittest.TestCase):
         self.assertEqual(config.num_hidden_layers, 5)
         self.assertEqual(config.target_layer_ids, [1, 16, 31, 46, 61])
         self.assertEqual(config._attn_implementation, "flex_attention")
+        self.assertEqual(config.target_context_layout, "native_head_tail")
         self.assertEqual(config.deepspec_draft_architecture, "qwen3_full_attention")
         self.assertEqual(config.deepspec_draft_rope, "full_head")
         self.assertEqual(config.partial_rotary_factor, 1.0)
@@ -93,6 +96,9 @@ class Qwen3_8DSparkConfigTest(unittest.TestCase):
         self.assertEqual(config.model.target_model_name_or_path, CONFIGURED_TARGET)
         self.assertFalse(config.data.multimodal)
         self.assertTrue(config.data.store_target_last_hidden_states)
+        self.assertTrue(config.data.online_target)
+        self.assertEqual(config.train.data_batch_size, 256)
+        self.assertIsNone(config.data.target_cache_path)
         self.assertEqual(config.train.num_train_epochs, 10)
 
     def test_checkpoint_architecture_selects_qwen38_evaluator(self):
@@ -266,6 +272,121 @@ class Qwen3_8DSparkModelTest(unittest.TestCase):
 
 
 class Qwen3_8DSparkTrainerTest(unittest.TestCase):
+    def test_builds_qwen38_online_target(self):
+        trainer = object.__new__(Qwen3_8DSparkTrainer)
+        trainer.args = SimpleNamespace(
+            model=SimpleNamespace(
+                target_model_name_or_path="target",
+                target_layer_ids=[1, 3],
+            )
+        )
+        trainer.target_parallel = object()
+        trainer.device = torch.device("cpu")
+        trainer.checkpoint_dir_root = "/tmp/checkpoint"
+
+        with patch(
+            "deepspec.modeling.target.Qwen3_8OnlineTarget"
+        ) as target_cls:
+            target = trainer.build_online_target()
+
+        self.assertIs(target, target_cls.return_value)
+        target_cls.assert_called_once_with(
+            model_name_or_path="target",
+            target_layer_ids=[1, 3],
+            topology=trainer.target_parallel,
+            device=trainer.device,
+            rank_local_cache_dir="/tmp/checkpoint/target_rank_local",
+        )
+
+    def test_online_target_batch_is_passed_to_qwen_draft(self):
+        hidden = torch.randn(1, 3, 8)
+
+        class FakeOnlineTarget:
+            def forward_training_batch(self, batch):
+                return {
+                    "input_ids": batch["input_ids"][:, :3],
+                    "loss_mask": batch["loss_mask"][:, :3],
+                    "target_hidden_states": hidden,
+                    "target_last_hidden_states": torch.randn(1, 3, 4),
+                    "context_chunk_len": torch.tensor([3]),
+                    "seq_len": torch.tensor([3]),
+                }
+
+        trainer = object.__new__(Qwen3_8DSparkTrainer)
+        trainer.online_target_enabled = True
+        trainer.online_target = FakeOnlineTarget()
+        trainer.data_batch_micro_batches = None
+        trainer._data_batch_phase = None
+        trainer.args = SimpleNamespace(
+            model=SimpleNamespace(
+                l1_loss_alpha=0.9,
+                confidence_head_alpha=1.0,
+                loss_decay_gamma=4.0,
+                ce_loss_alpha=0.1,
+            )
+        )
+        forwarded = {}
+
+        def forward_model(**kwargs):
+            forwarded.update(kwargs)
+            return object()
+
+        trainer.forward_model = forward_model
+        batch = {
+            "input_ids": torch.tensor([[10, 11, 12, 0]]),
+            "attention_mask": torch.tensor([[1, 1, 1, 0]]),
+            "loss_mask": torch.tensor([[0, 1, 1, 0]]),
+        }
+        with patch(
+            "deepspec.trainer.dspark_trainer.compute_dspark_loss",
+            return_value=torch.ones((), requires_grad=True),
+        ):
+            trainer.run_batch(batch)
+
+        self.assertIs(forwarded["target_hidden_states"], hidden)
+        self.assertEqual(forwarded["context_chunk_len"].item(), 3)
+        self.assertNotIn("attention_mask", batch)
+
+    def test_offline_qwen_cache_context_len_remains_supported(self):
+        trainer = object.__new__(Qwen3_8DSparkTrainer)
+        trainer.online_target_enabled = False
+        trainer.data_batch_micro_batches = None
+        trainer.args = SimpleNamespace(
+            model=SimpleNamespace(
+                l1_loss_alpha=0.0,
+                confidence_head_alpha=0.0,
+                loss_decay_gamma=4.0,
+                ce_loss_alpha=1.0,
+            )
+        )
+        forwarded = {}
+        trainer.forward_model = lambda **kwargs: forwarded.update(kwargs) or object()
+        batch = {
+            "input_ids": torch.ones(1, 3, dtype=torch.long),
+            "loss_mask": torch.ones(1, 3, dtype=torch.bool),
+            "target_hidden_states": torch.randn(1, 3, 8),
+            "context_start": torch.tensor([0]),
+            "context_len": torch.tensor([3]),
+            "seq_len": torch.tensor([3]),
+        }
+        with patch(
+            "deepspec.trainer.dspark_trainer.compute_dspark_loss",
+            return_value=torch.ones((), requires_grad=True),
+        ):
+            trainer.run_batch(batch)
+
+        self.assertIs(forwarded["context_chunk_len"], batch["context_len"])
+
+    def test_isolated_draft_phase_refuses_inline_target_inference(self):
+        trainer = object.__new__(Qwen3_8DSparkTrainer)
+        trainer.online_target_enabled = True
+        trainer.data_batch_micro_batches = (1,)
+        trainer._data_batch_phase = "draft_training"
+        with self.assertRaisesRegex(RuntimeError, "precomputed target hidden"):
+            trainer.run_batch({"input_ids": torch.ones(1, 1, dtype=torch.long)})
+        with self.assertRaisesRegex(RuntimeError, "only allowed"):
+            trainer.prepare_online_target_batch({})
+
     def test_local_checkpoint_initialization_does_not_load_full_target(self):
         class FakeDraft:
             def __init__(self):
@@ -324,6 +445,119 @@ class Qwen3_8DSparkTrainerTest(unittest.TestCase):
             weights[1].to(torch.bfloat16),
         )
         self.assertTrue(draft.initialized_with["freeze"])
+
+
+class Qwen3_8OnlineTargetTest(unittest.TestCase):
+    def test_constructor_truncates_text_layers_and_skips_vision(self):
+        class FakeModel:
+            def eval(self):
+                return self
+
+            def requires_grad_(self, value):
+                self.requires_grad = value
+                return self
+
+        target_config = SimpleNamespace(
+            model_type="qwen3_5",
+            text_config=SimpleNamespace(num_hidden_layers=64),
+            vision_config=SimpleNamespace(depth=27),
+        )
+        topology = SimpleNamespace(
+            expert_parallel_size=1,
+            tensor_parallel_size=1,
+            context_parallel_size=1,
+        )
+        model = FakeModel()
+        with (
+            patch(
+                "deepspec.modeling.target.online.AutoConfig.from_pretrained",
+                return_value=target_config,
+            ),
+            patch(
+                "deepspec.modeling.target.online._build_rank_local_ep_target_model",
+                return_value=model,
+            ) as build_model,
+            patch(
+                "deepspec.modeling.target.online._wrap_target_model_with_fsdp",
+                return_value=model,
+            ),
+        ):
+            teacher = online.Qwen3_8OnlineTarget(
+                model_name_or_path="target",
+                target_layer_ids=[1, 16, 31, 46, 61],
+                topology=topology,
+                device=torch.device("cpu"),
+                rank_local_cache_dir="/tmp/cache",
+            )
+
+        self.assertIs(teacher.model, model)
+        self.assertEqual(target_config.text_config.num_hidden_layers, 62)
+        self.assertEqual(target_config.vision_config.depth, 0)
+        self.assertFalse(model.requires_grad)
+        self.assertEqual(
+            build_model.call_args.kwargs["attn_implementation"], "sdpa"
+        )
+
+    def test_text_batch_is_trimmed_and_returns_qwen_cp_metadata(self):
+        teacher = online.Qwen3_8OnlineTarget.__new__(online.Qwen3_8OnlineTarget)
+        teacher.model = object()
+        teacher.target_layer_ids = [1, 3]
+        teacher.device = torch.device("cpu")
+        teacher.topology = SimpleNamespace(context_parallel_size=1)
+        hidden = torch.randn(1, 3, 8)
+        last_hidden = torch.randn(1, 3, 4)
+
+        with patch(
+            "deepspec.modeling.target.online._run_target_forward_with_hooks",
+            return_value=TargetForwardResult(
+                target_hidden_states=hidden,
+                target_last_hidden_states=last_hidden,
+                context_start=0,
+            ),
+        ) as target_forward:
+            result = teacher.forward_training_batch({
+                "input_ids": torch.tensor([[10, 11, 12, 0]]),
+                "attention_mask": torch.tensor([[1, 1, 1, 0]]),
+                "loss_mask": torch.tensor([[0, 1, 1, 0]]),
+            })
+
+        self.assertEqual(tuple(result["input_ids"].shape), (1, 3))
+        self.assertEqual(result["context_chunk_len"].item(), 3)
+        self.assertEqual(result["seq_len"].item(), 3)
+        self.assertIs(result["target_hidden_states"], hidden)
+        self.assertIs(result["target_last_hidden_states"], last_hidden)
+        target_forward.assert_called_once()
+
+    def test_native_head_tail_cp_shape_is_validated(self):
+        class FakeTarget:
+            _deepspec_context_layout = "native_head_tail"
+
+            def forward_context_parallel(self, **_kwargs):
+                return TargetForwardResult(
+                    target_hidden_states=torch.randn(1, 2, 8),
+                    target_last_hidden_states=torch.randn(1, 2, 4),
+                    context_start=0,
+                )
+
+        result = online._run_target_forward_context_parallel(
+            target_model=FakeTarget(),
+            model_inputs={
+                "input_ids": torch.tensor([[10, 11, 12]]),
+                "attention_mask": torch.ones(1, 3, dtype=torch.long),
+            },
+            target_layer_ids=[1, 3],
+            topology=SimpleNamespace(
+                context_parallel_group=None,
+                context_parallel_rank=0,
+                context_parallel_size=2,
+                tensor_parallel_group=None,
+                tensor_parallel_rank=0,
+                tensor_parallel_size=1,
+            ),
+            device=torch.device("cpu"),
+        )
+
+        self.assertEqual(tuple(result.target_hidden_states.shape), (1, 2, 8))
 
 
 if __name__ == "__main__":

@@ -1,17 +1,14 @@
-"""Online frozen-target execution for DeepSeek-V4 DSpark training.
+"""Online frozen-target execution for DSpark training.
 
 The target and draft models share one CP/EP/TP/FSDP topology.  Every raw
-training micro-batch is evaluated exactly once by the frozen target, and the
-resulting local CP hidden-state shard is consumed immediately by the draft
-model.  Nothing is gathered to a leader or written to a target-cache file.
+training micro-batch is evaluated exactly once by the frozen target. The
+resulting local CP hidden-state shard can be consumed immediately or staged by
+the trainer's target-first data-batch cache. Nothing is gathered to a leader.
 """
 
 from __future__ import annotations
 
-import os
-
 import torch
-import torch.distributed as dist
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
@@ -37,7 +34,7 @@ def _get_target_backbone(target_model):
     if hasattr(candidate, "language_model"):
         candidate = candidate.language_model
     if not hasattr(candidate, "layers"):
-        raise TypeError("DeepSeek-V4 target model does not expose decoder layers.")
+        raise TypeError("Target model does not expose decoder layers.")
     return candidate
 
 
@@ -93,7 +90,7 @@ def _run_target_forward_with_hooks(
         )
         missing = [layer_id for layer_id in requested if layer_id not in captured]
         if missing:
-            raise RuntimeError(f"DeepSeek-V4 target layers were not captured: {missing}.")
+            raise RuntimeError(f"Target layers were not captured: {missing}.")
         hidden = torch.cat([captured[layer_id] for layer_id in requested], dim=-1)
         last_hidden = output.last_hidden_state.detach()
     finally:
@@ -132,7 +129,11 @@ def _normalize_target_parameter_dtype(target_model) -> None:
 
 
 def _build_rank_local_ep_target_model(
-    *, model_name_or_path: str, target_config, topology
+    *,
+    model_name_or_path: str,
+    target_config,
+    topology,
+    attn_implementation: str | None = None,
 ):
     """Load only the routed experts owned by this EP rank.
 
@@ -147,6 +148,8 @@ def _build_rank_local_ep_target_model(
         "dtype": torch.bfloat16,
         "low_cpu_mem_usage": True,
     }
+    if attn_implementation is not None:
+        load_kwargs["attn_implementation"] = str(attn_implementation)
     quantization_config = _dequantizing_config(target_config)
     if quantization_config is not None:
         load_kwargs["quantization_config"] = quantization_config
@@ -232,7 +235,7 @@ def _materialize_replicated_target_state_locally(
             continue
         module_name, _, tensor_name = qualified_name.rpartition(".")
         module = target_model.get_submodule(module_name) if module_name else target_model
-        materialized = _materialize_tensor_on_device(
+        _materialize_tensor_on_device(
             module=module,
             tensor_name=tensor_name,
             device=device,
@@ -243,7 +246,7 @@ def _materialize_replicated_target_state_locally(
             continue
         module_name, _, tensor_name = qualified_name.rpartition(".")
         module = target_model.get_submodule(module_name) if module_name else target_model
-        materialized = _materialize_tensor_on_device(
+        _materialize_tensor_on_device(
             module=module,
             tensor_name=tensor_name,
             device=device,
@@ -345,20 +348,40 @@ def _run_target_forward_context_parallel(
             f"{type(result)!r}."
         )
     sequence_length = int(model_inputs["attention_mask"].sum(dim=1)[0].item())
-    expected_start, expected_end = compute_context_parallel_range(
-        sequence_length=sequence_length,
-        context_parallel_rank=topology.context_parallel_rank,
-        context_parallel_size=topology.context_parallel_size,
-    )
     local_length = int(result.target_hidden_states.shape[1])
-    if (
-        int(result.context_start) != expected_start
-        or local_length != expected_end - expected_start
-    ):
-        raise RuntimeError(
-            "Online target CP returned the wrong contiguous shard: expected "
-            f"[{expected_start}, {expected_end}), got start={result.context_start}, "
-            f"length={local_length}."
+    context_layout = str(
+        getattr(target_model, "_deepspec_context_layout", "contiguous")
+    )
+    if context_layout == "native_head_tail":
+        alignment = 2 * int(topology.context_parallel_size)
+        padded_length = (
+            (sequence_length + alignment - 1) // alignment
+        ) * alignment
+        expected_length = padded_length // int(topology.context_parallel_size)
+        if int(result.context_start) != 0 or local_length != expected_length:
+            raise RuntimeError(
+                "Online target CP returned the wrong native head/tail shard: "
+                f"expected start=0, length={expected_length}, got "
+                f"start={result.context_start}, length={local_length}."
+            )
+    elif context_layout == "contiguous":
+        expected_start, expected_end = compute_context_parallel_range(
+            sequence_length=sequence_length,
+            context_parallel_rank=topology.context_parallel_rank,
+            context_parallel_size=topology.context_parallel_size,
+        )
+        if (
+            int(result.context_start) != expected_start
+            or local_length != expected_end - expected_start
+        ):
+            raise RuntimeError(
+                "Online target CP returned the wrong contiguous shard: expected "
+                f"[{expected_start}, {expected_end}), got "
+                f"start={result.context_start}, length={local_length}."
+            )
+    else:
+        raise ValueError(
+            f"Unsupported online target context layout: {context_layout!r}."
         )
     if int(result.target_last_hidden_states.shape[1]) != local_length:
         raise RuntimeError("Online target hidden-state tensors have different lengths.")
@@ -555,4 +578,129 @@ class Glm5NextOnlineTarget(DeepseekV4OnlineTarget):
         ).eval()
 
 
-__all__ = ["DeepseekV4OnlineTarget", "Glm5NextOnlineTarget"]
+class Qwen3_8OnlineTarget(DeepseekV4OnlineTarget):
+    """Frozen, truncated Qwen3.8 teacher for text-only online DSpark training."""
+
+    def __init__(
+        self,
+        *,
+        model_name_or_path: str,
+        target_layer_ids,
+        topology,
+        device,
+        rank_local_cache_dir: str,
+    ):
+        if topology.expert_parallel_size != 1:
+            raise NotImplementedError(
+                "Qwen3.8 online target expert parallelism is not implemented; "
+                "set target EP to 1."
+            )
+        if topology.tensor_parallel_size != 1:
+            raise NotImplementedError(
+                "Qwen3.8 online target tensor parallelism is not implemented; "
+                "set target TP to 1."
+            )
+
+        self.model_name_or_path = str(model_name_or_path)
+        self.target_layer_ids = [int(layer_id) for layer_id in target_layer_ids]
+        self.topology = topology
+        self.device = device
+        self.rank_local_cache_dir = str(rank_local_cache_dir)
+        target_config = AutoConfig.from_pretrained(self.model_name_or_path)
+        if str(target_config.model_type) != "qwen3_5":
+            raise ValueError(
+                "Qwen3_8OnlineTarget requires a qwen3_5 checkpoint, got "
+                f"{target_config.model_type!r}."
+            )
+        text_config = target_config.text_config
+        decoder_layer_ids = [
+            layer_id for layer_id in self.target_layer_ids if layer_id >= 0
+        ]
+        if not decoder_layer_ids:
+            raise ValueError("Online target requires at least one decoder layer.")
+        retained_layers = max(decoder_layer_ids) + 1
+        original_layers = int(text_config.num_hidden_layers)
+        if retained_layers > original_layers:
+            raise ValueError(
+                f"Requested target layer {retained_layers - 1}, but the checkpoint "
+                f"contains only {original_layers} decoder layers."
+            )
+        text_config.num_hidden_layers = retained_layers
+        # The production Qwen3.8 training data is text-only. Avoid loading the
+        # unused vision tower while preserving the composite checkpoint layout.
+        target_config.vision_config.depth = 0
+        self.target_num_hidden_layers = retained_layers
+
+        model = _build_rank_local_ep_target_model(
+            model_name_or_path=self.model_name_or_path,
+            target_config=target_config,
+            topology=topology,
+            attn_implementation="sdpa",
+        ).eval()
+        model.requires_grad_(False)
+        if topology.context_parallel_size > 1:
+            from .qwen3_6_cp import install_qwen3_6_ring_context_parallel
+
+            model = install_qwen3_6_ring_context_parallel(model)
+        self.model = _wrap_target_model_with_fsdp(
+            target_model=model,
+            device=device,
+            topology=topology,
+        ).eval()
+
+    def forward_training_batch(self, batch) -> dict[str, torch.Tensor]:
+        if int(batch["input_ids"].shape[0]) != 1:
+            raise ValueError("Online Qwen3.8 training requires local_batch_size=1.")
+        attention_mask = batch["attention_mask"]
+        sequence_length = int(attention_mask.sum(dim=1)[0].item())
+        if sequence_length < 1:
+            raise ValueError("Online target received an empty token sequence.")
+        if not bool(attention_mask[0, :sequence_length].all()) or bool(
+            attention_mask[0, sequence_length:].any()
+        ):
+            raise ValueError("Online target requires a right-padded attention mask.")
+        model_inputs = {
+            "input_ids": batch["input_ids"][:, :sequence_length],
+            "attention_mask": attention_mask[:, :sequence_length],
+        }
+        with torch.no_grad():
+            if self.topology.context_parallel_size > 1:
+                result = _run_target_forward_context_parallel(
+                    target_model=self.model,
+                    model_inputs=model_inputs,
+                    target_layer_ids=self.target_layer_ids,
+                    topology=self.topology,
+                    device=self.device,
+                )
+            else:
+                result = _run_target_forward_with_hooks(
+                    target_model=self.model,
+                    input_ids=model_inputs["input_ids"],
+                    attention_mask=model_inputs["attention_mask"],
+                    target_layer_ids=self.target_layer_ids,
+                )
+
+        def metadata(value):
+            return torch.tensor(
+                [int(value)],
+                dtype=torch.long,
+                device=batch["input_ids"].device,
+            )
+
+        return {
+            "input_ids": model_inputs["input_ids"],
+            "loss_mask": batch["loss_mask"][:, :sequence_length],
+            "target_hidden_states": result.target_hidden_states,
+            "target_last_hidden_states": result.target_last_hidden_states,
+            "context_chunk_len": metadata(
+                result.target_hidden_states.shape[1]
+            ),
+            "seq_len": metadata(sequence_length),
+        }
+
+
+__all__ = [
+    "DeepseekV4OnlineTarget",
+    "Glm5NextOnlineTarget",
+    "Qwen3_8OnlineTarget",
+]

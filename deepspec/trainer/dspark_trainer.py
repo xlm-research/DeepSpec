@@ -32,8 +32,36 @@ class Qwen3DSparkTrainer(BaseTrainer):
         )
         return Qwen3DSparkModel(draft_config)
 
+    def prepare_online_target_batch(self, batch):
+        if (
+            self.data_batch_micro_batches is not None
+            and self._data_batch_phase != "target_inference"
+        ):
+            raise RuntimeError(
+                "Target inference is only allowed during the isolated "
+                "target_inference phase."
+            )
+        with record_function("deepspec::target_forward"):
+            target_batch = self.online_target.forward_training_batch(batch)
+        batch.clear()
+        batch.update(target_batch)
+        return batch
+
     # Training step.
     def run_batch(self, batch):
+        if self.online_target_enabled and self.data_batch_micro_batches is not None:
+            if self._data_batch_phase != "draft_training":
+                raise RuntimeError(
+                    "Draft forward is only allowed during the isolated "
+                    "draft_training phase."
+                )
+            if "target_hidden_states" not in batch:
+                raise RuntimeError(
+                    "Isolated draft training requires precomputed target hidden "
+                    "states; refusing to run target inference from run_batch."
+                )
+        elif self.online_target_enabled and "target_hidden_states" not in batch:
+            self.prepare_online_target_batch(batch)
         needs_target_logits = (
             float(self.args.model.l1_loss_alpha) > 0.0
             or float(self.args.model.confidence_head_alpha) > 0.0
@@ -45,13 +73,17 @@ class Qwen3DSparkTrainer(BaseTrainer):
             # unused.  Release it before the draft forward starts.
             batch.pop("target_last_hidden_states", None)
             target_last_hidden_states = None
+        context_chunk_len = batch.get("context_chunk_len")
+        if context_chunk_len is None:
+            # Offline cache records use the canonical context_len field.
+            context_chunk_len = batch.get("context_len")
         with record_function("deepspec::draft_forward"):
             outputs = self.forward_model(
                 input_ids=batch["input_ids"],
                 target_hidden_states=batch["target_hidden_states"],
                 loss_mask=batch["loss_mask"],
                 target_last_hidden_states=target_last_hidden_states,
-                context_chunk_len=batch["context_chunk_len"],
+                context_chunk_len=context_chunk_len,
                 seq_len=batch["seq_len"],
             )
         with record_function("deepspec::loss"):
@@ -90,6 +122,19 @@ class Qwen3_8DSparkTrainer(Qwen3DSparkTrainer):
             model_args=model_args,
         )
         return Qwen3_8DSparkModel(draft_config)
+
+    def build_online_target(self):
+        from deepspec.modeling.target import Qwen3_8OnlineTarget
+
+        return Qwen3_8OnlineTarget(
+            model_name_or_path=self.args.model.target_model_name_or_path,
+            target_layer_ids=self.args.model.target_layer_ids,
+            topology=self.target_parallel,
+            device=self.device,
+            rank_local_cache_dir=os.path.join(
+                self.checkpoint_dir_root, "target_rank_local"
+            ),
+        )
 
 
 class DeepseekV4DSparkTrainer(Qwen3DSparkTrainer):

@@ -3,8 +3,8 @@ set -euo pipefail
 
 # Production launcher for Qwen3.8-27B DSpark on homogeneous multi-GPU nodes.
 # Run this script once on every node with the same rendezvous address and a
-# shared filesystem. The first run prepares the offline target cache; later
-# runs reuse it and the checkpoint under OUTPUT_ROOT.
+# shared filesystem. Online target-first data batching is the default; set
+# ONLINE_TARGET=false to reuse the legacy full offline target-cache workflow.
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 BASE_DIR=$(cd "${SCRIPT_DIR}/../.." && pwd)
@@ -110,6 +110,10 @@ LOCAL_BATCH_SIZE=${LOCAL_BATCH_SIZE:-1}
 GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-512}
 NUM_TRAIN_EPOCHS=${NUM_TRAIN_EPOCHS:-10}
 MAX_TRAIN_STEPS=${MAX_TRAIN_STEPS:-}
+ONLINE_TARGET=${ONLINE_TARGET:-true}
+DATA_BATCH_SIZE=${DATA_BATCH_SIZE:-256}
+DATA_BATCH_CACHE_DIR=${DATA_BATCH_CACHE_DIR:-${OUTPUT_ROOT}/target_data_batch_cache}
+JSONL_INDEX_CACHE_DIR=${JSONL_INDEX_CACHE_DIR:-${OUTPUT_ROOT}/jsonl_index_cache}
 if ((NPROC_PER_NODE % CONTEXT_PARALLEL_SIZE != 0)); then
     echo "Visible GPUs per node ${NPROC_PER_NODE} must be divisible by CONTEXT_PARALLEL_SIZE=${CONTEXT_PARALLEL_SIZE}." >&2
     exit 1
@@ -136,7 +140,7 @@ PREPARE_NUM_WORKERS=${PREPARE_NUM_WORKERS:-1}
 DRY_RUN=${DRY_RUN:-false}
 PRODUCTION_RUN=${PRODUCTION_RUN:-true}
 
-for integer_var in MAX_LENGTH CONTEXT_PARALLEL_SIZE LOCAL_BATCH_SIZE GLOBAL_BATCH_SIZE NUM_TRAIN_EPOCHS FSDP_SIZE LOGGING_STEPS SAVE_STEPS PREPARE_NUM_WORKERS; do
+for integer_var in MAX_LENGTH CONTEXT_PARALLEL_SIZE LOCAL_BATCH_SIZE GLOBAL_BATCH_SIZE NUM_TRAIN_EPOCHS FSDP_SIZE LOGGING_STEPS SAVE_STEPS PREPARE_NUM_WORKERS DATA_BATCH_SIZE; do
     integer_value=${!integer_var}
     if [[ ! "${integer_value}" =~ ^[1-9][0-9]*$ ]]; then
         echo "${integer_var} must be a positive integer; got ${integer_value}." >&2
@@ -147,7 +151,7 @@ if [[ -n "${MAX_TRAIN_STEPS}" ]] && [[ ! "${MAX_TRAIN_STEPS}" =~ ^[1-9][0-9]*$ ]
     echo "MAX_TRAIN_STEPS must be empty or a positive integer; got ${MAX_TRAIN_STEPS}." >&2
     exit 1
 fi
-for boolean_var in SAVE_CHECKPOINTS TORCH_COMPILE TORCHRUN_PER_RANK_LOGS AUTO_PREPARE_CACHE TARGET_CACHE_FSDP DRY_RUN PRODUCTION_RUN; do
+for boolean_var in ONLINE_TARGET SAVE_CHECKPOINTS TORCH_COMPILE TORCHRUN_PER_RANK_LOGS AUTO_PREPARE_CACHE TARGET_CACHE_FSDP DRY_RUN PRODUCTION_RUN; do
     boolean_value=${!boolean_var}
     if [[ "${boolean_value}" != "true" && "${boolean_value}" != "false" ]]; then
         echo "${boolean_var} must be true or false; got ${boolean_value}." >&2
@@ -167,10 +171,14 @@ if ((CONTEXT_PARALLEL_SIZE > 1)); then
         echo "CONTEXT_PARALLEL_SIZE > 1 requires TORCH_COMPILE=false." >&2
         exit 1
     fi
-    if [[ "${TARGET_CACHE_FSDP}" != "true" ]]; then
-        echo "CONTEXT_PARALLEL_SIZE > 1 requires TARGET_CACHE_FSDP=true." >&2
+    if [[ "${ONLINE_TARGET}" == "false" && "${TARGET_CACHE_FSDP}" != "true" ]]; then
+        echo "Offline CONTEXT_PARALLEL_SIZE > 1 requires TARGET_CACHE_FSDP=true." >&2
         exit 1
     fi
+fi
+if [[ "${ONLINE_TARGET}" == "true" ]] && ((LOCAL_BATCH_SIZE != 1)); then
+    echo "ONLINE_TARGET=true requires LOCAL_BATCH_SIZE=1." >&2
+    exit 1
 fi
 if [[ "${PRODUCTION_RUN}" == "true" ]]; then
     if [[ "${DRY_RUN}" != "false" ]]; then
@@ -266,34 +274,38 @@ PREPARE_CACHE_ENV=(
     "MASTER_PORT=${MASTER_PORT}"
 )
 
-if [[ ! -f "${TARGET_CACHE_PATH}/manifest.json" ]]; then
-    if [[ -d "${TARGET_CACHE_PATH}" ]] && [[ -n "$(find "${TARGET_CACHE_PATH}" -mindepth 1 -print -quit)" ]]; then
-        echo "TARGET_CACHE_PATH contains an incomplete cache without manifest.json: ${TARGET_CACHE_PATH}" >&2
-        echo "Use a new TARGET_CACHE_PATH or explicitly remove the partial cache after confirming it is disposable." >&2
-        exit 1
-    fi
-    if [[ "${AUTO_PREPARE_CACHE}" != "true" ]]; then
-        echo "Target cache is missing and AUTO_PREPARE_CACHE=false: ${TARGET_CACHE_PATH}" >&2
-        exit 1
-    fi
-    echo "Qwen3.8 DSpark target cache is missing; preparing it before training."
-    echo "  Cache storage scales with the number of valid tokens; verify shared-disk capacity before a full run."
-    echo "  cache output=${TARGET_CACHE_PATH}"
-    echo "  target-cache FSDP=${TARGET_CACHE_FSDP}, FSDP_SIZE=${FSDP_SIZE}, CP=${CONTEXT_PARALLEL_SIZE}"
-    if [[ "${DRY_RUN}" == "true" ]]; then
-        printf '  prepare command:'
-        printf ' %q' "${PREPARE_CACHE_ENV[@]}" "${PREPARE_CACHE_COMMAND[@]}"
-        printf '\n'
-    else
-        mkdir -p "$(dirname "${TARGET_CACHE_PATH}")"
-        "${PREPARE_CACHE_ENV[@]}" "${PREPARE_CACHE_COMMAND[@]}"
-        if [[ ! -f "${TARGET_CACHE_PATH}/manifest.json" ]]; then
-            echo "Target-cache preparation finished without manifest.json: ${TARGET_CACHE_PATH}" >&2
+if [[ "${ONLINE_TARGET}" == "false" ]]; then
+    if [[ ! -f "${TARGET_CACHE_PATH}/manifest.json" ]]; then
+        if [[ -d "${TARGET_CACHE_PATH}" ]] && [[ -n "$(find "${TARGET_CACHE_PATH}" -mindepth 1 -print -quit)" ]]; then
+            echo "TARGET_CACHE_PATH contains an incomplete cache without manifest.json: ${TARGET_CACHE_PATH}" >&2
+            echo "Use a new TARGET_CACHE_PATH or explicitly remove the partial cache after confirming it is disposable." >&2
             exit 1
         fi
+        if [[ "${AUTO_PREPARE_CACHE}" != "true" ]]; then
+            echo "Target cache is missing and AUTO_PREPARE_CACHE=false: ${TARGET_CACHE_PATH}" >&2
+            exit 1
+        fi
+        echo "Qwen3.8 DSpark target cache is missing; preparing it before training."
+        echo "  Cache storage scales with the number of valid tokens; verify shared-disk capacity before a full run."
+        echo "  cache output=${TARGET_CACHE_PATH}"
+        echo "  target-cache FSDP=${TARGET_CACHE_FSDP}, FSDP_SIZE=${FSDP_SIZE}, CP=${CONTEXT_PARALLEL_SIZE}"
+        if [[ "${DRY_RUN}" == "true" ]]; then
+            printf '  prepare command:'
+            printf ' %q' "${PREPARE_CACHE_ENV[@]}" "${PREPARE_CACHE_COMMAND[@]}"
+            printf '\n'
+        else
+            mkdir -p "$(dirname "${TARGET_CACHE_PATH}")"
+            "${PREPARE_CACHE_ENV[@]}" "${PREPARE_CACHE_COMMAND[@]}"
+            if [[ ! -f "${TARGET_CACHE_PATH}/manifest.json" ]]; then
+                echo "Target-cache preparation finished without manifest.json: ${TARGET_CACHE_PATH}" >&2
+                exit 1
+            fi
+        fi
+    else
+        echo "Using completed Qwen3.8 DSpark target cache: ${TARGET_CACHE_PATH}"
     fi
 else
-    echo "Using completed Qwen3.8 DSpark target cache: ${TARGET_CACHE_PATH}"
+    echo "Using online Qwen3.8 target-first training; no complete offline cache is required."
 fi
 
 TRAIN_SCHEDULE_ARGS=(
@@ -304,9 +316,21 @@ if [[ -n "${MAX_TRAIN_STEPS}" ]]; then
     TRAIN_SCHEDULE_ARGS=(--opts "train.max_train_steps=${MAX_TRAIN_STEPS}")
 fi
 
-SOURCE_ARGS=()
-if [[ -n "${SOURCE_JSONL_PATH}" ]]; then
-    SOURCE_ARGS=(--opts "data.source_jsonl_path=${SOURCE_JSONL_PATH}")
+TARGET_DATA_ARGS=(
+    --opts "data.online_target=true"
+    --opts "data.train_data_path=${SOURCE_JSONL_PATH}"
+    --opts "data.jsonl_index_cache_dir=${JSONL_INDEX_CACHE_DIR}"
+    --opts "data.data_batch_cache_dir=${DATA_BATCH_CACHE_DIR}"
+    --opts "data.target_cache_path=null"
+    --opts "train.data_batch_size=${DATA_BATCH_SIZE}"
+)
+if [[ "${ONLINE_TARGET}" == "false" ]]; then
+    TARGET_DATA_ARGS=(
+        --opts "data.online_target=false"
+        --opts "data.source_jsonl_path=${SOURCE_JSONL_PATH}"
+        --opts "data.target_cache_path=${TARGET_CACHE_PATH}"
+        --opts "train.data_batch_size=null"
+    )
 fi
 
 echo "Launching Qwen3.8-27B DSpark FSDP2 on ${TRAIN_WORLD_SIZE} GPUs:"
@@ -323,7 +347,13 @@ else
     echo "  schedule=dataset-derived, epochs=${NUM_TRAIN_EPOCHS}"
 fi
 echo "  target model=${TARGET_MODEL_PATH}"
-echo "  target cache=${TARGET_CACHE_PATH}"
+if [[ "${ONLINE_TARGET}" == "true" ]]; then
+    echo "  target supervision=online, data batch partitions=${DATA_BATCH_SIZE}"
+    echo "  transient target cache=${DATA_BATCH_CACHE_DIR}"
+    echo "  JSONL index cache=${JSONL_INDEX_CACHE_DIR}"
+else
+    echo "  target supervision=offline cache, target cache=${TARGET_CACHE_PATH}"
+fi
 echo "  source JSONL=${SOURCE_JSONL_PATH:-<not supplied>}"
 echo "  checkpoint dir=${CHECKPOINT_DIR}"
 echo "  tensorboard dir=${TENSORBOARD_DIR}"
@@ -370,8 +400,7 @@ set -x
     train.py \
     --config config/dspark/dspark_qwen3_8_27b.py \
     --opts "model.target_model_name_or_path=${TARGET_MODEL_PATH}" \
-    --opts "data.target_cache_path=${TARGET_CACHE_PATH}" \
-    "${SOURCE_ARGS[@]}" \
+    "${TARGET_DATA_ARGS[@]}" \
     --opts "data.max_length=${MAX_LENGTH}" \
     --opts "data.store_target_last_hidden_states=true" \
     --opts "train.lr=${LEARNING_RATE}" \
