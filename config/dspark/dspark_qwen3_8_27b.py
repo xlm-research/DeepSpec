@@ -12,9 +12,9 @@ model = dict(
     target_model_name_or_path=(
         "/mnt/afs-agentpro/share/models/Qwen/Qwen3.8-27B"
     ),
-    block_size=7,
-    num_draft_layers=5,
-    target_layer_ids=[1, 16, 31, 46, 61],
+    block_size=5,
+    num_draft_layers=3,
+    target_layer_ids=[61,62,63],
     # The tokenizer ends at 248076 while the embedding table has 248320 rows.
     mask_token_id=248077,
     num_anchors=512,

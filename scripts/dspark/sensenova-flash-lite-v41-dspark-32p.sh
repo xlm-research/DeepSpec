@@ -101,11 +101,11 @@ if [[ ! "${CONTEXT_PARALLEL_SIZE}" =~ ^[1-9][0-9]*$ ]]; then
     exit 1
 fi
 TARGET_MODEL_PATH=${TARGET_MODEL_PATH:-/mnt/afs-agentpro/share/models/Qwen/Qwen3.8-27B}
-SOURCE_JSONL_PATH=${SOURCE_JSONL_PATH:-${BASE_DIR}/train_data/spec_o3_coldstartsft.repeat60.deepspec.jsonl}
-TARGET_CACHE_PATH=${TARGET_CACHE_PATH:-${BASE_DIR}/output/dspark_qwen3_8_27b_target_cache/cp${CONTEXT_PARALLEL_SIZE}_maxlen${MAX_LENGTH}}
-DEFAULT_OUTPUT_ROOT=${BASE_DIR}/output/dspark_qwen3_8_27b_multinode_production
+SOURCE_JSONL_PATH=${SOURCE_JSONL_PATH:-${BASE_DIR}/train_dataset/sensenova-flash-lite-v42-text-all.jsonl}
+TARGET_CACHE_PATH=${TARGET_CACHE_PATH:-${BASE_DIR}/output/dspark_qwen3_8_27b_target_cache_v42_all_text/cp${CONTEXT_PARALLEL_SIZE}_maxlen${MAX_LENGTH}}
+DEFAULT_OUTPUT_ROOT=${BASE_DIR}/output/dspark_qwen3_8_27b_v42_all_text_multinode_32p
 if ((CONTEXT_PARALLEL_SIZE > 1)); then
-    DEFAULT_OUTPUT_ROOT=${BASE_DIR}/output/dspark_qwen3_8_27b_cp${CONTEXT_PARALLEL_SIZE}_maxlen${MAX_LENGTH}
+    DEFAULT_OUTPUT_ROOT=${BASE_DIR}/output/dspark_qwen3_8_27b_v42_all_text_cp${CONTEXT_PARALLEL_SIZE}_maxlen${MAX_LENGTH}_32p
 fi
 OUTPUT_ROOT=${OUTPUT_ROOT:-${DEFAULT_OUTPUT_ROOT}}
 CHECKPOINT_DIR=${CHECKPOINT_DIR:-${OUTPUT_ROOT}/checkpoints}
