@@ -20,8 +20,10 @@ from deepspec.modeling.dspark.deepseek_v4 import (
 )
 from deepspec.trainer.base_trainer import (
     _compute_data_batch_schedule,
+    _compute_epoch_data_partition_schedule,
     _release_target_features,
     _resolve_data_batch_partition_count,
+    _resolve_data_partition_count,
 )
 from deepspec.trainer.dflash2_trainer import DeepseekV4DFlash2Trainer
 from deepspec.trainer.dspark_trainer import DeepseekV4DSparkTrainer
@@ -131,6 +133,53 @@ class DeepseekV4DraftModelTest(unittest.TestCase):
                 data_parallel_size=1,
                 local_batch_size=1,
             )
+
+    def test_exact_data_partitions_can_split_gradient_accumulation(self):
+        self.assertEqual(
+            _resolve_data_partition_count(
+                512,
+                remaining_micro_batches=3520,
+            ),
+            512,
+        )
+        self.assertEqual(
+            _resolve_data_partition_count(
+                512,
+                remaining_micro_batches=100,
+            ),
+            100,
+        )
+        micro_batches, optimizer_steps = _compute_epoch_data_partition_schedule(
+            data_partitions=512,
+            micro_batches_per_epoch=3520,
+            start_micro_step=0,
+            total_micro_batches=35200,
+            gradient_accumulation_steps=32,
+        )
+        self.assertEqual(len(micro_batches), 5120)
+        self.assertEqual(sum(micro_batches), 35200)
+        self.assertEqual((min(micro_batches), max(micro_batches)), (6, 7))
+        self.assertTrue(
+            all(
+                sum(micro_batches[start : start + 512]) == 3520
+                for start in range(0, len(micro_batches), 512)
+            )
+        )
+        self.assertEqual(sum(optimizer_steps), 1100)
+        self.assertIn(0, optimizer_steps)
+        resumed_micro_batches, resumed_optimizer_steps = (
+            _compute_epoch_data_partition_schedule(
+                data_partitions=512,
+                micro_batches_per_epoch=3520,
+                start_micro_step=32,
+                total_micro_batches=35200 - 32,
+                gradient_accumulation_steps=32,
+            )
+        )
+        self.assertEqual(resumed_micro_batches[0], 3)
+        self.assertLessEqual(max(resumed_micro_batches), 7)
+        self.assertEqual(sum(resumed_micro_batches), 35200 - 32)
+        self.assertEqual(sum(resumed_optimizer_steps), 1099)
 
     def _exercise(self, model):
         seq = 32

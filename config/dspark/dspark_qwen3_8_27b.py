@@ -37,17 +37,41 @@ train = dict(
     precision="bf16",
     local_batch_size=1,
     global_batch_size=512,
-    # Number of target-first disk-cache partitions, not samples per partition.
-    data_batch_size=256,
+    # Exact transient-cache partitions per dataset epoch. Unlike
+    # data_batch_size, boundaries may fall inside gradient accumulation.
+    data_partitions=512,
     # Match the canonical DSpark training protocol used by the other Qwen runs.
     num_train_epochs=10,
     max_train_steps=None,
     max_grad_norm=1.0,
     sharding_strategy="full_shard",
-    fsdp_size=None,
+    fsdp_size=1,
     fsdp_layerwise=False,
-    context_parallel_size=1,
-    torch_compile=True,
+    context_parallel_size=2,
+    parallel=dict(
+        dp_replicate=1,
+        dp_shard=1,
+        cp=2,
+        tp=4,
+        ep=1,
+        expert_tp=1,
+        use_fsdp=True,
+        context_parallel_backend="model_native",
+        use_compile=False,
+    ),
+    # The frozen target reuses the draft TP ranks as additional FSDP shards;
+    # its hidden-state outputs remain replicated for the TP4 draft consumers.
+    offline_target_parallel=dict(
+        dp_replicate=1,
+        dp_shard=1,
+        cp=2,
+        tp=4,
+        ep=1,
+        expert_tp=1,
+        use_fsdp=True,
+        context_parallel_backend="model_native",
+    ),
+    torch_compile=False,
 )
 
 logging = dict(
@@ -59,13 +83,16 @@ logging = dict(
 )
 
 data = dict(
-    online_target=True,
-    train_data_path="train_data/spec_o3_coldstartsft.repeat60.deepspec.jsonl",
+    online_target=False,
+    offline_target_data_batches=True,
+    train_data_path=(
+        "train_data/spec_o3_coldstartsft.repeat60.deepspec.jsonl"
+    ),
     jsonl_index_cache_dir=None,
     data_batch_cache_dir=None,
     target_cache_path=None,
     chat_template="qwen",
-    max_length=4096,
+    max_length=131072,
     num_workers=1,
     prefetch_factor=1,
     # The bundled JSONL has literal <image> text but no media file paths.

@@ -167,6 +167,95 @@ def _resolve_data_batch_partition_count(
     return min(resolved, remaining_optimizer_steps)
 
 
+def _resolve_data_partition_count(
+    configured_data_partitions,
+    *,
+    remaining_micro_batches: int,
+) -> int:
+    """Resolve exact data partitions to non-empty per-rank micro-batches."""
+
+    remaining_micro_batches = int(remaining_micro_batches)
+    if remaining_micro_batches < 0:
+        raise ValueError("remaining_micro_batches must be non-negative.")
+    resolved = int(configured_data_partitions)
+    if resolved <= 0:
+        raise ValueError("data_partitions must be positive.")
+    return min(resolved, remaining_micro_batches)
+
+
+def _compute_epoch_data_partition_schedule(
+    *,
+    data_partitions: int,
+    micro_batches_per_epoch: int,
+    start_micro_step: int,
+    total_micro_batches: int,
+    gradient_accumulation_steps: int,
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """Repeat one exact dataset-partition layout for every training epoch."""
+
+    micro_batches_per_epoch = int(micro_batches_per_epoch)
+    start_micro_step = int(start_micro_step)
+    total_micro_batches = int(total_micro_batches)
+    gradient_accumulation_steps = int(gradient_accumulation_steps)
+    if micro_batches_per_epoch <= 0:
+        raise ValueError("micro_batches_per_epoch must be positive.")
+    if start_micro_step < 0 or total_micro_batches < 0:
+        raise ValueError(
+            "start_micro_step and total_micro_batches must be non-negative."
+        )
+    if gradient_accumulation_steps <= 0:
+        raise ValueError("gradient_accumulation_steps must be positive.")
+    partition_count = _resolve_data_partition_count(
+        data_partitions,
+        remaining_micro_batches=micro_batches_per_epoch,
+    )
+    base_micro_batches, extra_partitions = divmod(
+        micro_batches_per_epoch,
+        partition_count,
+    )
+    epoch_partitions = tuple(
+        base_micro_batches + int(index < extra_partitions)
+        for index in range(partition_count)
+    )
+    epoch_boundaries = []
+    boundary = 0
+    for micro_batch_count in epoch_partitions:
+        boundary += micro_batch_count
+        epoch_boundaries.append(boundary)
+
+    micro_batches = []
+    optimizer_steps = []
+    cursor = start_micro_step
+    final_micro_step = start_micro_step + total_micro_batches
+    while cursor < final_micro_step:
+        epoch_offset = cursor % micro_batches_per_epoch
+        partition_index = 0
+        while epoch_boundaries[partition_index] <= epoch_offset:
+            partition_index += 1
+        first_partition_count = (
+            epoch_boundaries[partition_index] - epoch_offset
+        )
+        remaining_epoch_partitions = (
+            first_partition_count,
+            *epoch_partitions[partition_index + 1 :],
+        )
+        for planned_micro_batches in remaining_epoch_partitions:
+            partition_end = min(
+                cursor + planned_micro_batches,
+                final_micro_step,
+            )
+            actual_micro_batches = partition_end - cursor
+            micro_batches.append(actual_micro_batches)
+            optimizer_steps.append(
+                partition_end // gradient_accumulation_steps
+                - cursor // gradient_accumulation_steps
+            )
+            cursor = partition_end
+            if cursor == final_micro_step:
+                break
+    return tuple(micro_batches), tuple(optimizer_steps)
+
+
 def _compute_samples_per_epoch(*, dataset_size: int, global_batch_size: int) -> int:
     samples_per_epoch = (dataset_size // global_batch_size) * global_batch_size
     assert samples_per_epoch > 0, (
@@ -358,7 +447,22 @@ class BaseTrainer:
                 "Runtime target inference requires local_batch_size=1."
             )
         configured_data_batch_size = self.args.train.get("data_batch_size")
+        configured_data_partitions = self.args.train.get("data_partitions")
+        if (
+            configured_data_batch_size is not None
+            and configured_data_partitions is not None
+        ):
+            raise ValueError(
+                "Configure only one of train.data_batch_size and "
+                "train.data_partitions."
+            )
+        configured_partition_count = (
+            configured_data_partitions
+            if configured_data_partitions is not None
+            else configured_data_batch_size
+        )
         self.data_batch_size = None
+        self.data_batch_optimizer_aligned = configured_data_partitions is None
         self.data_batch_micro_batches = None
         self.optimizer_steps_per_data_batch = None
         self.data_batch_cache_root = None
@@ -366,16 +470,22 @@ class BaseTrainer:
         self._active_data_batch_cache = None
         self._data_batch_phase = None
         self._data_batch_end_after_current = False
-        if configured_data_batch_size is not None:
+        if configured_partition_count is not None:
             if not self.target_runtime_enabled:
                 raise ValueError(
-                    "data_batch_size requires online target training or "
-                    "offline target data batches."
+                    "Partitioned target caching requires online target training "
+                    "or offline target data batches."
                 )
-            self.data_batch_size = _resolve_data_batch_partition_count(
-                configured_data_batch_size,
-                remaining_optimizer_steps=1,
-            )
+            if self.data_batch_optimizer_aligned:
+                self.data_batch_size = _resolve_data_batch_partition_count(
+                    configured_partition_count,
+                    remaining_optimizer_steps=1,
+                )
+            else:
+                self.data_batch_size = _resolve_data_partition_count(
+                    configured_partition_count,
+                    remaining_micro_batches=1,
+                )
             self.data_batch_cache_root = os.path.abspath(
                 os.fspath(
                     self.args.data.get("data_batch_cache_dir")
@@ -388,7 +498,8 @@ class BaseTrainer:
             self._initialize_data_batch_cache()
         elif self.offline_target_data_batches_enabled:
             raise ValueError(
-                "data.offline_target_data_batches requires train.data_batch_size."
+                "data.offline_target_data_batches requires "
+                "train.data_batch_size or train.data_partitions."
             )
         if self.heterogeneous_target_data_batches:
             self._validate_heterogeneous_target_data_batch_layout()
@@ -580,32 +691,56 @@ class BaseTrainer:
         if self.data_batch_size is not None:
             if self.next_micro_step % self.gradient_accumulation_steps != 0:
                 raise ValueError(
-                    "data_batch_size requires an optimizer-step-aligned resume: "
+                    "Partitioned target caching requires an optimizer-step-"
+                    "aligned resume: "
                     f"next_micro_step={self.next_micro_step}, "
                     f"gradient_accumulation_steps={self.gradient_accumulation_steps}."
                 )
             remaining_optimizer_steps = self.max_train_steps - self.global_step
-            self.data_batch_size = _resolve_data_batch_partition_count(
-                configured_data_batch_size,
-                remaining_optimizer_steps=remaining_optimizer_steps,
+            remaining_micro_batches = (
+                remaining_optimizer_steps * self.gradient_accumulation_steps
             )
+            if self.data_batch_optimizer_aligned:
+                self.data_batch_size = _resolve_data_batch_partition_count(
+                    configured_partition_count,
+                    remaining_optimizer_steps=remaining_optimizer_steps,
+                )
+            else:
+                self.data_batch_size = _resolve_data_partition_count(
+                    configured_partition_count,
+                    remaining_micro_batches=self.micro_batches_per_epoch,
+                )
             if remaining_optimizer_steps == 0:
                 self.data_batch_micro_batches = ()
                 self.optimizer_steps_per_data_batch = ()
             else:
-                (
-                    self.data_batch_micro_batches,
-                    self.optimizer_steps_per_data_batch,
-                ) = _compute_data_batch_schedule(
-                    data_batch_size=self.data_batch_size,
-                    total_samples=(
-                        remaining_optimizer_steps
-                        * int(self.args.train.global_batch_size)
-                    ),
-                    global_batch_size=int(self.args.train.global_batch_size),
-                    data_parallel_size=self.data_parallel_size,
-                    local_batch_size=int(self.args.train.local_batch_size),
-                )
+                if self.data_batch_optimizer_aligned:
+                    (
+                        self.data_batch_micro_batches,
+                        self.optimizer_steps_per_data_batch,
+                    ) = _compute_data_batch_schedule(
+                        data_batch_size=self.data_batch_size,
+                        total_samples=(
+                            remaining_optimizer_steps
+                            * int(self.args.train.global_batch_size)
+                        ),
+                        global_batch_size=int(self.args.train.global_batch_size),
+                        data_parallel_size=self.data_parallel_size,
+                        local_batch_size=int(self.args.train.local_batch_size),
+                    )
+                else:
+                    (
+                        self.data_batch_micro_batches,
+                        self.optimizer_steps_per_data_batch,
+                    ) = _compute_epoch_data_partition_schedule(
+                        data_partitions=self.data_batch_size,
+                        micro_batches_per_epoch=self.micro_batches_per_epoch,
+                        start_micro_step=self.next_micro_step,
+                        total_micro_batches=remaining_micro_batches,
+                        gradient_accumulation_steps=(
+                            self.gradient_accumulation_steps
+                        ),
+                    )
         if self.target_runtime_enabled:
             self.online_target = self.build_online_target()
         self.info_board()
@@ -658,14 +793,31 @@ class BaseTrainer:
     def info_board(self):
         print_on_local_main("***** Running training *****")
         print_on_local_main(f"  Train dataset size = {len(self.train_dataset)}")
+        if bool(
+            getattr(self.online_target, "cache_replicated_across_tp", False)
+        ):
+            target_fsdp_size = (
+                self.target_parallel_config.fsdp_shard_size
+                * self.target_parallel_config.tp
+            )
+            target_topology = (
+                "target FSDP "
+                f"{target_fsdp_size} "
+                "(includes draft TP axis) x "
+                f"EP {self.target_parallel_config.ep}"
+            )
+        else:
+            target_topology = (
+                f"target FSDP {self.target_parallel_config.fsdp_shard_size} x "
+                f"TP {self.target_parallel_config.tp} x "
+                f"EP {self.target_parallel_config.ep}"
+            )
         print_on_local_main(
             "  Parallel topology = "
             f"CP {self.context_parallel_size} x FSDP {self.fsdp_size} "
             f"(effective data replicas {self.data_parallel_size}), "
             f"draft EP {self.parallel_config.ep}, "
-            f"target FSDP {self.target_parallel_config.fsdp_shard_size} x "
-            f"TP {self.target_parallel_config.tp} x "
-            f"EP {self.target_parallel_config.ep}"
+            f"{target_topology}"
         )
         print_on_local_main(f"  Num train epochs = {self.args.train.num_train_epochs}")
         print_on_local_main(f"  Samples per epoch = {self.samples_per_epoch}")
@@ -683,7 +835,26 @@ class BaseTrainer:
                 else "online"
             )
             print_on_local_main(f"  Target data-batch mode = {target_mode}")
-            print_on_local_main(f"  Data batch partitions = {self.data_batch_size}")
+            partition_label = (
+                "Data batch partitions"
+                if self.data_batch_optimizer_aligned
+                else "Data partitions per epoch"
+            )
+            print_on_local_main(
+                f"  {partition_label} = {self.data_batch_size}"
+            )
+            print_on_local_main(
+                "  Remaining transient partition cycles = "
+                f"{len(self.data_batch_micro_batches)}"
+            )
+            partition_alignment = (
+                "optimizer step"
+                if self.data_batch_optimizer_aligned
+                else "training micro-batch"
+            )
+            print_on_local_main(
+                f"  Data batch partition alignment = {partition_alignment}"
+            )
             if len(self.optimizer_steps_per_data_batch) <= 16:
                 optimizer_step_summary = str(
                     self.optimizer_steps_per_data_batch
@@ -838,10 +1009,28 @@ class BaseTrainer:
         *,
         batch_index: int,
         sample_index: int,
+        cache_rank: int | None = None,
     ) -> str:
-        rank_dir = self.data_batch_rank_cache_dir
+        rank_dir = (
+            self.data_batch_rank_cache_dir
+            if cache_rank is None
+            else os.path.join(
+                self.data_batch_cache_root,
+                f"rank_{int(cache_rank):05d}",
+            )
+        )
         batch_dir = os.path.join(rank_dir, f"data_batch_{batch_index:08d}")
         return os.path.join(batch_dir, f"sample_{sample_index:08d}.pt")
+
+    def _target_cache_owner_rank(self) -> int:
+        if not bool(
+            getattr(self.online_target, "cache_replicated_across_tp", False)
+        ):
+            return self.global_rank
+        if self.target_parallel.tensor_parallel_size == 1:
+            return self.global_rank
+        group = self.target_parallel.tensor_parallel_group
+        return int(dist.get_process_group_ranks(group)[0])
 
     def _write_data_batch_cache_file(
         self,
@@ -849,10 +1038,12 @@ class BaseTrainer:
         *,
         batch_index,
         sample_index,
+        cache_rank: int | None = None,
     ):
         path = self._data_batch_cache_file_path(
             batch_index=batch_index,
             sample_index=sample_index,
+            cache_rank=cache_rank,
         )
         batch_dir = os.path.dirname(path)
         rank_dir = os.path.dirname(batch_dir)
@@ -1036,25 +1227,34 @@ class BaseTrainer:
                     cached_paths=cached_paths,
                 )
             else:
+                cache_owner_rank = self._target_cache_owner_rank()
                 for sample_index in range(micro_batch_count):
                     try:
                         batch = next(batches)
                     except StopIteration:
                         break
                     prepared = self.prepare_online_target_batch(batch)
-                    with record_function("deepspec::target_cache_disk_write"):
-                        cached_paths.append(
+                    cache_path = self._data_batch_cache_file_path(
+                        batch_index=data_batch_index,
+                        sample_index=sample_index,
+                        cache_rank=cache_owner_rank,
+                    )
+                    cached_paths.append(cache_path)
+                    if self.global_rank == cache_owner_rank:
+                        with record_function("deepspec::target_cache_disk_write"):
                             self._write_data_batch_cache_file(
                                 prepared,
                                 batch_index=data_batch_index,
                                 sample_index=sample_index,
+                                cache_rank=cache_owner_rank,
                             )
-                        )
-                        self._synchronize_target_inference_progress(
-                            data_batch_index=data_batch_index,
-                            processed_samples=sample_index + 1,
-                            total_samples=micro_batch_count,
-                        )
+                    else:
+                        prepared.clear()
+                    self._synchronize_target_inference_progress(
+                        data_batch_index=data_batch_index,
+                        processed_samples=sample_index + 1,
+                        total_samples=micro_batch_count,
+                    )
 
             if not cached_paths:
                 self._active_data_batch_cache = None
@@ -1104,7 +1304,8 @@ class BaseTrainer:
                     torch.cuda.synchronize(self.device)
                 dist.barrier()
             with record_function("deepspec::target_cache_disk_delete"):
-                self._delete_data_batch_cache(cached_paths)
+                if self.global_rank == self._target_cache_owner_rank():
+                    self._delete_data_batch_cache(cached_paths)
             self._active_data_batch_cache = None
             self._data_batch_phase = None
             if dist.is_initialized():
@@ -1265,13 +1466,24 @@ class BaseTrainer:
                 should_sync = (
                     self.next_micro_step + 1
                 ) % self.gradient_accumulation_steps == 0
-                if self._data_batch_end_after_current and not should_sync:
+                if (
+                    self._data_batch_end_after_current
+                    and self.data_batch_optimizer_aligned
+                    and not should_sync
+                ):
                     raise RuntimeError(
                         "A target-cache data batch ended inside a gradient "
                         "accumulation window."
                     )
                 with record_function("deepspec::training_micro_step"):
-                    with gradient_sync_context(self.model, should_sync=should_sync):
+                    with gradient_sync_context(
+                        self.model,
+                        should_sync=should_sync,
+                        # Exact cache partitions may end inside an accumulation
+                        # window. Reshard the draft before the next frozen-target
+                        # phase without synchronizing or discarding its gradients.
+                        reshard_after_backward=self._data_batch_end_after_current,
+                    ):
                         with record_function("deepspec::forward_and_loss"):
                             loss = (
                                 self.run_batch(batch) / self.gradient_accumulation_steps
@@ -1350,6 +1562,11 @@ class BaseTrainer:
                             self._save_and_suspend()
                             profiler.step()
                             return
+                    elif self._data_batch_end_after_current:
+                        # Do not carry an asynchronous metric collective into
+                        # the next isolated target-inference phase.
+                        training_logger.finish_optimizer_step(pending_log)
+                        pending_log = None
                 profiler.step()
 
         # Preserve the final log record. This wait is outside the profiled

@@ -49,7 +49,7 @@ class Qwen3DSparkTrainer(BaseTrainer):
 
     # Training step.
     def run_batch(self, batch):
-        if self.online_target_enabled and self.data_batch_micro_batches is not None:
+        if self.target_runtime_enabled and self.data_batch_micro_batches is not None:
             if self._data_batch_phase != "draft_training":
                 raise RuntimeError(
                     "Draft forward is only allowed during the isolated "
@@ -60,7 +60,7 @@ class Qwen3DSparkTrainer(BaseTrainer):
                     "Isolated draft training requires precomputed target hidden "
                     "states; refusing to run target inference from run_batch."
                 )
-        elif self.online_target_enabled and "target_hidden_states" not in batch:
+        elif self.target_runtime_enabled and "target_hidden_states" not in batch:
             self.prepare_online_target_batch(batch)
         needs_target_logits = (
             float(self.args.model.l1_loss_alpha) > 0.0
@@ -75,7 +75,7 @@ class Qwen3DSparkTrainer(BaseTrainer):
             target_last_hidden_states = None
         context_chunk_len = batch.get("context_chunk_len")
         if context_chunk_len is None:
-            # Offline cache records use the canonical context_len field.
+            # Reusable full-cache records use the canonical context_len field.
             context_chunk_len = batch.get("context_len")
         with record_function("deepspec::draft_forward"):
             outputs = self.forward_model(

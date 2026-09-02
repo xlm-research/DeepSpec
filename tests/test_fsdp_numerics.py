@@ -87,7 +87,7 @@ class FSDP2NumericsTest(unittest.TestCase):
         shard_optim.step()
         torch.testing.assert_close(sharded(x), baseline(x), rtol=2e-5, atol=2e-5)
 
-    def test_accumulation_last_backward_hint_preserves_update(self):
+    def test_accumulation_can_reshard_at_partition_boundary(self):
         runtime = require_torchrun(self, world_size=2)
         torch.manual_seed(2027)
         baseline = _Model().to(runtime.device)
@@ -98,14 +98,15 @@ class FSDP2NumericsTest(unittest.TestCase):
         base_optim = BF16Optimizer(baseline, 1e-3, 2, 0, 0)
         shard_optim = BF16Optimizer(sharded, 1e-3, 2, 0, 0)
         inputs = [
-            torch.randn(3, 4, 8, device=runtime.device),
-            torch.randn(3, 4, 8, device=runtime.device),
+            torch.randn(3, 4, 8, device=runtime.device)
+            for _ in range(5)
         ]
         for index, value in enumerate(inputs):
             baseline(value).square().mean().div_(len(inputs)).backward()
             with gradient_sync_context(
                 sharded,
                 should_sync=index + 1 == len(inputs),
+                reshard_after_backward=index + 1 < len(inputs),
                 use_last_backward_hint=True,
             ):
                 sharded(value).square().mean().div_(len(inputs)).backward()

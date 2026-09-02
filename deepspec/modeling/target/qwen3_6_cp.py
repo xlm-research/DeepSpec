@@ -349,10 +349,33 @@ def _send_linear_state(*, cache, layer_idx, dst, group, device):
         raise TypeError(
             f"Target cache layer {layer_idx} is not a DeltaNet cache."
         )
+    if isinstance(layer.conv_states, dict):
+        state_indices = tuple(range(int(layer.number_of_states)))
+        for state_idx in state_indices:
+            _send_optional_tensor(
+                tensor=(
+                    layer.conv_states[state_idx]
+                    if layer.is_conv_states_initialized[state_idx]
+                    else None
+                ),
+                dst=dst,
+                group=group,
+                device=device,
+            )
+            _send_optional_tensor(
+                tensor=(
+                    layer.recurrent_states[state_idx]
+                    if layer.is_recurrent_states_initialized[state_idx]
+                    else None
+                ),
+                dst=dst,
+                group=group,
+                device=device,
+            )
+        return
+    # Compatibility with Transformers releases that stored one state directly.
     _send_optional_tensor(
-        tensor=(
-            layer.conv_states if layer.is_conv_states_initialized else None
-        ),
+        tensor=layer.conv_states if layer.is_conv_states_initialized else None,
         dst=dst,
         group=group,
         device=device,
@@ -370,34 +393,60 @@ def _send_linear_state(*, cache, layer_idx, dst, group, device):
 
 
 def _recv_linear_state(*, cache, layer_idx, src, group, device):
-    conv_states = _recv_optional_tensor(
-        src=src,
-        group=group,
-        device=device,
-    )
-    recurrent_states = _recv_optional_tensor(
-        src=src,
-        group=group,
-        device=device,
-    )
-    if conv_states is None or recurrent_states is None:
-        raise RuntimeError(
-            f"Missing Qwen3.6 DeltaNet state for layer {layer_idx}."
-        )
     layer = cache.layers[int(layer_idx)]
-    if not layer.is_conv_states_initialized:
-        layer.lazy_initialization(conv_states=conv_states)
-    if not layer.is_recurrent_states_initialized:
-        layer.lazy_initialization(recurrent_states=recurrent_states)
-    if layer.conv_states.shape != conv_states.shape:
-        raise RuntimeError("Received DeltaNet conv state has the wrong shape.")
-    if layer.recurrent_states.shape != recurrent_states.shape:
-        raise RuntimeError(
-            "Received DeltaNet recurrent state has the wrong shape."
+    state_indices = (
+        tuple(range(int(layer.number_of_states)))
+        if isinstance(layer.conv_states, dict)
+        else (None,)
+    )
+    for state_idx in state_indices:
+        conv_states = _recv_optional_tensor(
+            src=src,
+            group=group,
+            device=device,
         )
-    layer.conv_states.copy_(conv_states)
-    layer.recurrent_states.copy_(recurrent_states)
-    layer.has_previous_state = True
+        recurrent_states = _recv_optional_tensor(
+            src=src,
+            group=group,
+            device=device,
+        )
+        if conv_states is None or recurrent_states is None:
+            raise RuntimeError(
+                f"Missing Qwen3.6 DeltaNet state for layer {layer_idx}, "
+                f"state {state_idx if state_idx is not None else 0}."
+            )
+        if state_idx is None:
+            if not layer.is_conv_states_initialized:
+                layer.lazy_initialization(conv_states=conv_states)
+            if not layer.is_recurrent_states_initialized:
+                layer.lazy_initialization(recurrent_states=recurrent_states)
+            local_conv_states = layer.conv_states
+            local_recurrent_states = layer.recurrent_states
+        else:
+            if not layer.is_conv_states_initialized[state_idx]:
+                layer.lazy_initialization(
+                    conv_states=conv_states,
+                    state_idx=state_idx,
+                )
+            if not layer.is_recurrent_states_initialized[state_idx]:
+                layer.lazy_initialization(
+                    recurrent_states=recurrent_states,
+                    state_idx=state_idx,
+                )
+            local_conv_states = layer.conv_states[state_idx]
+            local_recurrent_states = layer.recurrent_states[state_idx]
+        if local_conv_states.shape != conv_states.shape:
+            raise RuntimeError("Received DeltaNet conv state has the wrong shape.")
+        if local_recurrent_states.shape != recurrent_states.shape:
+            raise RuntimeError(
+                "Received DeltaNet recurrent state has the wrong shape."
+            )
+        local_conv_states.copy_(conv_states)
+        local_recurrent_states.copy_(recurrent_states)
+        if state_idx is None:
+            layer.has_previous_state = True
+        else:
+            layer.has_previous_state[state_idx] = True
 
 
 def _split_linear_mask(attention_mask, split_size):
