@@ -241,6 +241,35 @@ disk capacity for transient target activations.
 For workflows that have ample disk and want a reusable full cache, the separate
 `prepare_glm5_next_target_cache.py` runner remains available.
 
+Qwen3.8-27B DSpark uses exact per-epoch micro-batch partitions, so the requested
+count is not capped by the number of optimizer steps. The 128K launcher splits
+each dataset epoch into 512 partitions by default and deletes each partition
+only after its draft backward passes have finished on every rank:
+
+```bash
+bash scripts/train/train_qwen3_8_27b_dspark_128gpu.sh
+```
+
+`DATA_PARTITIONS` defaults to 512 and may be set to any positive integer. The
+default transient cache directory is created under `OUTPUT_ROOT` with the
+target model name, DP/FSDP/CP/TP configuration, and launch time, for example
+`Qwen3.8-27B_dp16_fsdp1_cp2_tp4_20260902_153045`. Set the same
+`DATA_BATCH_CACHE_TIMESTAMP=YYYYMMDD_HHMMSS` on every node when a multi-node
+launch must use one shared timestamp, or set `DATA_BATCH_CACHE_DIR` explicitly
+to override the generated path.
+
+If the partition count exceeds the per-rank micro-batches in one epoch, the
+effective count is capped so no partition is empty. Ten epochs therefore run
+ten repetitions of the 512-part lifecycle, but only one 1/512-epoch feature
+block is resident on disk at a time. The draft retains its configured CP/TP
+topology. During target inference, Qwen's native causal CP shards the 128K
+sequence and the draft TP ranks act as additional target FSDP shards; the
+generated hidden states remain replicated across the TP consumers. Only one of
+those identical copies is written per TP group, so `DATA_BATCH_CACHE_DIR` must
+be visible at the same path to all ranks in that node-local TP group. Set
+`BOUNDED_OFFLINE=false` only when a complete reusable target cache is
+intentionally desired.
+
 ### Multimodal targets
 
 `prepare_target_cache.py` detects image-text target configurations such as

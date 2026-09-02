@@ -7,17 +7,25 @@ import unittest
 from unittest.mock import patch
 
 import torch
-from transformers import AutoConfig
+from transformers import AutoConfig, DynamicCache
 from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
 
+from deepspec.distributed import (
+    ParallelConfig,
+    ParallelContext,
+    apply_parallelism,
+)
 from deepspec.eval.dspark import Qwen3_8DSparkEvaluator
 from deepspec.modeling.dspark.qwen3_8 import (
     Qwen3_8DSparkModel,
     build_draft_config,
 )
 from deepspec.modeling.dspark.loss import compute_dspark_loss
+from deepspec.modeling.target import online
+from deepspec.modeling.target import qwen3_6_cp
 from deepspec.trainer import Qwen3_8DSparkTrainer
 from deepspec.utils.config import ConfigNode, load_config
+from tests.distributed_test_utils import require_torchrun
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -77,6 +85,7 @@ class Qwen3_8DSparkConfigTest(unittest.TestCase):
         self.assertEqual(config.num_hidden_layers, 5)
         self.assertEqual(config.target_layer_ids, [1, 16, 31, 46, 61])
         self.assertEqual(config._attn_implementation, "flex_attention")
+        self.assertEqual(config.target_context_layout, "native_head_tail")
         self.assertEqual(config.deepspec_draft_architecture, "qwen3_full_attention")
         self.assertEqual(config.deepspec_draft_rope, "full_head")
         self.assertEqual(config.partial_rotary_factor, 1.0)
@@ -90,9 +99,32 @@ class Qwen3_8DSparkConfigTest(unittest.TestCase):
             REPO_ROOT / "config/dspark/dspark_qwen3_8_27b.py"
         )
         self.assertIs(config.train.trainer_cls, Qwen3_8DSparkTrainer)
+        parallel = ParallelConfig.from_mapping(config.train, world_size=8)
+        self.assertEqual(
+            (parallel.dp_replicate, parallel.dp_shard, parallel.cp, parallel.tp),
+            (1, 1, 2, 4),
+        )
+        self.assertEqual(config.data.max_length, 131072)
         self.assertEqual(config.model.target_model_name_or_path, CONFIGURED_TARGET)
         self.assertFalse(config.data.multimodal)
         self.assertTrue(config.data.store_target_last_hidden_states)
+        self.assertFalse(config.data.online_target)
+        self.assertTrue(config.data.offline_target_data_batches)
+        self.assertEqual(config.train.data_partitions, 512)
+        self.assertIsNone(config.data.target_cache_path)
+        target_parallel = ParallelConfig.from_mapping(
+            {"parallel": dict(config.train.offline_target_parallel)},
+            world_size=8,
+        )
+        self.assertEqual(
+            (
+                target_parallel.dp_replicate,
+                target_parallel.dp_shard,
+                target_parallel.cp,
+                target_parallel.tp,
+            ),
+            (1, 1, 2, 4),
+        )
         self.assertEqual(config.train.num_train_epochs, 10)
 
     def test_checkpoint_architecture_selects_qwen38_evaluator(self):
@@ -150,14 +182,20 @@ class Qwen3_8DSparkConfigTest(unittest.TestCase):
 
 
 class Qwen3_8DSparkModelTest(unittest.TestCase):
-    def _build_tiny_model(self, device="cpu", *, production_heads=False):
+    def _build_tiny_model(
+        self,
+        device="cpu",
+        *,
+        production_heads=False,
+        tp4_compatible=False,
+    ):
         config = Qwen3_5TextConfig(
             vocab_size=128,
             hidden_size=64,
             intermediate_size=128,
             num_hidden_layers=1,
-            num_attention_heads=4,
-            num_key_value_heads=2,
+            num_attention_heads=8 if tp4_compatible else 4,
+            num_key_value_heads=4 if tp4_compatible else 2,
             head_dim=16,
             max_position_embeddings=128,
             layer_types=["full_attention"],
@@ -174,6 +212,66 @@ class Qwen3_8DSparkModelTest(unittest.TestCase):
             config.confidence_head_with_markov = True
         config._attn_implementation = "flex_attention"
         return Qwen3_8DSparkModel(config).float().to(device)
+
+    def test_cp2_tp4_fsdp_forward_and_backward(self):
+        runtime = require_torchrun(self, world_size=8)
+        torch.manual_seed(20260902)
+        parallel_config = ParallelConfig(
+            cp=2,
+            tp=4,
+            use_fsdp=True,
+            context_parallel_backend="model_native",
+        )
+        topology = ParallelContext.build(
+            parallel_config,
+            device_type=runtime.device.type,
+        )
+        model = self._build_tiny_model(
+            runtime.device,
+            tp4_compatible=True,
+        ).to(torch.bfloat16)
+        model.configure_context_parallel(
+            size=2,
+            rank=topology.context_parallel_rank,
+            group=topology.context_parallel_group,
+            model_parallel_group=topology.model_mesh.get_group(),
+            model_parallel_src_rank=topology.model_parallel_src_rank,
+        )
+        model = apply_parallelism(
+            model,
+            topology,
+            parallel_config,
+            param_dtype=torch.bfloat16,
+            sequence_length=16,
+        )
+        output = model(
+            input_ids=(
+                torch.arange(16, device=runtime.device)
+                .remainder(120)
+                .unsqueeze(0)
+            ),
+            target_hidden_states=torch.randn(
+                1,
+                8,
+                128,
+                device=runtime.device,
+                dtype=torch.bfloat16,
+            ),
+            loss_mask=torch.ones(
+                1,
+                16,
+                dtype=torch.bool,
+                device=runtime.device,
+            ),
+            context_chunk_len=torch.tensor([8], device=runtime.device),
+            seq_len=torch.tensor([16], device=runtime.device),
+        )
+        self.assertEqual(tuple(output.draft_logits.shape), (1, 1, 3, 128))
+        output.draft_logits.float().square().mean().backward()
+        self.assertTrue(
+            any(parameter.grad is not None for parameter in model.parameters())
+        )
+        torch.distributed.barrier()
 
     def test_initializes_embedding_and_head_from_checkpoint_tensors(self):
         model = self._build_tiny_model()
@@ -266,6 +364,44 @@ class Qwen3_8DSparkModelTest(unittest.TestCase):
 
 
 class Qwen3_8DSparkTrainerTest(unittest.TestCase):
+    def test_tp_ranks_share_one_transient_cache_owner(self):
+        trainer = object.__new__(Qwen3_8DSparkTrainer)
+        trainer.global_rank = 6
+        trainer.online_target = SimpleNamespace(cache_replicated_across_tp=True)
+        trainer.target_parallel = SimpleNamespace(
+            tensor_parallel_size=4,
+            tensor_parallel_group=object(),
+        )
+        with patch(
+            "deepspec.trainer.base_trainer.dist.get_process_group_ranks",
+            return_value=[4, 5, 6, 7],
+        ):
+            self.assertEqual(trainer._target_cache_owner_rank(), 4)
+
+    def test_builds_qwen38_partition_target(self):
+        trainer = object.__new__(Qwen3_8DSparkTrainer)
+        trainer.args = SimpleNamespace(
+            model=SimpleNamespace(
+                target_model_name_or_path="target",
+                target_layer_ids=[1, 3],
+            )
+        )
+        trainer.target_parallel = object()
+        trainer.device = torch.device("cpu")
+        trainer.checkpoint_dir_root = "/tmp/checkpoint"
+
+        with patch("deepspec.modeling.target.Qwen3_8OnlineTarget") as target_cls:
+            target = trainer.build_online_target()
+
+        self.assertIs(target, target_cls.return_value)
+        target_cls.assert_called_once_with(
+            model_name_or_path="target",
+            target_layer_ids=[1, 3],
+            topology=trainer.target_parallel,
+            device=trainer.device,
+            rank_local_cache_dir="/tmp/checkpoint/target_rank_local",
+        )
+
     def test_local_checkpoint_initialization_does_not_load_full_target(self):
         class FakeDraft:
             def __init__(self):
@@ -324,6 +460,129 @@ class Qwen3_8DSparkTrainerTest(unittest.TestCase):
             weights[1].to(torch.bfloat16),
         )
         self.assertTrue(draft.initialized_with["freeze"])
+
+
+class Qwen3_8PartitionTargetTest(unittest.TestCase):
+    def test_deltanet_cp_transfers_transformers_dict_cache_state(self):
+        text_config = Qwen3_5TextConfig(
+            vocab_size=32,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=8,
+            layer_types=["linear_attention"],
+            linear_key_head_dim=4,
+            linear_value_head_dim=4,
+            linear_num_key_heads=2,
+            linear_num_value_heads=2,
+        )
+        source_cache = DynamicCache(config=text_config)
+        source_layer = source_cache.layers[0]
+        conv_state = torch.randn(1, 12, 4)
+        recurrent_state = torch.randn(1, 2, 4, 4)
+        source_layer.lazy_initialization(
+            conv_states=conv_state,
+            recurrent_states=recurrent_state,
+            state_idx=0,
+        )
+        source_layer.conv_states[0].copy_(conv_state)
+        source_layer.recurrent_states[0].copy_(recurrent_state)
+
+        with patch(
+            "deepspec.modeling.target.qwen3_6_cp._send_optional_tensor"
+        ) as send_tensor:
+            qwen3_6_cp._send_linear_state(
+                cache=source_cache,
+                layer_idx=0,
+                dst=1,
+                group=object(),
+                device=torch.device("cpu"),
+            )
+        self.assertEqual(send_tensor.call_count, 2)
+        torch.testing.assert_close(
+            send_tensor.call_args_list[0].kwargs["tensor"],
+            conv_state,
+        )
+        torch.testing.assert_close(
+            send_tensor.call_args_list[1].kwargs["tensor"],
+            recurrent_state,
+        )
+
+        destination_cache = DynamicCache(config=text_config)
+        with patch(
+            "deepspec.modeling.target.qwen3_6_cp._recv_optional_tensor",
+            side_effect=[conv_state.clone(), recurrent_state.clone()],
+        ):
+            qwen3_6_cp._recv_linear_state(
+                cache=destination_cache,
+                layer_idx=0,
+                src=0,
+                group=object(),
+                device=torch.device("cpu"),
+            )
+        destination_layer = destination_cache.layers[0]
+        torch.testing.assert_close(destination_layer.conv_states[0], conv_state)
+        torch.testing.assert_close(
+            destination_layer.recurrent_states[0],
+            recurrent_state,
+        )
+        self.assertTrue(destination_layer.has_previous_state[0])
+
+    def test_target_reuses_tp_ranks_as_fsdp_shards(self):
+        class FakeModel:
+            def eval(self):
+                return self
+
+            def requires_grad_(self, value):
+                self.requires_grad = value
+                return self
+
+        target_config = SimpleNamespace(
+            model_type="qwen3_5",
+            text_config=SimpleNamespace(num_hidden_layers=64),
+            vision_config=SimpleNamespace(depth=27),
+        )
+        topology = SimpleNamespace(
+            expert_parallel_size=1,
+            tensor_parallel_size=4,
+            context_parallel_size=1,
+        )
+        model = FakeModel()
+        with (
+            patch(
+                "deepspec.modeling.target.online.AutoConfig.from_pretrained",
+                return_value=target_config,
+            ),
+            patch(
+                "deepspec.modeling.target.online._build_rank_local_ep_target_model",
+                return_value=model,
+            ) as build_model,
+            patch(
+                "deepspec.modeling.target.online._wrap_target_model_with_fsdp",
+                return_value=model,
+            ) as wrap_model,
+        ):
+            target = online.Qwen3_8OnlineTarget(
+                model_name_or_path="target",
+                target_layer_ids=[1, 16, 31, 46, 61],
+                topology=topology,
+                device=torch.device("cpu"),
+                rank_local_cache_dir="/tmp/cache",
+            )
+
+        self.assertIs(target.model, model)
+        self.assertEqual(target_config.text_config.num_hidden_layers, 62)
+        self.assertEqual(target_config.vision_config.depth, 0)
+        self.assertFalse(model.requires_grad)
+        self.assertEqual(
+            build_model.call_args.kwargs["attn_implementation"],
+            "sdpa",
+        )
+        self.assertTrue(
+            wrap_model.call_args.kwargs["shard_tensor_parallel_dimension"]
+        )
 
 
 if __name__ == "__main__":

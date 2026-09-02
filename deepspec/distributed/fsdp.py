@@ -192,6 +192,7 @@ def gradient_sync_context(
     model: nn.Module,
     *,
     should_sync: bool,
+    reshard_after_backward: bool = False,
     use_last_backward_hint: bool = False,
 ):
     set_is_last_backward = (
@@ -214,7 +215,10 @@ def gradient_sync_context(
         return
     if isinstance(model, FSDPModule):
         model.set_requires_gradient_sync(False, recurse=True)
-        model.set_reshard_after_backward(False, recurse=True)
+        model.set_reshard_after_backward(
+            bool(reshard_after_backward),
+            recurse=True,
+        )
         try:
             yield
         finally:
@@ -239,9 +243,9 @@ def clip_grad_norm_(
     """Clip a model containing both FSDP2 DTensors and pure-EP tensors.
 
     PyTorch's generic clipper batches gradients by device and dtype, which
-    makes its foreach kernel reject a bucket containing both Tensor and
-    DTensor gradients.  Compute the two contributions independently and use
-    one common coefficient so this remains a true global L2-norm clip.
+    makes it reject mixed Tensor/DTensor gradients or DTensors on different
+    meshes. Compute each compatible contribution independently and use one
+    common coefficient so this remains a true global L2-norm clip.
     """
 
     expert_parameter_ids = {
@@ -249,7 +253,7 @@ def clip_grad_norm_(
         for module in (pure_expert_modules or [])
         for parameter in module.parameters()
     }
-    distributed_parameters = []
+    distributed_parameter_buckets = {}
     expert_parameters = []
     other_parameters = []
     for parameter in model.parameters():
@@ -258,7 +262,9 @@ def clip_grad_norm_(
         if id(parameter) in expert_parameter_ids:
             expert_parameters.append(parameter)
         elif isinstance(parameter.grad, torch.distributed.tensor.DTensor):
-            distributed_parameters.append(parameter)
+            distributed_parameter_buckets.setdefault(
+                parameter.grad.device_mesh, []
+            ).append(parameter)
         else:
             other_parameters.append(parameter)
 
@@ -267,7 +273,7 @@ def clip_grad_norm_(
         torch.device("cpu"),
     )
     total_sq = torch.zeros((), device=device, dtype=torch.float32)
-    if distributed_parameters:
+    for distributed_parameters in distributed_parameter_buckets.values():
         dtensor_norm = torch.nn.utils.clip_grad_norm_(
             distributed_parameters, float("inf")
         )
