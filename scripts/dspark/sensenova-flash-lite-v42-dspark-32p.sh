@@ -3,23 +3,17 @@ set -euo pipefail
 
 # Production launcher for Qwen3.8-27B DSpark on homogeneous multi-GPU nodes.
 # Run this script once on every node with the same rendezvous address and a
-# shared filesystem. Bounded offline mode generates, trains, and deletes one
-# transient target-feature partition at a time. Set BOUNDED_OFFLINE=false only
-# to reuse the legacy full-cache workflow.
+# shared filesystem. Online target-first data batching is the default; set
+# ONLINE_TARGET=false to reuse the legacy full offline target-cache workflow.
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ROOT_DIR=${ROOT_DIR:-/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain}
 BASE_DIR=${ROOT_DIR}
 cd "${ROOT_DIR}"
 
-# No scheduler topology means a direct single-node launch. SenseCore reports
-# node topology explicitly; generic launchers may report WORLD_SIZE/RANK in
-# either nodes or GPU processes.
-SCHEDULER_WORLD_SIZE=${WORLD_SIZE:-}
-SCHEDULER_LOCAL_WORLD_SIZE=${LOCAL_WORLD_SIZE:-}
-SCHEDULER_RANK=${RANK:-}
-NNODES=${SENSECORE_PYTORCH_NNODES:-${NNODES:-}}
-NODE_RANK=${SENSECORE_PYTORCH_NODE_RANK:-${NODE_RANK:-}}
+# No scheduler topology means a direct single-node launch.
+NNODES=${SENSECORE_PYTORCH_NNODES:-${NNODES:-${WORLD_SIZE:-1}}}
+NODE_RANK=${SENSECORE_PYTORCH_NODE_RANK:-${NODE_RANK:-${RANK:-}}}
 REQUESTED_NPROC_PER_NODE=${NPROC_PER_NODE:-}
 MASTER_ADDR=${MASTER_ADDR:-}
 MASTER_PORT=${MASTER_PORT:-29501}
@@ -35,6 +29,19 @@ if [[ -n "${LOCAL_RANK:-}" ]]; then
     echo "Run this launcher once per node, not from inside an existing torchrun worker." >&2
     exit 1
 fi
+if [[ ! "${NNODES}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "NNODES must be a positive integer; got ${NNODES}." >&2
+    exit 1
+fi
+if [[ -z "${NODE_RANK}" ]]; then
+    if ((NNODES == 1)); then
+        NODE_RANK=0
+    else
+        echo "NODE_RANK (or SENSECORE_PYTORCH_NODE_RANK/RANK) is required." >&2
+        exit 1
+    fi
+fi
+
 command -v "${PYTHON_BIN}" >/dev/null || {
     echo "PYTHON_BIN is not available on PATH: ${PYTHON_BIN}" >&2
     exit 1
@@ -58,53 +65,6 @@ if [[ -n "${REQUESTED_NPROC_PER_NODE}" ]]; then
     fi
 fi
 NPROC_PER_NODE=${DETECTED_NPROC_PER_NODE}
-
-WORLD_SIZE_IS_GPU_PROCESSES=false
-if [[ -z "${NNODES}" ]]; then
-    if [[ -n "${SCHEDULER_WORLD_SIZE}" ]]; then
-        NNODES=${SCHEDULER_WORLD_SIZE}
-        if [[ -n "${SCHEDULER_LOCAL_WORLD_SIZE}" ]]; then
-            if [[ ! "${SCHEDULER_WORLD_SIZE}" =~ ^[1-9][0-9]*$ ]] || [[ ! "${SCHEDULER_LOCAL_WORLD_SIZE}" =~ ^[1-9][0-9]*$ ]]; then
-                echo "WORLD_SIZE and LOCAL_WORLD_SIZE must be positive integers." >&2
-                exit 1
-            fi
-            if ((SCHEDULER_LOCAL_WORLD_SIZE != NPROC_PER_NODE)); then
-                echo "LOCAL_WORLD_SIZE=${SCHEDULER_LOCAL_WORLD_SIZE} does not match the ${NPROC_PER_NODE} GPUs visible to PyTorch." >&2
-                exit 1
-            fi
-            if ((SCHEDULER_WORLD_SIZE % SCHEDULER_LOCAL_WORLD_SIZE != 0)); then
-                echo "WORLD_SIZE=${SCHEDULER_WORLD_SIZE} must be divisible by LOCAL_WORLD_SIZE=${SCHEDULER_LOCAL_WORLD_SIZE}." >&2
-                exit 1
-            fi
-            NNODES=$((SCHEDULER_WORLD_SIZE / SCHEDULER_LOCAL_WORLD_SIZE))
-            WORLD_SIZE_IS_GPU_PROCESSES=true
-        fi
-    else
-        NNODES=1
-    fi
-fi
-if [[ ! "${NNODES}" =~ ^[1-9][0-9]*$ ]]; then
-    echo "NNODES must be a positive integer; got ${NNODES}." >&2
-    exit 1
-fi
-if [[ -z "${NODE_RANK}" && -n "${SCHEDULER_RANK}" ]]; then
-    NODE_RANK=${SCHEDULER_RANK}
-    if [[ "${WORLD_SIZE_IS_GPU_PROCESSES}" == "true" ]]; then
-        if [[ ! "${SCHEDULER_RANK}" =~ ^(0|[1-9][0-9]*)$ ]]; then
-            echo "RANK must be a canonical non-negative integer; got ${SCHEDULER_RANK}." >&2
-            exit 1
-        fi
-        NODE_RANK=$((SCHEDULER_RANK / SCHEDULER_LOCAL_WORLD_SIZE))
-    fi
-fi
-if [[ -z "${NODE_RANK}" ]]; then
-    if ((NNODES == 1)); then
-        NODE_RANK=0
-    else
-        echo "NODE_RANK (or SENSECORE_PYTORCH_NODE_RANK/RANK) is required." >&2
-        exit 1
-    fi
-fi
 
 for topology_var in NODE_RANK NPROC_PER_NODE MASTER_PORT; do
     topology_value=${!topology_var}
@@ -135,18 +95,18 @@ if ((NNODES > 1)) && [[ "${MASTER_ADDR}" == "localhost" || "${MASTER_ADDR}" == "
 fi
 
 MAX_LENGTH=${MAX_LENGTH:-131072}
+MAX_LENGTH=${MAX_LENGTH:-65536}
 CONTEXT_PARALLEL_SIZE=${CONTEXT_PARALLEL_SIZE:-${CP:-1}}
-TENSOR_PARALLEL_SIZE=${TENSOR_PARALLEL_SIZE:-${TP:-4}}
 if [[ ! "${CONTEXT_PARALLEL_SIZE}" =~ ^[1-9][0-9]*$ ]]; then
     echo "CONTEXT_PARALLEL_SIZE must be a positive integer; got ${CONTEXT_PARALLEL_SIZE}." >&2
     exit 1
 fi
-TARGET_MODEL_PATH=${TARGET_MODEL_PATH:-/mnt/afs_agents/hongjiawei/share_models/Qwen/Qwen3.8-27B}
+TARGET_MODEL_PATH=${TARGET_MODEL_PATH:-/mnt/afs_rl/hongjiawei1/code/ms-swift-hjw/outputs/sensenova-flash-lite-v42-20260830/v1-20260903-021230/checkpoint-1600}
 SOURCE_JSONL_PATH=${SOURCE_JSONL_PATH:-${BASE_DIR}/train_dataset/sensenova-flash-lite-v42-text-all.jsonl}
-TARGET_CACHE_PATH=${TARGET_CACHE_PATH:-${BASE_DIR}/output/dspark_qwen3_8_27b_target_cache_v42_text_128k/cp${CONTEXT_PARALLEL_SIZE}_maxlen${MAX_LENGTH}}
-DEFAULT_OUTPUT_ROOT=${BASE_DIR}/output/dspark_qwen3_8_27b_v42_text_128k_multinode_32p
+TARGET_CACHE_PATH=${TARGET_CACHE_PATH:-${BASE_DIR}/output/sensenova-flash-lite-v42-dspark-32p/cp${CONTEXT_PARALLEL_SIZE}_maxlen${MAX_LENGTH}}
+DEFAULT_OUTPUT_ROOT=${BASE_DIR}/output/sensenova-flash-lite-v42-dspark-32p
 if ((CONTEXT_PARALLEL_SIZE > 1)); then
-    DEFAULT_OUTPUT_ROOT=${BASE_DIR}/output/dspark_qwen3_8_27b_v42_text_128k_cp${CONTEXT_PARALLEL_SIZE}_maxlen${MAX_LENGTH}_32p
+    DEFAULT_OUTPUT_ROOT=${BASE_DIR}/output/sensenova-flash-lite-v42-dspark-32p_cp${CONTEXT_PARALLEL_SIZE}_maxlen${MAX_LENGTH}_32p
 fi
 OUTPUT_ROOT=${OUTPUT_ROOT:-${DEFAULT_OUTPUT_ROOT}}
 CHECKPOINT_DIR=${CHECKPOINT_DIR:-${OUTPUT_ROOT}/checkpoints}
@@ -159,40 +119,34 @@ GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-512}
 NUM_TRAIN_EPOCHS=${NUM_TRAIN_EPOCHS:-10}
 MAX_TRAIN_STEPS=${MAX_TRAIN_STEPS:-}
 ONLINE_TARGET=${ONLINE_TARGET:-true}
-DATA_BATCH_SIZE=${DATA_BATCH_SIZE:-400}
+DATA_BATCH_SIZE=${DATA_BATCH_SIZE:-800}
 DATA_BATCH_CACHE_DIR=${DATA_BATCH_CACHE_DIR:-${OUTPUT_ROOT}/target_data_batch_cache}
 JSONL_INDEX_CACHE_DIR=${JSONL_INDEX_CACHE_DIR:-${OUTPUT_ROOT}/jsonl_index_cache}
 # The online target path runs with LOCAL_BATCH_SIZE=1. Some very long source
 # records are truncated before the assistant span, producing zero loss tokens.
 # Keep those as zero-weight batches instead of letting the collator return None.
-MIN_LOSS_TOKENS=${MIN_LOSS_TOKENS:-0}
+MIN_LOSS_TOKENS=${MIN_LOSS_TOKENS:-14}
 WANDB_ENABLE=${WANDB_ENABLE:-true}
-WANDB_PROJECT=${WANDB_PROJECT:-DeepSeek-V4-Flash-0731}
+WANDB_PROJECT=${WANDB_PROJECT:-sensenova-flash-lite-v42-dspark-32p}
 WANDB_NAME=${WANDB_NAME:-$(basename "${OUTPUT_ROOT}")}
 WANDB_GROUP=${WANDB_GROUP:-qwen3_8_27b_v42_128k_32p}
 WANDB_DIR=${WANDB_DIR:-${OUTPUT_ROOT}/wandb}
 WANDB_JOB_TYPE=${WANDB_JOB_TYPE:-train}
 WANDB_RESUME=${WANDB_RESUME:-allow}
+
 if ((NPROC_PER_NODE % CONTEXT_PARALLEL_SIZE != 0)); then
     echo "Visible GPUs per node ${NPROC_PER_NODE} must be divisible by CONTEXT_PARALLEL_SIZE=${CONTEXT_PARALLEL_SIZE}." >&2
-BOUNDED_OFFLINE=${BOUNDED_OFFLINE:-true}
-DATA_PARTITIONS=${DATA_PARTITIONS:-512}
-JSONL_INDEX_CACHE_DIR=${JSONL_INDEX_CACHE_DIR:-${OUTPUT_ROOT}/jsonl_index_cache}
-if ((NPROC_PER_NODE % (CONTEXT_PARALLEL_SIZE * TENSOR_PARALLEL_SIZE) != 0)); then
-    echo "Visible GPUs per node ${NPROC_PER_NODE} must be divisible by CONTEXT_PARALLEL_SIZE * TENSOR_PARALLEL_SIZE=$((CONTEXT_PARALLEL_SIZE * TENSOR_PARALLEL_SIZE))." >&2
-
     exit 1
 fi
 if ((512 % CONTEXT_PARALLEL_SIZE != 0)); then
     echo "Qwen3.8 DSpark model.num_anchors=512 must be divisible by CONTEXT_PARALLEL_SIZE=${CONTEXT_PARALLEL_SIZE}." >&2
     exit 1
 fi
-FSDP_SIZE=${FSDP_SIZE:-$((NPROC_PER_NODE / (CONTEXT_PARALLEL_SIZE * TENSOR_PARALLEL_SIZE)))}
-TARGET_CACHE_FSDP_SIZE=${TARGET_CACHE_FSDP_SIZE:-$((NPROC_PER_NODE / CONTEXT_PARALLEL_SIZE))}
+FSDP_SIZE=${FSDP_SIZE:-$((NPROC_PER_NODE / CONTEXT_PARALLEL_SIZE))}
 LOGGING_STEPS=${LOGGING_STEPS:-10}
-SAVE_STEPS=${SAVE_STEPS:-3000}
+SAVE_STEPS=${SAVE_STEPS:-100}
 SAVE_CHECKPOINTS=${SAVE_CHECKPOINTS:-true}
-DEFAULT_TORCH_COMPILE=false
+DEFAULT_TORCH_COMPILE=true
 DEFAULT_TARGET_CACHE_FSDP=false
 if ((CONTEXT_PARALLEL_SIZE > 1)); then
     DEFAULT_TORCH_COMPILE=false
@@ -206,7 +160,7 @@ PREPARE_NUM_WORKERS=${PREPARE_NUM_WORKERS:-1}
 DRY_RUN=${DRY_RUN:-false}
 PRODUCTION_RUN=${PRODUCTION_RUN:-true}
 
-for integer_var in MAX_LENGTH CONTEXT_PARALLEL_SIZE TENSOR_PARALLEL_SIZE LOCAL_BATCH_SIZE GLOBAL_BATCH_SIZE NUM_TRAIN_EPOCHS FSDP_SIZE TARGET_CACHE_FSDP_SIZE LOGGING_STEPS SAVE_STEPS PREPARE_NUM_WORKERS DATA_PARTITIONS; do
+for integer_var in MAX_LENGTH CONTEXT_PARALLEL_SIZE LOCAL_BATCH_SIZE GLOBAL_BATCH_SIZE NUM_TRAIN_EPOCHS FSDP_SIZE LOGGING_STEPS SAVE_STEPS PREPARE_NUM_WORKERS DATA_BATCH_SIZE; do
     integer_value=${!integer_var}
     if [[ ! "${integer_value}" =~ ^[1-9][0-9]*$ ]]; then
         echo "${integer_var} must be a positive integer; got ${integer_value}." >&2
@@ -221,7 +175,7 @@ if [[ -n "${MAX_TRAIN_STEPS}" ]] && [[ ! "${MAX_TRAIN_STEPS}" =~ ^[1-9][0-9]*$ ]
     echo "MAX_TRAIN_STEPS must be empty or a positive integer; got ${MAX_TRAIN_STEPS}." >&2
     exit 1
 fi
-for boolean_var in BOUNDED_OFFLINE SAVE_CHECKPOINTS TORCH_COMPILE TORCHRUN_PER_RANK_LOGS AUTO_PREPARE_CACHE TARGET_CACHE_FSDP DRY_RUN PRODUCTION_RUN; do
+for boolean_var in ONLINE_TARGET SAVE_CHECKPOINTS TORCH_COMPILE TORCHRUN_PER_RANK_LOGS AUTO_PREPARE_CACHE TARGET_CACHE_FSDP DRY_RUN PRODUCTION_RUN; do
     boolean_value=${!boolean_var}
     if [[ "${boolean_value}" != "true" && "${boolean_value}" != "false" ]]; then
         echo "${boolean_var} must be true or false; got ${boolean_value}." >&2
@@ -241,10 +195,14 @@ if ((CONTEXT_PARALLEL_SIZE > 1)); then
         echo "CONTEXT_PARALLEL_SIZE > 1 requires TORCH_COMPILE=false." >&2
         exit 1
     fi
-    if [[ "${BOUNDED_OFFLINE}" == "false" && "${TARGET_CACHE_FSDP}" != "true" ]]; then
-        echo "Full-cache CONTEXT_PARALLEL_SIZE > 1 requires TARGET_CACHE_FSDP=true." >&2
+    if [[ "${ONLINE_TARGET}" == "false" && "${TARGET_CACHE_FSDP}" != "true" ]]; then
+        echo "Offline CONTEXT_PARALLEL_SIZE > 1 requires TARGET_CACHE_FSDP=true." >&2
         exit 1
     fi
+fi
+if [[ "${ONLINE_TARGET}" == "true" ]] && ((LOCAL_BATCH_SIZE != 1)); then
+    echo "ONLINE_TARGET=true requires LOCAL_BATCH_SIZE=1." >&2
+    exit 1
 fi
 if [[ "${PRODUCTION_RUN}" == "true" ]]; then
     if [[ "${DRY_RUN}" != "false" ]]; then
@@ -262,18 +220,13 @@ if [[ "${PRODUCTION_RUN}" == "true" ]]; then
 fi
 
 TRAIN_WORLD_SIZE=$((NNODES * NPROC_PER_NODE))
-MODEL_PARALLEL_SIZE=$((FSDP_SIZE * CONTEXT_PARALLEL_SIZE * TENSOR_PARALLEL_SIZE))
+MODEL_PARALLEL_SIZE=$((FSDP_SIZE * CONTEXT_PARALLEL_SIZE))
 if ((TRAIN_WORLD_SIZE % MODEL_PARALLEL_SIZE != 0)); then
-    echo "World size ${TRAIN_WORLD_SIZE} must be divisible by FSDP_SIZE * CONTEXT_PARALLEL_SIZE * TENSOR_PARALLEL_SIZE=${MODEL_PARALLEL_SIZE}." >&2
-    exit 1
-fi
-CACHE_MODEL_PARALLEL_SIZE=$((TARGET_CACHE_FSDP_SIZE * CONTEXT_PARALLEL_SIZE))
-if ((TRAIN_WORLD_SIZE % CACHE_MODEL_PARALLEL_SIZE != 0)); then
-    echo "World size ${TRAIN_WORLD_SIZE} must be divisible by TARGET_CACHE_FSDP_SIZE * CONTEXT_PARALLEL_SIZE=${CACHE_MODEL_PARALLEL_SIZE}." >&2
+    echo "World size ${TRAIN_WORLD_SIZE} must be divisible by FSDP_SIZE * CONTEXT_PARALLEL_SIZE=${MODEL_PARALLEL_SIZE}." >&2
     exit 1
 fi
 DP_REPLICATE=$((TRAIN_WORLD_SIZE / MODEL_PARALLEL_SIZE))
-DATA_PARALLEL_SIZE=$((TRAIN_WORLD_SIZE / (CONTEXT_PARALLEL_SIZE * TENSOR_PARALLEL_SIZE)))
+DATA_PARALLEL_SIZE=$((TRAIN_WORLD_SIZE / CONTEXT_PARALLEL_SIZE))
 EFFECTIVE_FSDP_SHARD_SIZE=$((FSDP_SIZE * CONTEXT_PARALLEL_SIZE))
 MICRO_GLOBAL_BATCH_SIZE=$((DATA_PARALLEL_SIZE * LOCAL_BATCH_SIZE))
 if ((GLOBAL_BATCH_SIZE % MICRO_GLOBAL_BATCH_SIZE != 0)); then
@@ -281,16 +234,6 @@ if ((GLOBAL_BATCH_SIZE % MICRO_GLOBAL_BATCH_SIZE != 0)); then
     exit 1
 fi
 GRADIENT_ACCUMULATION_STEPS=$((GLOBAL_BATCH_SIZE / MICRO_GLOBAL_BATCH_SIZE))
-
-if [[ -z "${DATA_BATCH_CACHE_DIR:-}" ]]; then
-    DATA_BATCH_CACHE_TIMESTAMP=${DATA_BATCH_CACHE_TIMESTAMP:-$(date '+%Y%m%d_%H%M%S')}
-    if [[ ! "${DATA_BATCH_CACHE_TIMESTAMP}" =~ ^[0-9]{8}_[0-9]{6}$ ]]; then
-        echo "DATA_BATCH_CACHE_TIMESTAMP must use YYYYMMDD_HHMMSS; got ${DATA_BATCH_CACHE_TIMESTAMP}." >&2
-        exit 1
-    fi
-    TARGET_MODEL_NAME=$(basename "${TARGET_MODEL_PATH%/}")
-    DATA_BATCH_CACHE_DIR=${OUTPUT_ROOT}/${TARGET_MODEL_NAME}_dp${DP_REPLICATE}_fsdp${FSDP_SIZE}_cp${CONTEXT_PARALLEL_SIZE}_tp${TENSOR_PARALLEL_SIZE}_${DATA_BATCH_CACHE_TIMESTAMP}
-fi
 
 if [[ ! -d "${TARGET_MODEL_PATH}" ]]; then
     echo "TARGET_MODEL_PATH does not exist: ${TARGET_MODEL_PATH}" >&2
@@ -338,7 +281,7 @@ PREPARE_CACHE_COMMAND=(
     --local-batch-size 1
     --num-workers "${PREPARE_NUM_WORKERS}"
     "${PREPARE_FSDP_ARGS[@]}"
-    --fsdp-size "${TARGET_CACHE_FSDP_SIZE}"
+    --fsdp-size "${FSDP_SIZE}"
     --context-parallel-size "${CONTEXT_PARALLEL_SIZE}"
     --target-micro-chunk-size 0
     --target-cache-cpu-offload false
@@ -355,7 +298,7 @@ PREPARE_CACHE_ENV=(
     "MASTER_PORT=${MASTER_PORT}"
 )
 
-if [[ "${BOUNDED_OFFLINE}" == "false" ]]; then
+if [[ "${ONLINE_TARGET}" == "false" ]]; then
     if [[ ! -f "${TARGET_CACHE_PATH}/manifest.json" ]]; then
         if [[ -d "${TARGET_CACHE_PATH}" ]] && [[ -n "$(find "${TARGET_CACHE_PATH}" -mindepth 1 -print -quit)" ]]; then
             echo "TARGET_CACHE_PATH contains an incomplete cache without manifest.json: ${TARGET_CACHE_PATH}" >&2
@@ -369,7 +312,7 @@ if [[ "${BOUNDED_OFFLINE}" == "false" ]]; then
         echo "Qwen3.8 DSpark target cache is missing; preparing it before training."
         echo "  Cache storage scales with the number of valid tokens; verify shared-disk capacity before a full run."
         echo "  cache output=${TARGET_CACHE_PATH}"
-        echo "  target-cache FSDP=${TARGET_CACHE_FSDP}, FSDP_SIZE=${TARGET_CACHE_FSDP_SIZE}, CP=${CONTEXT_PARALLEL_SIZE}"
+        echo "  target-cache FSDP=${TARGET_CACHE_FSDP}, FSDP_SIZE=${FSDP_SIZE}, CP=${CONTEXT_PARALLEL_SIZE}"
         if [[ "${DRY_RUN}" == "true" ]]; then
             printf '  prepare command:'
             printf ' %q' "${PREPARE_CACHE_ENV[@]}" "${PREPARE_CACHE_COMMAND[@]}"
@@ -386,7 +329,7 @@ if [[ "${BOUNDED_OFFLINE}" == "false" ]]; then
         echo "Using completed Qwen3.8 DSpark target cache: ${TARGET_CACHE_PATH}"
     fi
 else
-    echo "Using bounded offline Qwen3.8 target partitions; no full cache is required."
+    echo "Using online Qwen3.8 target-first training; no complete offline cache is required."
 fi
 
 TRAIN_SCHEDULE_ARGS=(
@@ -398,29 +341,19 @@ if [[ -n "${MAX_TRAIN_STEPS}" ]]; then
 fi
 
 TARGET_DATA_ARGS=(
-    --opts "data.online_target=false"
-    --opts "data.offline_target_data_batches=true"
+    --opts "data.online_target=true"
     --opts "data.train_data_path=${SOURCE_JSONL_PATH}"
     --opts "data.jsonl_index_cache_dir=${JSONL_INDEX_CACHE_DIR}"
     --opts "data.data_batch_cache_dir=${DATA_BATCH_CACHE_DIR}"
     --opts "data.target_cache_path=null"
-    --opts "train.data_partitions=${DATA_PARTITIONS}"
-    --opts "train.offline_target_parallel.dp_replicate=${DP_REPLICATE}"
-    --opts "train.offline_target_parallel.dp_shard=${FSDP_SIZE}"
-    --opts "train.offline_target_parallel.cp=${CONTEXT_PARALLEL_SIZE}"
-    --opts "train.offline_target_parallel.tp=${TENSOR_PARALLEL_SIZE}"
-    --opts "train.offline_target_parallel.ep=1"
-    --opts "train.offline_target_parallel.expert_tp=1"
-    --opts "train.offline_target_parallel.use_fsdp=true"
-    --opts "train.offline_target_parallel.context_parallel_backend=model_native"
+    --opts "train.data_batch_size=${DATA_BATCH_SIZE}"
 )
-if [[ "${BOUNDED_OFFLINE}" == "false" ]]; then
+if [[ "${ONLINE_TARGET}" == "false" ]]; then
     TARGET_DATA_ARGS=(
         --opts "data.online_target=false"
-        --opts "data.offline_target_data_batches=false"
         --opts "data.source_jsonl_path=${SOURCE_JSONL_PATH}"
         --opts "data.target_cache_path=${TARGET_CACHE_PATH}"
-        --opts "train.data_partitions=null"
+        --opts "train.data_batch_size=null"
     )
 fi
 
@@ -429,7 +362,7 @@ echo "  start=${START_TIME}, host=$(hostname), pid=$$"
 echo "  node=${NODE_RANK}/${NNODES}, rendezvous=${MASTER_ADDR}:${MASTER_PORT}"
 echo "  visible GPUs per node=${NPROC_PER_NODE}, CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<unset>}"
 echo "  homogeneous-node requirement=every node must detect ${NPROC_PER_NODE} visible GPUs"
-echo "  topology=DP_REPLICATE=${DP_REPLICATE}, DP_SHARD=${FSDP_SIZE}, CP=${CONTEXT_PARALLEL_SIZE}, TP=${TENSOR_PARALLEL_SIZE}, effective FSDP shard=${EFFECTIVE_FSDP_SHARD_SIZE}"
+echo "  topology=DP_REPLICATE=${DP_REPLICATE}, DP_SHARD=${FSDP_SIZE}, CP=${CONTEXT_PARALLEL_SIZE}, effective FSDP shard=${EFFECTIVE_FSDP_SHARD_SIZE}, TP=1"
 echo "  data parallel size=${DATA_PARALLEL_SIZE}"
 echo "  local batch=${LOCAL_BATCH_SIZE}, global batch=${GLOBAL_BATCH_SIZE}, gradient accumulation=${GRADIENT_ACCUMULATION_STEPS}"
 if [[ -n "${MAX_TRAIN_STEPS}" ]]; then
@@ -438,13 +371,12 @@ else
     echo "  schedule=dataset-derived, epochs=${NUM_TRAIN_EPOCHS}"
 fi
 echo "  target model=${TARGET_MODEL_PATH}"
-if [[ "${BOUNDED_OFFLINE}" == "true" ]]; then
-    echo "  target supervision=bounded offline, data partitions per epoch=${DATA_PARTITIONS}"
+if [[ "${ONLINE_TARGET}" == "true" ]]; then
+    echo "  target supervision=online, data batch partitions=${DATA_BATCH_SIZE}"
     echo "  transient target cache=${DATA_BATCH_CACHE_DIR}"
     echo "  JSONL index cache=${JSONL_INDEX_CACHE_DIR}"
-    echo "  target FSDP shard includes draft TP ranks=${TENSOR_PARALLEL_SIZE}"
 else
-    echo "  target supervision=full offline cache, target cache=${TARGET_CACHE_PATH}"
+    echo "  target supervision=offline cache, target cache=${TARGET_CACHE_PATH}"
 fi
 echo "  source JSONL=${SOURCE_JSONL_PATH:-<not supplied>}"
 echo "  min loss tokens=${MIN_LOSS_TOKENS}"
@@ -506,11 +438,8 @@ set -x
     --opts "train.lr=${LEARNING_RATE}" \
     --opts "train.local_batch_size=${LOCAL_BATCH_SIZE}" \
     --opts "train.global_batch_size=${GLOBAL_BATCH_SIZE}" \
-    --opts "train.parallel.dp_replicate=${DP_REPLICATE}" \
-    --opts "train.parallel.dp_shard=${FSDP_SIZE}" \
-    --opts "train.parallel.cp=${CONTEXT_PARALLEL_SIZE}" \
-    --opts "train.parallel.tp=${TENSOR_PARALLEL_SIZE}" \
-    --opts "train.parallel.use_compile=${TORCH_COMPILE}" \
+    --opts "train.fsdp_size=${FSDP_SIZE}" \
+    --opts "train.context_parallel_size=${CONTEXT_PARALLEL_SIZE}" \
     --opts "train.torch_compile=${TORCH_COMPILE}" \
     "${TRAIN_SCHEDULE_ARGS[@]}" \
     --opts "logging.logging_steps=${LOGGING_STEPS}" \

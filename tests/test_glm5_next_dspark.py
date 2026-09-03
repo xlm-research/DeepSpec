@@ -1,10 +1,13 @@
 import copy
+import os
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 import torch
-from transformers import AutoConfig, AutoTokenizer
+from transformers import AutoConfig, AutoModel, AutoTokenizer
 
+from deepspec.modeling.glm5_next_parallel import parallelize_glm5_next_model
 from deepspec.modeling.dspark.glm5_next import (
     Glm5NextDSparkModel,
     build_draft_config,
@@ -13,6 +16,10 @@ from deepspec.modeling.target import Glm5NextOnlineTarget
 from deepspec.trainer import Glm5NextDSparkTrainer
 from deepspec.utils import load_config
 from deepspec.data.parser import preprocess_record
+from scripts.data.prepare_deepseek_v4_target_cache import (
+    _resolve_target_runtime,
+    _retained_target_has_routed_experts,
+)
 
 
 TARGET = "/mnt/afs-agentpro/share/models/zai-org/GLM-5.3-Flash"
@@ -58,7 +65,98 @@ class Glm5NextDSparkTest(unittest.TestCase):
         self.assertEqual(config.model.target_model_name_or_path, TARGET)
         self.assertEqual(config.train.parallel.ep, 8)
         self.assertEqual(config.train.target_parallel.ep, 1)
+        self.assertEqual(config.train.offline_target_parallel.dp_shard, 2)
+        self.assertEqual(config.train.offline_target_parallel.tp, 4)
+        self.assertEqual(config.train.offline_target_parallel.ep, 1)
+        self.assertEqual(config.train.data_batch_size, 256)
+        self.assertIsNone(config.train.max_train_steps)
+        self.assertFalse(config.data.online_target)
+        self.assertTrue(config.data.offline_target_data_batches)
+        self.assertTrue(config.data.train_data_path)
+        self.assertTrue(config.data.source_jsonl_path)
+        self.assertTrue(config.data.store_target_last_hidden_states)
+        self.assertIsNone(config.data.target_cache_path)
         self.assertEqual(config.data.chat_template, "glm5_next")
+
+    def test_config_derives_multi_node_topologies_from_torchrun(self):
+        cases = (
+            # Node-local target TP4/FSDP2 groups on two 8-GPU nodes.
+            (16, 8, (2, 8, 8), (2, 2)),
+            # Six GPUs per node cannot contain whole TP4 groups. Fall back to
+            # one global target mesh without restricting the node shape.
+            (12, 6, (2, 6, 6), (1, 3)),
+        )
+        for world_size, local_size, draft, target in cases:
+            with self.subTest(world_size=world_size, local_size=local_size):
+                with patch.dict(
+                    os.environ,
+                    {
+                        "WORLD_SIZE": str(world_size),
+                        "LOCAL_WORLD_SIZE": str(local_size),
+                    },
+                ):
+                    config = load_config(
+                        "config/dspark/dspark_glm5_3_flash.py"
+                    )
+                self.assertEqual(config.train.global_batch_size, world_size)
+                self.assertEqual(
+                    (
+                        config.train.parallel.dp_replicate,
+                        config.train.parallel.dp_shard,
+                        config.train.parallel.ep,
+                    ),
+                    draft,
+                )
+                self.assertEqual(
+                    (
+                        config.train.offline_target_parallel.dp_replicate,
+                        config.train.offline_target_parallel.dp_shard,
+                    ),
+                    target,
+                )
+                self.assertEqual(config.train.offline_target_parallel.tp, 4)
+
+    def test_offline_target_runner_selects_glm_wrapper(self):
+        target_name, target_cls = _resolve_target_runtime(
+            SimpleNamespace(model_type="glm5_next")
+        )
+        self.assertEqual(target_name, "GLM-5.3")
+        self.assertIs(target_cls, Glm5NextOnlineTarget)
+
+    def test_target_ep_matches_retained_glm_layers(self):
+        target_config = AutoConfig.from_pretrained(TARGET)
+        self.assertFalse(
+            _retained_target_has_routed_experts(target_config, [0, 1, 2])
+        )
+        self.assertTrue(
+            _retained_target_has_routed_experts(target_config, [0, 1, 2, 3])
+        )
+
+    def test_target_linear_attention_and_dense_mlp_support_tp4(self):
+        config = tiny_target_config()
+        config.vision_config.depth = 0
+        text = config.text_config
+        text.linear_num_heads = 4
+        text.linear_head_dim = 16
+        with torch.device("meta"):
+            target = AutoModel.from_config(config).language_model
+        topology = SimpleNamespace(
+            tensor_parallel_size=4,
+            tensor_parallel_rank=1,
+            tensor_parallel_group=None,
+        )
+
+        parallelize_glm5_next_model(target, topology=topology, draft=False)
+
+        attention = target.layers[0].self_attn
+        self.assertEqual(tuple(attention.q_proj.weight.shape), (16, 64))
+        self.assertEqual(tuple(attention.conv1d.weight.shape), (48, 1, 4))
+        self.assertEqual(tuple(attention.forget_gate.A_log.shape), (1,))
+        self.assertEqual(tuple(attention.o_proj.weight.shape), (64, 16))
+        mlp = target.layers[0].mlp
+        self.assertEqual(tuple(mlp.gate_proj.weight.shape), (32, 64))
+        self.assertEqual(tuple(mlp.down_proj.weight.shape), (64, 32))
+        self.assertEqual(tuple(target.embed_tokens.weight.shape), (32, 64))
 
     def test_draft_forward_and_backward(self):
         config = build_draft_config(tiny_target_config(), model_args())
@@ -120,7 +218,6 @@ class Glm5NextDSparkTest(unittest.TestCase):
         )
         for field, message in (
             ("expert_parallel_size", "target_parallel.ep=1"),
-            ("tensor_parallel_size", "parallel.tp=1"),
             ("context_parallel_size", "parallel.cp=1"),
         ):
             values = dict(base)

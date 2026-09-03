@@ -1,9 +1,10 @@
-"""Online frozen-target execution for DSpark training.
+"""Frozen-target execution for bounded DSpark feature batches.
 
 The target and draft models share one CP/EP/TP/FSDP topology.  Every raw
 training micro-batch is evaluated exactly once by the frozen target. The
 resulting local CP hidden-state shard can be consumed immediately or staged by
-the trainer's target-first data-batch cache. Nothing is gathered to a leader.
+the trainer's transient target-cache partition. Nothing is gathered to a
+leader.
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ from transformers.distributed.configuration_utils import DistributedConfig
 from deepspec.modeling.deepseek_v4_parallel import (
     parallelize_deepseek_v4_model,
 )
+from deepspec.modeling.glm5_next_parallel import parallelize_glm5_next_model
 from deepspec.modeling.pure_ep import (
     get_pure_expert_modules,
     materialize_modules_locally,
@@ -266,7 +268,11 @@ def _materialize_meta_module(module: nn.Module, *, device) -> None:
 
 
 def _wrap_target_model_with_fsdp(
-    *, target_model, device, topology
+    *,
+    target_model,
+    device,
+    topology,
+    shard_tensor_parallel_dimension: bool = False,
 ):
     """FSDP2-shard dense target state while keeping routed experts pure-EP."""
 
@@ -291,11 +297,25 @@ def _wrap_target_model_with_fsdp(
         reduce_dtype=torch.float32,
         output_dtype=torch.bfloat16,
     )
-    mesh = (
-        topology.dense_mesh["dp_shard_cp"]
-        if topology.config.dp_replicate == 1
-        else topology.fsdp_mesh
-    )
+    if shard_tensor_parallel_dimension:
+        # Qwen's frozen target does not apply tensor parallelism. Reuse the
+        # draft TP ranks as additional target FSDP shards so the target output
+        # remains replicated across the TP ranks that consume it later.
+        target_shard_name = "target_dp_shard_cp_tp"
+        topology.dense_mesh[("dp_shard", "cp", "tp")]._flatten(
+            target_shard_name
+        )
+        mesh = (
+            topology.dense_mesh[target_shard_name]
+            if topology.config.dp_replicate == 1
+            else topology.dense_mesh[("dp_replicate", target_shard_name)]
+        )
+    else:
+        mesh = (
+            topology.dense_mesh["dp_shard_cp"]
+            if topology.config.dp_replicate == 1
+            else topology.fsdp_mesh
+        )
     for layer_idx, decoder_layer in enumerate(decoder_layers):
         fully_shard(
             decoder_layer,
@@ -523,11 +543,6 @@ class Glm5NextOnlineTarget(DeepseekV4OnlineTarget):
                 "GLM-5.3 online target expert parallelism is not implemented; "
                 "set train.target_parallel.ep=1."
             )
-        if topology.tensor_parallel_size != 1:
-            raise NotImplementedError(
-                "GLM-5.3 online target tensor parallelism is not implemented; "
-                "set train.parallel.tp=1."
-            )
         if topology.context_parallel_size != 1:
             raise NotImplementedError(
                 "GLM-5.3 hybrid-attention target context parallelism is not "
@@ -571,6 +586,12 @@ class Glm5NextOnlineTarget(DeepseekV4OnlineTarget):
             topology=topology,
         ).eval()
         model.requires_grad_(False)
+        if topology.tensor_parallel_size > 1:
+            parallelize_glm5_next_model(
+                _get_target_backbone(model),
+                topology=topology,
+                draft=False,
+            )
         self.model = _wrap_target_model_with_fsdp(
             target_model=model,
             device=device,
@@ -580,6 +601,10 @@ class Glm5NextOnlineTarget(DeepseekV4OnlineTarget):
 
 class Qwen3_8OnlineTarget(DeepseekV4OnlineTarget):
     """Frozen, truncated Qwen3.8 teacher for text-only online DSpark training."""
+
+    # Target features are identical across the draft TP ranks because those
+    # ranks are used as target FSDP shards rather than target tensor parallel.
+    cache_replicated_across_tp = True
 
     def __init__(
         self,
@@ -595,12 +620,6 @@ class Qwen3_8OnlineTarget(DeepseekV4OnlineTarget):
                 "Qwen3.8 online target expert parallelism is not implemented; "
                 "set target EP to 1."
             )
-        if topology.tensor_parallel_size != 1:
-            raise NotImplementedError(
-                "Qwen3.8 online target tensor parallelism is not implemented; "
-                "set target TP to 1."
-            )
-
         self.model_name_or_path = str(model_name_or_path)
         self.target_layer_ids = [int(layer_id) for layer_id in target_layer_ids]
         self.topology = topology
@@ -646,6 +665,7 @@ class Qwen3_8OnlineTarget(DeepseekV4OnlineTarget):
             target_model=model,
             device=device,
             topology=topology,
+            shard_tensor_parallel_dimension=True,
         ).eval()
 
     def forward_training_batch(self, batch) -> dict[str, torch.Tensor]:

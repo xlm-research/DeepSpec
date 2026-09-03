@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Precompute rank-sharded DeepSeek-V4 target features for training."""
+"""Precompute rank-sharded large-model target features for training."""
 
 # ruff: noqa: E402
 
@@ -39,7 +39,8 @@ from deepspec.data.target_cache_dataset import (
     write_target_cache_manifest,
 )
 from deepspec.distributed import ParallelConfig, ParallelContext
-from deepspec.modeling.target import DeepseekV4OnlineTarget
+from deepspec.modeling.target import DeepseekV4OnlineTarget, Glm5NextOnlineTarget
+from deepspec.modeling.target_adapter import get_target_hidden_size
 from deepspec.utils import (
     CustomJSONEncoder,
     get_git_sha,
@@ -62,7 +63,7 @@ torch.set_float32_matmul_precision("high")
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
-            "Run the frozen DeepSeek-V4 target once per source record and "
+            "Run the frozen distributed target once per source record and "
             "persist its selected hidden states for later draft training."
         )
     )
@@ -80,6 +81,36 @@ def parse_args():
     args = parser.parse_args()
     config = parse_opts_to_config(args.opts, load_config(args.config))
     return args, config
+
+
+def _resolve_target_runtime(target_config):
+    model_type = str(target_config.model_type)
+    if model_type == "deepseek_v4":
+        return "DeepSeek-V4", DeepseekV4OnlineTarget
+    if model_type == "glm5_next":
+        return "GLM-5.3", Glm5NextOnlineTarget
+    raise NotImplementedError(
+        "Distributed offline target-cache generation supports only "
+        f"DeepSeek-V4 and GLM-5.3, got model_type={model_type!r}."
+    )
+
+
+def _retained_target_has_routed_experts(target_config, target_layer_ids) -> bool:
+    """Return whether the truncated target contains any routed-expert layer."""
+
+    decoder_layer_ids = [int(layer_id) for layer_id in target_layer_ids if layer_id >= 0]
+    if not decoder_layer_ids:
+        return False
+    retained_layers = max(decoder_layer_ids) + 1
+    text_config = getattr(target_config, "text_config", target_config)
+    mlp_layer_types = list(getattr(text_config, "mlp_layer_types", ()))
+    if mlp_layer_types:
+        routed_types = {"hash_moe", "moe", "sparse"}
+        return any(
+            str(layer_type) in routed_types
+            for layer_type in mlp_layer_types[:retained_layers]
+        )
+    return bool(getattr(text_config, "n_routed_experts", 0))
 
 
 def _target_parallel_context(*, config, parallel, world_size: int):
@@ -110,6 +141,7 @@ def _reuse_existing_cache(
     config,
     context_parallel_size: int,
     stores_target_last_hidden_states: bool,
+    target_name: str,
 ):
     manifest_path = os.path.join(output_dir, "manifest.json")
     manifest_present = [
@@ -133,7 +165,7 @@ def _reuse_existing_cache(
                 stores_target_last_hidden_states=stores_target_last_hidden_states,
             )
             assert manifest["context_layout"] == "contiguous", (
-                "DeepSeek-V4 requires contiguous CP cache shards."
+                f"{target_name} requires contiguous cache shards."
             )
             assert int(manifest.get("min_loss_tokens", -1)) == int(
                 config.data.get("min_loss_tokens", 1)
@@ -146,7 +178,7 @@ def _reuse_existing_cache(
             "Existing target cache is stale or incompatible; use a different "
             f"--output-dir or remove it explicitly: {error[0]}"
         )
-    print_on_global_main(f"Reusing offline DeepSeek-V4 target cache: {output_dir}")
+    print_on_global_main(f"Reusing offline {target_name} target cache: {output_dir}")
     return True
 
 
@@ -162,6 +194,7 @@ def _write_manifest(
     parallel,
     target_parallel,
     stores_target_last_hidden_states: bool,
+    target_context_parallel_implementation: str,
 ):
     target_config = AutoConfig.from_pretrained(
         config.model.target_model_name_or_path
@@ -170,7 +203,7 @@ def _write_manifest(
         num_samples=num_samples,
         shards=shards,
         target_layer_ids=config.model.target_layer_ids,
-        hidden_size=int(target_config.hidden_size),
+        hidden_size=get_target_hidden_size(target_config),
         extra_fields={
             "target_model_name_or_path": str(
                 config.model.target_model_name_or_path
@@ -190,10 +223,15 @@ def _write_manifest(
             "cache_context_parallel_size": int(context_parallel_size),
             "context_layout": "contiguous",
             "index_files": [str(path) for path in index_files],
-            "target_context_parallel_implementation": "deepseek_v4_ring",
+            "target_context_parallel_implementation": (
+                target_context_parallel_implementation
+            ),
             "target_fsdp_size": int(parallel.config.fsdp_shard_size),
             "target_expert_parallel_size": int(
                 target_parallel.expert_parallel_size
+            ),
+            "target_tensor_parallel_size": int(
+                target_parallel.tensor_parallel_size
             ),
             "target_micro_chunk_size": 0,
             "target_cache_cpu_offload": False,
@@ -215,26 +253,57 @@ def main(local_rank: int):
     seed_all(int(config.seed))
     device, global_rank, world_size = init_dist(local_rank)
 
-    parallel_config = ParallelConfig.from_mapping(
+    source_target_config = AutoConfig.from_pretrained(
+        config.model.target_model_name_or_path
+    )
+    target_name, target_cls = _resolve_target_runtime(source_target_config)
+
+    draft_parallel_config = ParallelConfig.from_mapping(
         config.train,
         world_size=world_size,
     )
-    if int(parallel_config.tp) != 1:
+    offline_target_mapping = config.train.get("offline_target_parallel")
+    if offline_target_mapping is None:
+        parallel = ParallelContext.build(draft_parallel_config)
+        target_parallel = _target_parallel_context(
+            config=config,
+            parallel=parallel,
+            world_size=world_size,
+        )
+    else:
+        offline_target_config = ParallelConfig.from_mapping(
+            {"parallel": dict(offline_target_mapping)},
+            world_size=world_size,
+        )
+        parallel = ParallelContext.build(offline_target_config)
+        target_parallel = parallel
+    target_has_routed_experts = _retained_target_has_routed_experts(
+        source_target_config,
+        config.model.target_layer_ids,
+    )
+    if target_parallel.expert_parallel_size > 1 and not target_has_routed_experts:
+        raise ValueError(
+            f"Offline {target_name} target retains no routed-expert layers; "
+            "set target EP=1."
+        )
+    if (
+        int(target_parallel.tensor_parallel_size) != 1
+        and str(source_target_config.model_type) != "glm5_next"
+    ):
         raise NotImplementedError(
-            "Offline DeepSeek-V4 target-cache generation currently requires TP=1."
+            f"Offline {target_name} target-cache generation currently requires TP=1."
         )
     if int(config.train.local_batch_size) != 1:
         raise ValueError(
-            "Offline DeepSeek-V4 target-cache generation requires "
+            f"Offline {target_name} target-cache generation requires "
             "train.local_batch_size=1."
         )
-    parallel = ParallelContext.build(parallel_config)
-    target_parallel = _target_parallel_context(
-        config=config,
-        parallel=parallel,
-        world_size=world_size,
-    )
     context_parallel_size = int(parallel.context_parallel_size)
+    target_context_parallel_implementation = (
+        "deepseek_v4_ring"
+        if str(source_target_config.model_type) == "deepseek_v4"
+        else "disabled"
+    )
     stores_target_last_hidden_states = bool(
         config.data.get("store_target_last_hidden_states", True)
     )
@@ -243,12 +312,14 @@ def main(local_rank: int):
         json.dumps(
             {
                 "output_dir": output_dir,
+                "target_family": target_name,
                 "source_jsonl_paths": train_data_paths,
                 "target_layer_ids": list(config.model.target_layer_ids),
                 "stores_target_last_hidden_states": (
                     stores_target_last_hidden_states
                 ),
-                "draft_parallel": parallel.config.to_dict(),
+                "target_has_routed_experts": target_has_routed_experts,
+                "draft_parallel": draft_parallel_config.to_dict(),
                 "target_parallel": target_parallel.config.to_dict(),
             },
             indent=2,
@@ -262,6 +333,7 @@ def main(local_rank: int):
         config=config,
         context_parallel_size=context_parallel_size,
         stores_target_last_hidden_states=stores_target_last_hidden_states,
+        target_name=target_name,
     ):
         dist.barrier()
         dist.destroy_process_group()
@@ -318,7 +390,7 @@ def main(local_rank: int):
         pin_memory=True,
         drop_last=False,
     )
-    target = DeepseekV4OnlineTarget(
+    target = target_cls(
         model_name_or_path=config.model.target_model_name_or_path,
         target_layer_ids=config.model.target_layer_ids,
         topology=target_parallel,
@@ -332,10 +404,13 @@ def main(local_rank: int):
     )
 
     processed = 0
+    writes_cache_shard = int(parallel.tensor_parallel_rank) == 0
     try:
         for step, batch in enumerate(dataloader):
             is_padding = step >= local_total_samples
-            should_write = batch is not None and not is_padding
+            should_write = (
+                batch is not None and not is_padding and writes_cache_shard
+            )
             if batch is None:
                 batch = _dummy_batch(
                     device=device,
@@ -427,10 +502,13 @@ def main(local_rank: int):
             parallel=parallel,
             target_parallel=target_parallel,
             stores_target_last_hidden_states=stores_target_last_hidden_states,
+            target_context_parallel_implementation=(
+                target_context_parallel_implementation
+            ),
         )
         cleanup_target_cache_tmp_dir(output_dir)
         print_on_global_main(
-            f"Prepared offline DeepSeek-V4 target cache at {output_dir}: "
+            f"Prepared offline {target_name} target cache at {output_dir}: "
             f"{num_samples}/{source_num_samples} valid samples."
         )
     dist.barrier()

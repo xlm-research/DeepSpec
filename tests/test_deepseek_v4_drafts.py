@@ -20,7 +20,10 @@ from deepspec.modeling.dspark.deepseek_v4 import (
 )
 from deepspec.trainer.base_trainer import (
     _compute_data_batch_schedule,
+    _compute_epoch_data_partition_schedule,
     _release_target_features,
+    _resolve_data_batch_partition_count,
+    _resolve_data_partition_count,
 )
 from deepspec.trainer.dflash2_trainer import DeepseekV4DFlash2Trainer
 from deepspec.trainer.dspark_trainer import DeepseekV4DSparkTrainer
@@ -59,6 +62,48 @@ def model_args(path):
 
 
 class DeepseekV4DraftModelTest(unittest.TestCase):
+    def test_data_batch_size_is_capped_by_remaining_optimizer_steps(self):
+        self.assertEqual(
+            _resolve_data_batch_partition_count(
+                "auto",
+                remaining_optimizer_steps=125,
+            ),
+            125,
+        )
+        self.assertEqual(
+            _resolve_data_batch_partition_count(
+                "AUTO",
+                remaining_optimizer_steps=7,
+            ),
+            7,
+        )
+        self.assertEqual(
+            _resolve_data_batch_partition_count(
+                3,
+                remaining_optimizer_steps=7,
+            ),
+            3,
+        )
+        self.assertEqual(
+            _resolve_data_batch_partition_count(
+                256,
+                remaining_optimizer_steps=1,
+            ),
+            1,
+        )
+        self.assertEqual(
+            _resolve_data_batch_partition_count(
+                256,
+                remaining_optimizer_steps=0,
+            ),
+            0,
+        )
+        with self.assertRaisesRegex(ValueError, "positive or 'auto'"):
+            _resolve_data_batch_partition_count(
+                0,
+                remaining_optimizer_steps=7,
+            )
+
     def test_data_batch_schedule_splits_total_samples_by_ratio(self):
         micro_batches, optimizer_steps = _compute_data_batch_schedule(
             data_batch_size=3,
@@ -88,6 +133,53 @@ class DeepseekV4DraftModelTest(unittest.TestCase):
                 data_parallel_size=1,
                 local_batch_size=1,
             )
+
+    def test_exact_data_partitions_can_split_gradient_accumulation(self):
+        self.assertEqual(
+            _resolve_data_partition_count(
+                512,
+                remaining_micro_batches=3520,
+            ),
+            512,
+        )
+        self.assertEqual(
+            _resolve_data_partition_count(
+                512,
+                remaining_micro_batches=100,
+            ),
+            100,
+        )
+        micro_batches, optimizer_steps = _compute_epoch_data_partition_schedule(
+            data_partitions=512,
+            micro_batches_per_epoch=3520,
+            start_micro_step=0,
+            total_micro_batches=35200,
+            gradient_accumulation_steps=32,
+        )
+        self.assertEqual(len(micro_batches), 5120)
+        self.assertEqual(sum(micro_batches), 35200)
+        self.assertEqual((min(micro_batches), max(micro_batches)), (6, 7))
+        self.assertTrue(
+            all(
+                sum(micro_batches[start : start + 512]) == 3520
+                for start in range(0, len(micro_batches), 512)
+            )
+        )
+        self.assertEqual(sum(optimizer_steps), 1100)
+        self.assertIn(0, optimizer_steps)
+        resumed_micro_batches, resumed_optimizer_steps = (
+            _compute_epoch_data_partition_schedule(
+                data_partitions=512,
+                micro_batches_per_epoch=3520,
+                start_micro_step=32,
+                total_micro_batches=35200 - 32,
+                gradient_accumulation_steps=32,
+            )
+        )
+        self.assertEqual(resumed_micro_batches[0], 3)
+        self.assertLessEqual(max(resumed_micro_batches), 7)
+        self.assertEqual(sum(resumed_micro_batches), 35200 - 32)
+        self.assertEqual(sum(resumed_optimizer_steps), 1099)
 
     def _exercise(self, model):
         seq = 32
@@ -308,6 +400,32 @@ class DeepseekV4DraftModelTest(unittest.TestCase):
             )
             self.assertIsNone(trainer._active_data_batch_cache)
             self.assertIsNone(trainer._data_batch_phase)
+
+    def test_target_inference_progress_synchronizes_each_optimizer_window(self):
+        trainer = object.__new__(DeepseekV4DSparkTrainer)
+        trainer.gradient_accumulation_steps = 2
+        trainer.data_batch_micro_batches = (5,)
+        trainer.device = torch.device("cpu")
+
+        with (
+            patch(
+                "deepspec.trainer.base_trainer.dist.is_initialized",
+                return_value=True,
+            ),
+            patch("deepspec.trainer.base_trainer.dist.barrier") as barrier,
+            patch("deepspec.trainer.base_trainer.print_on_global_main") as log,
+        ):
+            for processed_samples in range(1, 6):
+                trainer._synchronize_target_inference_progress(
+                    data_batch_index=1,
+                    processed_samples=processed_samples,
+                    total_samples=5,
+                )
+
+        self.assertEqual(barrier.call_count, 2)
+        self.assertEqual(log.call_count, 2)
+        self.assertIn("2/5 local samples", log.call_args_list[0].args[0])
+        self.assertIn("4/5 local samples", log.call_args_list[1].args[0])
 
     def test_isolated_draft_phase_refuses_inline_target_inference(self):
         trainer = object.__new__(DeepseekV4DSparkTrainer)
