@@ -94,18 +94,18 @@ if ((NNODES > 1)) && [[ "${MASTER_ADDR}" == "localhost" || "${MASTER_ADDR}" == "
     exit 1
 fi
 
-MAX_LENGTH=${MAX_LENGTH:-4096}
+MAX_LENGTH=${MAX_LENGTH:-131072}
 CONTEXT_PARALLEL_SIZE=${CONTEXT_PARALLEL_SIZE:-${CP:-1}}
 if [[ ! "${CONTEXT_PARALLEL_SIZE}" =~ ^[1-9][0-9]*$ ]]; then
     echo "CONTEXT_PARALLEL_SIZE must be a positive integer; got ${CONTEXT_PARALLEL_SIZE}." >&2
     exit 1
 fi
-TARGET_MODEL_PATH=${TARGET_MODEL_PATH:-/mnt/afs-agentpro/share/models/Qwen/Qwen3.8-27B}
-SOURCE_JSONL_PATH=${SOURCE_JSONL_PATH:-${BASE_DIR}/train_data/spec_o3_coldstartsft.repeat60.deepspec.jsonl}
-TARGET_CACHE_PATH=${TARGET_CACHE_PATH:-${BASE_DIR}/output/dspark_qwen3_8_27b_target_cache/cp${CONTEXT_PARALLEL_SIZE}_maxlen${MAX_LENGTH}}
-DEFAULT_OUTPUT_ROOT=${BASE_DIR}/output/dspark_qwen3_8_27b_multinode_production
+TARGET_MODEL_PATH=${TARGET_MODEL_PATH:-/mnt/afs_agents/hongjiawei/share_models/Qwen/Qwen3.8-27B}
+SOURCE_JSONL_PATH=${SOURCE_JSONL_PATH:-${BASE_DIR}/train_dataset/sensenova-flash-lite-v42-text-all.jsonl}
+TARGET_CACHE_PATH=${TARGET_CACHE_PATH:-${BASE_DIR}/output/dspark_qwen3_8_27b_target_cache_v42_text_128k/cp${CONTEXT_PARALLEL_SIZE}_maxlen${MAX_LENGTH}}
+DEFAULT_OUTPUT_ROOT=${BASE_DIR}/output/dspark_qwen3_8_27b_v42_text_128k_multinode_32p
 if ((CONTEXT_PARALLEL_SIZE > 1)); then
-    DEFAULT_OUTPUT_ROOT=${BASE_DIR}/output/dspark_qwen3_8_27b_cp${CONTEXT_PARALLEL_SIZE}_maxlen${MAX_LENGTH}
+    DEFAULT_OUTPUT_ROOT=${BASE_DIR}/output/dspark_qwen3_8_27b_v42_text_128k_cp${CONTEXT_PARALLEL_SIZE}_maxlen${MAX_LENGTH}_32p
 fi
 OUTPUT_ROOT=${OUTPUT_ROOT:-${DEFAULT_OUTPUT_ROOT}}
 CHECKPOINT_DIR=${CHECKPOINT_DIR:-${OUTPUT_ROOT}/checkpoints}
@@ -118,9 +118,20 @@ GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-512}
 NUM_TRAIN_EPOCHS=${NUM_TRAIN_EPOCHS:-10}
 MAX_TRAIN_STEPS=${MAX_TRAIN_STEPS:-}
 ONLINE_TARGET=${ONLINE_TARGET:-true}
-DATA_BATCH_SIZE=${DATA_BATCH_SIZE:-256}
+DATA_BATCH_SIZE=${DATA_BATCH_SIZE:-400}
 DATA_BATCH_CACHE_DIR=${DATA_BATCH_CACHE_DIR:-${OUTPUT_ROOT}/target_data_batch_cache}
 JSONL_INDEX_CACHE_DIR=${JSONL_INDEX_CACHE_DIR:-${OUTPUT_ROOT}/jsonl_index_cache}
+# The online target path runs with LOCAL_BATCH_SIZE=1. Some very long source
+# records are truncated before the assistant span, producing zero loss tokens.
+# Keep those as zero-weight batches instead of letting the collator return None.
+MIN_LOSS_TOKENS=${MIN_LOSS_TOKENS:-0}
+WANDB_ENABLE=${WANDB_ENABLE:-true}
+WANDB_PROJECT=${WANDB_PROJECT:-DeepSeek-V4-Flash-0731}
+WANDB_NAME=${WANDB_NAME:-$(basename "${OUTPUT_ROOT}")}
+WANDB_GROUP=${WANDB_GROUP:-qwen3_8_27b_v42_128k_32p}
+WANDB_DIR=${WANDB_DIR:-${OUTPUT_ROOT}/wandb}
+WANDB_JOB_TYPE=${WANDB_JOB_TYPE:-train}
+WANDB_RESUME=${WANDB_RESUME:-allow}
 if ((NPROC_PER_NODE % CONTEXT_PARALLEL_SIZE != 0)); then
     echo "Visible GPUs per node ${NPROC_PER_NODE} must be divisible by CONTEXT_PARALLEL_SIZE=${CONTEXT_PARALLEL_SIZE}." >&2
     exit 1
@@ -154,6 +165,10 @@ for integer_var in MAX_LENGTH CONTEXT_PARALLEL_SIZE LOCAL_BATCH_SIZE GLOBAL_BATC
         exit 1
     fi
 done
+if [[ ! "${MIN_LOSS_TOKENS}" =~ ^(0|[1-9][0-9]*)$ ]]; then
+    echo "MIN_LOSS_TOKENS must be a non-negative integer; got ${MIN_LOSS_TOKENS}." >&2
+    exit 1
+fi
 if [[ -n "${MAX_TRAIN_STEPS}" ]] && [[ ! "${MAX_TRAIN_STEPS}" =~ ^[1-9][0-9]*$ ]]; then
     echo "MAX_TRAIN_STEPS must be empty or a positive integer; got ${MAX_TRAIN_STEPS}." >&2
     exit 1
@@ -362,8 +377,10 @@ else
     echo "  target supervision=offline cache, target cache=${TARGET_CACHE_PATH}"
 fi
 echo "  source JSONL=${SOURCE_JSONL_PATH:-<not supplied>}"
+echo "  min loss tokens=${MIN_LOSS_TOKENS}"
 echo "  checkpoint dir=${CHECKPOINT_DIR}"
 echo "  tensorboard dir=${TENSORBOARD_DIR}"
+echo "  wandb=${WANDB_ENABLE}, project=${WANDB_PROJECT}, name=${WANDB_NAME}, dir=${WANDB_DIR}"
 echo "  torch.compile=${TORCH_COMPILE}, save checkpoints=${SAVE_CHECKPOINTS}"
 echo "  production safety=${PRODUCTION_RUN}, dry run=${DRY_RUN}"
 echo "  node log=${NODE_LOG}"
@@ -380,6 +397,11 @@ export NCCL_DEBUG_SUBSYS=${NCCL_DEBUG_SUBSYS:-INIT,NET,COLL}
 export TORCH_NCCL_DUMP_ON_TIMEOUT=${TORCH_NCCL_DUMP_ON_TIMEOUT:-1}
 export TORCH_FR_BUFFER_SIZE=${TORCH_FR_BUFFER_SIZE:-20000}
 export TORCH_NCCL_DESYNC_DEBUG=${TORCH_NCCL_DESYNC_DEBUG:-1}
+export WANDB_ENABLE WANDB_PROJECT WANDB_NAME WANDB_GROUP WANDB_DIR WANDB_JOB_TYPE WANDB_RESUME
+if [[ "${WANDB_ENABLE}" == "true" && -z "${WANDB_API_KEY:-}" ]]; then
+    echo "  WARNING: WANDB_ENABLE=true but WANDB_API_KEY is not exported; set WANDB_API_KEY or use WANDB_MODE=offline." >&2
+fi
+export ROOT_DIR SOURCE_JSONL_PATH TARGET_MODEL_PATH MAX_LENGTH CONTEXT_PARALLEL_SIZE FSDP_SIZE GLOBAL_BATCH_SIZE DATA_BATCH_SIZE ONLINE_TARGET MIN_LOSS_TOKENS
 
 LAUNCHER=("${PYTHON_BIN}" -m torch.distributed.run)
 if [[ "${DRY_RUN}" == "true" ]]; then
@@ -409,6 +431,7 @@ set -x
     --opts "model.target_model_name_or_path=${TARGET_MODEL_PATH}" \
     "${TARGET_DATA_ARGS[@]}" \
     --opts "data.max_length=${MAX_LENGTH}" \
+    --opts "data.min_loss_tokens=${MIN_LOSS_TOKENS}" \
     --opts "data.store_target_last_hidden_states=true" \
     --opts "train.lr=${LEARNING_RATE}" \
     --opts "train.local_batch_size=${LOCAL_BATCH_SIZE}" \

@@ -10,7 +10,7 @@ seed = 42
 
 model = dict(
     target_model_name_or_path=(
-        "/mnt/afs-agentpro/share/models/Qwen/Qwen3.8-27B"
+        "/mnt/afs_agents/hongjiawei/share_models/Qwen/Qwen3.8-27B"
     ),
     block_size=5,
     num_draft_layers=3,
@@ -38,7 +38,7 @@ train = dict(
     local_batch_size=1,
     global_batch_size=512,
     # Number of target-first disk-cache partitions, not samples per partition.
-    data_batch_size=256,
+    data_batch_size=400,
     # Match the canonical DSpark training protocol used by the other Qwen runs.
     num_train_epochs=10,
     max_train_steps=None,
@@ -60,12 +60,17 @@ logging = dict(
 
 data = dict(
     online_target=True,
-    train_data_path="train_data/spec_o3_coldstartsft.repeat60.deepspec.jsonl",
+    train_data_path="/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/train_dataset/sensenova-flash-lite-v42-text-all.jsonl",
     jsonl_index_cache_dir=None,
     data_batch_cache_dir=None,
     target_cache_path=None,
     chat_template="qwen",
-    max_length=4096,
+    max_length=131072,
+    # Keep the historical default filtering behavior for callers that do not
+    # override it. Online long-context launchers set this to 0 because with
+    # local_batch_size=1 a fully-filtered sample would make the collator return
+    # None and break CUDA prefetching/rank alignment.
+    min_loss_tokens=1,
     num_workers=1,
     prefetch_factor=1,
     # The bundled JSONL has literal <image> text but no media file paths.

@@ -1,4 +1,5 @@
 import time
+import os
 from typing import Optional
 
 from torch.utils.tensorboard import SummaryWriter
@@ -8,17 +9,59 @@ from deepspec.utils.metrics import add_metric, flush_async, reset
 
 
 _writer: Optional[SummaryWriter] = None
+_wandb_run = None
 _logging_steps: int = 1
 _session_start_wall: Optional[float] = None
 _session_start_step: int = 0
 
 
 def init(*, logging_steps: int, tensorboard_dir: Optional[str] = None) -> None:
-    global _writer, _logging_steps
+    global _writer, _wandb_run, _logging_steps
     _logging_steps = int(logging_steps)
-    if tensorboard_dir is not None and is_global_main_process():
+    if not is_global_main_process():
+        return
+    if tensorboard_dir is not None:
         ensure_dir(tensorboard_dir)
         _writer = SummaryWriter(tensorboard_dir)
+    wandb_enabled = os.environ.get("WANDB_ENABLE", "false").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    if wandb_enabled:
+        try:
+            import wandb
+
+            wandb_dir = os.environ.get("WANDB_DIR")
+            if wandb_dir:
+                ensure_dir(wandb_dir)
+            _wandb_run = wandb.init(
+                project=os.environ.get("WANDB_PROJECT", "deepspec"),
+                entity=os.environ.get("WANDB_ENTITY") or None,
+                name=os.environ.get("WANDB_NAME") or None,
+                group=os.environ.get("WANDB_GROUP") or None,
+                job_type=os.environ.get("WANDB_JOB_TYPE", "train"),
+                dir=wandb_dir,
+                resume=os.environ.get("WANDB_RESUME", "allow"),
+                config={
+                    "tensorboard_dir": tensorboard_dir,
+                    "logging_steps": _logging_steps,
+                    "root_dir": os.environ.get("ROOT_DIR"),
+                    "source_jsonl_path": os.environ.get("SOURCE_JSONL_PATH"),
+                    "target_model_path": os.environ.get("TARGET_MODEL_PATH"),
+                    "max_length": os.environ.get("MAX_LENGTH"),
+                    "context_parallel_size": os.environ.get("CONTEXT_PARALLEL_SIZE"),
+                    "fsdp_size": os.environ.get("FSDP_SIZE"),
+                    "global_batch_size": os.environ.get("GLOBAL_BATCH_SIZE"),
+                    "data_batch_size": os.environ.get("DATA_BATCH_SIZE"),
+                    "online_target": os.environ.get("ONLINE_TARGET"),
+                },
+            )
+            print_on_global_main(f"W&B logging enabled: {_wandb_run.url}")
+        except Exception as exc:
+            _wandb_run = None
+            print_on_global_main(f"W&B logging disabled after init failure: {exc}")
 
 
 def start_session(*, global_step: int) -> None:
@@ -78,17 +121,23 @@ def on_optimizer_step(**kwargs):
 
 
 def close() -> None:
-    global _writer
+    global _writer, _wandb_run
     if _writer is not None:
         _writer.close()
         _writer = None
+    if _wandb_run is not None:
+        try:
+            _wandb_run.finish()
+        finally:
+            _wandb_run = None
 
 
 def _write_scalars(summary, *, global_step: int) -> None:
-    if _writer is None:
-        return
-    for key, value in summary.items():
-        _writer.add_scalar(key, value, global_step)
+    if _writer is not None:
+        for key, value in summary.items():
+            _writer.add_scalar(key, value, global_step)
+    if _wandb_run is not None:
+        _wandb_run.log(dict(summary), step=global_step)
 
 
 def _print_summary(
