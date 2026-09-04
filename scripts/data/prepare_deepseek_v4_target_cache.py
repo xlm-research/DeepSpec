@@ -96,13 +96,17 @@ def _resolve_target_runtime(target_config):
 
 
 def _retained_target_has_routed_experts(target_config, target_layer_ids) -> bool:
-    """Return whether the truncated target contains any routed-expert layer."""
+    """Return whether the executed target contains any routed-expert layer."""
 
     decoder_layer_ids = [int(layer_id) for layer_id in target_layer_ids if layer_id >= 0]
     if not decoder_layer_ids:
         return False
-    retained_layers = max(decoder_layer_ids) + 1
     text_config = getattr(target_config, "text_config", target_config)
+    retained_layers = (
+        int(text_config.num_hidden_layers)
+        if str(target_config.model_type) == "glm5_next"
+        else max(decoder_layer_ids) + 1
+    )
     mlp_layer_types = list(getattr(text_config, "mlp_layer_types", ()))
     if mlp_layer_types:
         routed_types = {"hash_moe", "moe", "sparse"}
@@ -170,6 +174,19 @@ def _reuse_existing_cache(
             assert int(manifest.get("min_loss_tokens", -1)) == int(
                 config.data.get("min_loss_tokens", 1)
             ), "Minimum loss-token filtering does not match the cache."
+            if target_name == "GLM-5.3":
+                assert manifest.get("target_execution") == "full_model", (
+                    "GLM target cache predates full-model execution."
+                )
+                assert int(
+                    manifest.get("target_execution_num_hidden_layers", -1)
+                ) == 45, "GLM target cache was not produced by all 45 layers."
+                assert int(manifest.get("target_final_hidden_layer", -1)) == 44, (
+                    "GLM target cache final state is not from layer 44."
+                )
+                assert manifest.get("target_final_hidden_source") == (
+                    "full_model_final_norm"
+                ), "GLM target cache final state predates the full-model contract."
         except (AssertionError, FileNotFoundError, OSError, ValueError) as exc:
             error[0] = f"{type(exc).__name__}: {exc}"
     dist.broadcast_object_list(error, src=0)
@@ -199,6 +216,19 @@ def _write_manifest(
     target_config = AutoConfig.from_pretrained(
         config.model.target_model_name_or_path
     )
+    target_execution_fields = {}
+    if str(target_config.model_type) == "glm5_next":
+        target_execution_fields = {
+            "target_execution": "full_model",
+            "target_execution_num_hidden_layers": int(
+                target_config.text_config.num_hidden_layers
+            ),
+            "target_final_hidden_layer": int(
+                target_config.text_config.num_hidden_layers
+            )
+            - 1,
+            "target_final_hidden_source": "full_model_final_norm",
+        }
     manifest = build_target_cache_manifest(
         num_samples=num_samples,
         shards=shards,
@@ -241,6 +271,7 @@ def _write_manifest(
             "project_name": str(config.get("project_name", "")),
             "exp_name": str(config.get("exp_name", "")),
             "git_sha": str(get_git_sha()),
+            **target_execution_fields,
         },
     )
     write_target_cache_manifest(output_dir=output_dir, manifest=manifest)
@@ -302,7 +333,7 @@ def main(local_rank: int):
     target_context_parallel_implementation = (
         "deepseek_v4_ring"
         if str(source_target_config.model_type) == "deepseek_v4"
-        else "disabled"
+        else "glm5_next_bounded_full_prefill"
     )
     stores_target_last_hidden_states = bool(
         config.data.get("store_target_last_hidden_states", True)
@@ -376,6 +407,15 @@ def main(local_rank: int):
     tokenizer = AutoTokenizer.from_pretrained(
         config.model.target_model_name_or_path
     )
+    if str(source_target_config.model_type) == "glm5_next":
+        from deepspec.modeling.dspark.glm5_next.config import (
+            validate_glm5_next_tokenizer,
+        )
+
+        validate_glm5_next_tokenizer(
+            tokenizer,
+            mask_token_id=config.model.mask_token_id,
+        )
     collator = ConversationCollator(
         tokenizer=tokenizer,
         chat_template=config.data.chat_template,

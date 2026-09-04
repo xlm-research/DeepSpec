@@ -2,6 +2,7 @@ import math
 import os
 import json
 import shutil
+import time
 
 import torch
 import torch.distributed as dist
@@ -333,6 +334,7 @@ def _launch_eval(
 
 class BaseTrainer:
     data_collator_cls = None
+    supports_partitioned_model_swap = False
 
     def __init__(self, local_rank, args):
         self.args = args
@@ -341,6 +343,20 @@ class BaseTrainer:
         self.offline_target_data_batches_enabled = bool(
             self.args.data.get("offline_target_data_batches", False)
         )
+        partitioned_model_swap = self.args.train.get("partitioned_model_swap") or {}
+        self.partitioned_model_swap_enabled = bool(
+            partitioned_model_swap.get("enabled", False)
+        )
+        self.partitioned_model_swap_max_samples = int(
+            partitioned_model_swap.get("max_samples", 512)
+        )
+        if self.partitioned_model_swap_enabled and not bool(
+            self.supports_partitioned_model_swap
+        ):
+            raise ValueError(
+                "train.partitioned_model_swap is only implemented for "
+                "Glm5NextDSparkTrainer."
+            )
         if (
             self.online_target_enabled
             and self.offline_target_data_batches_enabled
@@ -448,6 +464,14 @@ class BaseTrainer:
             )
         configured_data_batch_size = self.args.train.get("data_batch_size")
         configured_data_partitions = self.args.train.get("data_partitions")
+        if self.partitioned_model_swap_enabled and (
+            configured_data_batch_size is not None
+            or configured_data_partitions is not None
+        ):
+            raise ValueError(
+                "train.data_batch_size and train.data_partitions must both be "
+                "null when train.partitioned_model_swap.enabled=true."
+            )
         if (
             configured_data_batch_size is not None
             and configured_data_partitions is not None
@@ -470,7 +494,27 @@ class BaseTrainer:
         self._active_data_batch_cache = None
         self._data_batch_phase = None
         self._data_batch_end_after_current = False
-        if configured_partition_count is not None:
+        if self.partitioned_model_swap_enabled:
+            if not self.offline_target_data_batches_enabled:
+                raise ValueError(
+                    "GLM partitioned model swap requires "
+                    "data.offline_target_data_batches=true."
+                )
+            if not bool(self.args.logging.get("save_checkpoints", True)):
+                raise ValueError(
+                    "GLM partitioned model swap requires "
+                    "logging.save_checkpoints=true."
+                )
+            self.data_batch_cache_root = os.path.abspath(
+                os.fspath(
+                    self.args.data.get("data_batch_cache_dir")
+                    or os.path.join(
+                        self.checkpoint_dir_root,
+                        "target_data_batch_cache",
+                    )
+                )
+            )
+        elif configured_partition_count is not None:
             if not self.target_runtime_enabled:
                 raise ValueError(
                     "Partitioned target caching requires online target training "
@@ -516,6 +560,11 @@ class BaseTrainer:
             logging_steps=int(self.args.logging.logging_steps),
             tensorboard_dir=self.args.logging.tensorboard_dir,
         )
+
+        if self.partitioned_model_swap_enabled:
+            self._initialize_partitioned_model_swap()
+            self.info_board()
+            return
 
         self.draft_model, self.tokenizer = self.build_models()
         resume_is_distributed = bool(
@@ -752,6 +801,11 @@ class BaseTrainer:
             or getattr(self, "offline_target_data_batches_enabled", False)
         )
 
+    def _initialize_partitioned_model_swap(self) -> None:
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement partitioned model swap."
+        )
+
     @property
     def global_step(self):
         return self.next_micro_step // self.gradient_accumulation_steps
@@ -890,30 +944,39 @@ class BaseTrainer:
             print_on_local_main(
                 f"  Transient target cache = {self.data_batch_cache_root}"
             )
+        if self.partitioned_model_swap_enabled:
+            print_on_local_main("  Model lifecycle = GLM partitioned model swap")
+            print_on_local_main(
+                "  Maximum global samples per partition = "
+                f"{self.partitioned_model_swap_max_samples}"
+            )
+            print_on_local_main(
+                f"  Transactional target cache = {self.data_batch_cache_root}"
+            )
         print_on_local_main(f"  Steps per epoch = {self.steps_per_epoch}")
         print_on_local_main(f"  Max train steps = {self.max_train_steps}")
 
     def build_models(self):
+        build_started = time.perf_counter()
         model_args = self.args.model
-
-        target_config = AutoConfig.from_pretrained(
-            model_args.target_model_name_or_path,
-        )
-        if is_multimodal_config(target_config):
-            processor = AutoProcessor.from_pretrained(
-                model_args.target_model_name_or_path,
+        log_draft_load = not dist.is_initialized() or is_global_main_process()
+        if log_draft_load:
+            print(
+                "[deepspec-draft-load] initializing draft from "
+                f"{model_args.target_model_name_or_path}",
+                flush=True,
             )
-            tokenizer = processor.tokenizer
-        else:
-            tokenizer = AutoTokenizer.from_pretrained(
-                model_args.target_model_name_or_path,
-            )
+        config_started = time.perf_counter()
+        target_config, tokenizer = self.load_target_config_and_tokenizer()
+        config_seconds = time.perf_counter() - config_started
 
+        construct_started = time.perf_counter()
         draft_model = self._build_draft_model(
             target_config=target_config,
             model_args=model_args,
         )
         draft_model = draft_model.to(device=self.device, dtype=self.precision_dtype)
+        construct_seconds = time.perf_counter() - construct_started
 
         # Training only uses the target checkpoint to initialize frozen draft
         # embeddings and lm_head weights.
@@ -921,6 +984,7 @@ class BaseTrainer:
         has_local_safetensors = os.path.isfile(
             os.path.join(target_model_path, "model.safetensors.index.json")
         ) or os.path.isfile(os.path.join(target_model_path, "model.safetensors"))
+        weights_started = time.perf_counter()
         if str(target_config.model_type) in ("deepseek_v4", "glm5_next") or (
             str(target_config.model_type) == "qwen3_5" and has_local_safetensors
         ):
@@ -957,7 +1021,53 @@ class BaseTrainer:
                 freeze=True,
             )
             del target_model
+        weights_seconds = time.perf_counter() - weights_started
+        local_expert_counts = set()
+        for layer in getattr(draft_model, "layers", ()):
+            experts = getattr(getattr(layer, "mlp", None), "experts", None)
+            gate_up_proj = getattr(experts, "gate_up_proj", None)
+            if gate_up_proj is not None:
+                local_expert_counts.add(int(gate_up_proj.shape[0]))
+        expert_detail = (
+            f", local_experts={sorted(local_expert_counts)}"
+            if local_expert_counts
+            else ""
+        )
+        if log_draft_load:
+            print(
+                "[deepspec-draft-load] draft initialization complete "
+                f"in {time.perf_counter() - build_started:.1f}s "
+                f"(config_and_tokenizer={config_seconds:.1f}s, "
+                f"construct_and_place={construct_seconds:.1f}s, "
+                f"embedding_and_head={weights_seconds:.1f}s{expert_detail})",
+                flush=True,
+            )
         return draft_model, tokenizer
+
+    def load_target_config_and_tokenizer(self):
+        model_args = self.args.model
+        target_config = AutoConfig.from_pretrained(
+            model_args.target_model_name_or_path,
+        )
+        if is_multimodal_config(target_config):
+            processor = AutoProcessor.from_pretrained(
+                model_args.target_model_name_or_path,
+            )
+            tokenizer = processor.tokenizer
+        else:
+            tokenizer = AutoTokenizer.from_pretrained(
+                model_args.target_model_name_or_path,
+            )
+        self.validate_target_tokenizer(
+            target_config=target_config,
+            tokenizer=tokenizer,
+        )
+        return target_config, tokenizer
+
+    def validate_target_tokenizer(self, *, target_config, tokenizer) -> None:
+        """Run family-specific tokenizer/checkpoint compatibility checks."""
+
+        del target_config, tokenizer
 
     def _build_draft_model(self, *, target_config, model_args):
         raise NotImplementedError
@@ -1316,7 +1426,13 @@ class BaseTrainer:
                     "inference phase."
                 )
 
-    def _build_train_dataloader(self, start_offset_samples=0, num_samples=None):
+    def _build_train_dataloader(
+        self,
+        start_offset_samples=0,
+        num_samples=None,
+        *,
+        persistent_workers=True,
+    ):
         sampler = StatelessResumableDistributedSampler(
             dataset=self.train_dataset,
             num_replicas=self.data_parallel_size,
@@ -1325,16 +1441,20 @@ class BaseTrainer:
             start_global_offset_samples=start_offset_samples,
             num_samples=num_samples,
         )
+        num_workers = int(self.args.data.num_workers)
+        kwargs = {}
+        if num_workers > 0:
+            kwargs["prefetch_factor"] = int(self.args.data.get("prefetch_factor", 1))
         return DataLoader(
             self.train_dataset,
             batch_size=int(self.args.train.local_batch_size),
             sampler=sampler,
             collate_fn=self.data_collator,
-            num_workers=int(self.args.data.num_workers),
+            num_workers=num_workers,
             pin_memory=True,
             drop_last=True,
-            persistent_workers=True,
-            prefetch_factor=1,
+            persistent_workers=bool(persistent_workers and num_workers > 0),
+            **kwargs,
         )
 
     def run_batch(self, batch):
@@ -1439,11 +1559,14 @@ class BaseTrainer:
 
     def train(self):
         self.model.train()
-        if self.global_step >= self.max_train_steps:
+        training_end_step = int(
+            getattr(self, "_active_train_end_step", self.max_train_steps)
+        )
+        if self.global_step >= training_end_step:
             return
 
         local_batch_size = int(self.args.train.local_batch_size)
-        total_micro_steps = self.max_train_steps * self.gradient_accumulation_steps
+        total_micro_steps = training_end_step * self.gradient_accumulation_steps
         remaining_micro_steps = total_micro_steps - self.next_micro_step
         remaining_samples = remaining_micro_steps * local_batch_size
 
@@ -1452,6 +1575,7 @@ class BaseTrainer:
             num_samples=remaining_samples,
         )
         prefetcher = CUDAPrefetcher(dataloader, self.device)
+        self._active_prefetcher = prefetcher
         training_logger.start_session(global_step=self.global_step)
         profiler = build_torch_profiler(
             self.args.get("profiling"),
@@ -1547,6 +1671,7 @@ class BaseTrainer:
 
                         if (
                             save_checkpoints
+                            and not self.partitioned_model_swap_enabled
                             and self.global_step
                             % int(self.args.logging.checkpointing_steps)
                             == 0
@@ -1560,6 +1685,8 @@ class BaseTrainer:
                             training_logger.finish_optimizer_step(pending_log)
                             pending_log = None
                             self._save_and_suspend()
+                            prefetcher.close()
+                            self._active_prefetcher = None
                             profiler.step()
                             return
                     elif self._data_batch_end_after_current:
@@ -1568,6 +1695,9 @@ class BaseTrainer:
                         training_logger.finish_optimizer_step(pending_log)
                         pending_log = None
                 profiler.step()
+
+        prefetcher.close()
+        self._active_prefetcher = None
 
         # Preserve the final log record. This wait is outside the profiled
         # training-step region and, in normal runs, the final checkpoint/exit
@@ -1580,6 +1710,13 @@ class BaseTrainer:
             print_on_global_main("Checkpoint saving is disabled for this training run.")
 
     def clean_up(self, *, synchronize: bool = True):
+        active_prefetcher = getattr(self, "_active_prefetcher", None)
+        if active_prefetcher is not None:
+            active_prefetcher.close()
+            self._active_prefetcher = None
+        if self.partitioned_model_swap_enabled:
+            self._clean_up_partitioned_model_swap(synchronize=synchronize)
+            return
         if self.online_target is not None:
             self.online_target.close()
             self.online_target = None
@@ -1608,3 +1745,8 @@ class BaseTrainer:
             dist.barrier()
         if dist.is_initialized():
             dist.destroy_process_group()
+
+    def _clean_up_partitioned_model_swap(
+        self, *, synchronize: bool = True
+    ) -> None:
+        raise NotImplementedError

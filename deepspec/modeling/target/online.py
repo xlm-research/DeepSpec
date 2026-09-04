@@ -9,11 +9,15 @@ leader.
 
 from __future__ import annotations
 
+import gc
+import weakref
+
 import torch
+import torch.distributed as dist
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
-from torch.distributed.fsdp import FSDPModule
+from torch.distributed.fsdp import FSDPModule, MixedPrecisionPolicy, fully_shard
+from torch.distributed.tensor import DTensor
 from transformers import AutoConfig, AutoModel, FineGrainedFP8Config
 from transformers.distributed.configuration_utils import DistributedConfig
 
@@ -29,6 +33,11 @@ from deepspec.utils import compute_context_parallel_range
 
 from .common import TargetForwardResult
 from .deepseek_v4_cp import install_target_context_parallel
+from .glm5_checkpoint import load_glm5_huggingface_checkpoint
+from .glm5_next import (
+    install_glm5_next_bounded_target_prefill,
+    uninstall_glm5_next_bounded_target_prefill,
+)
 
 
 def _get_target_backbone(target_model):
@@ -56,6 +65,7 @@ def _run_target_forward_with_hooks(
     input_ids: torch.Tensor,
     attention_mask: torch.Tensor,
     target_layer_ids,
+    output_device: torch.device | str | None = None,
 ):
     backbone = _get_target_backbone(target_model)
     requested = [int(layer_id) for layer_id in target_layer_ids]
@@ -67,7 +77,10 @@ def _run_target_forward_with_hooks(
             hidden = _get_hook_tensor(output)
             if hidden.ndim == 4:
                 hidden = backbone.hc_head(hidden)
-            captured[layer_id] = hidden.detach()
+            hidden = hidden.detach()
+            if output_device is not None:
+                hidden = hidden.to(device=output_device)
+            captured[layer_id] = hidden
 
         return hook
 
@@ -95,6 +108,8 @@ def _run_target_forward_with_hooks(
             raise RuntimeError(f"Target layers were not captured: {missing}.")
         hidden = torch.cat([captured[layer_id] for layer_id in requested], dim=-1)
         last_hidden = output.last_hidden_state.detach()
+        if output_device is not None:
+            last_hidden = last_hidden.to(device=output_device)
     finally:
         for handle in handles:
             handle.remove()
@@ -130,6 +145,23 @@ def _normalize_target_parameter_dtype(target_model) -> None:
             parameter.data = parameter.data.to(dtype=torch.bfloat16)
 
 
+def _localize_rank_local_expert_parameters(experts: nn.Module) -> None:
+    """Hand loader-created EP DTensors to DeepSpec's pure-EP runtime."""
+
+    for parameter_name in ("gate_up_proj", "down_proj"):
+        parameter = experts._parameters.get(parameter_name)
+        if parameter is None:
+            raise RuntimeError(
+                f"Loaded target experts are missing {parameter_name!r}."
+            )
+        if isinstance(parameter, DTensor):
+            local_parameter = parameter.to_local().detach()
+            experts._parameters[parameter_name] = nn.Parameter(
+                local_parameter,
+                requires_grad=bool(parameter.requires_grad),
+            )
+
+
 def _build_rank_local_ep_target_model(
     *,
     model_name_or_path: str,
@@ -163,7 +195,8 @@ def _build_rank_local_ep_target_model(
         # Only shard routed-expert parameters during checkpoint loading. The
         # framework's existing pure-EP forward owns token dispatch and routing;
         # dense modules remain replicated until the layerwise FSDP wrap below.
-        target_config.base_model_ep_plan = {
+        expert_config = getattr(target_config, "text_config", target_config)
+        expert_config.base_model_ep_plan = {
             "layers.*.mlp.experts.gate_up_proj": "grouped_gemm",
             "layers.*.mlp.experts.down_proj": "grouped_gemm",
         }
@@ -173,19 +206,26 @@ def _build_rank_local_ep_target_model(
             mesh_dim_names=("tp",),
         )
         load_kwargs.update(
-            tp_plan="auto",
             device_mesh=ep_mesh,
-            distributed_config=DistributedConfig(enable_expert_parallel=True),
+            distributed_config=DistributedConfig(
+                tp_size=ep_size,
+                tp_plan="auto",
+                enable_expert_parallel=True,
+            ),
         )
 
     model = AutoModel.from_pretrained(model_name_or_path, **load_kwargs)
     _normalize_target_parameter_dtype(model)
 
     if ep_size > 1:
-        expected_local_experts = int(target_config.n_routed_experts) // ep_size
+        expert_config = getattr(target_config, "text_config", target_config)
+        expected_local_experts = int(expert_config.n_routed_experts) // ep_size
         backbone = _get_target_backbone(model)
         for layer_idx, decoder_layer in enumerate(backbone.layers):
+            if not hasattr(decoder_layer.mlp, "experts"):
+                continue
             experts = decoder_layer.mlp.experts
+            _localize_rank_local_expert_parameters(experts)
             local_experts = int(experts.gate_up_proj.shape[0])
             if local_experts != expected_local_experts:
                 raise RuntimeError(
@@ -273,6 +313,7 @@ def _wrap_target_model_with_fsdp(
     device,
     topology,
     shard_tensor_parallel_dimension: bool = False,
+    deferred_init: bool = False,
 ):
     """FSDP2-shard dense target state while keeping routed experts pure-EP."""
 
@@ -280,13 +321,14 @@ def _wrap_target_model_with_fsdp(
     decoder_layers = list(backbone.layers)
     if not decoder_layers:
         raise ValueError("Target model does not expose decoder layers for FSDP.")
-    _materialize_replicated_target_state_locally(
-        target_model=target_model,
-        decoder_layers=decoder_layers,
-        device=device,
-    )
     pure_expert_modules = get_pure_expert_modules(target_model)
-    materialize_modules_locally(pure_expert_modules, device=device)
+    if not deferred_init:
+        _materialize_replicated_target_state_locally(
+            target_model=target_model,
+            decoder_layers=decoder_layers,
+            device=device,
+        )
+        materialize_modules_locally(pure_expert_modules, device=device)
     ignored_params = {
         parameter
         for expert_root in pure_expert_modules
@@ -470,6 +512,13 @@ class DeepseekV4OnlineTarget:
     def forward_training_batch(self, batch) -> dict[str, torch.Tensor]:
         """Run one target forward and return a cache-shaped in-memory batch."""
 
+        if bool(getattr(self, "require_phase_guard", False)) and getattr(
+            self, "execution_phase", None
+        ) != "TARGET_GENERATE_FEATURES":
+            raise RuntimeError(
+                "GLM target forward is only allowed during "
+                "TARGET_GENERATE_FEATURES."
+            )
         if int(batch["input_ids"].shape[0]) != 1:
             raise ValueError("Online DeepSeek-V4 training requires local_batch_size=1.")
         attention_mask = batch["attention_mask"]
@@ -499,6 +548,7 @@ class DeepseekV4OnlineTarget:
                     input_ids=model_inputs["input_ids"],
                     attention_mask=model_inputs["attention_mask"],
                     target_layer_ids=self.target_layer_ids,
+                    output_device=getattr(self, "feature_output_device", None),
                 )
 
         context_start = int(result.context_start)
@@ -527,7 +577,7 @@ class DeepseekV4OnlineTarget:
 
 
 class Glm5NextOnlineTarget(DeepseekV4OnlineTarget):
-    """Frozen, truncated GLM-5.3 teacher for online DSpark distillation."""
+    """Frozen full-depth GLM-5.3 teacher for DSpark distillation."""
 
     def __init__(
         self,
@@ -537,12 +587,16 @@ class Glm5NextOnlineTarget(DeepseekV4OnlineTarget):
         topology,
         device,
         rank_local_cache_dir: str,
+        require_phase_guard: bool = False,
     ):
-        if topology.expert_parallel_size != 1:
-            raise NotImplementedError(
-                "GLM-5.3 online target expert parallelism is not implemented; "
-                "set train.target_parallel.ep=1."
-            )
+        # Import lazily: the GLM draft model reuses DeepSeek draft operations,
+        # whose module imports the target package for CP helpers. Importing the
+        # GLM package at target-module load time would therefore form a cycle
+        # on otherwise unrelated DeepSeek startup paths.
+        from deepspec.modeling.dspark.glm5_next.config import (
+            validate_glm5_next_target_config,
+        )
+
         if topology.context_parallel_size != 1:
             raise NotImplementedError(
                 "GLM-5.3 hybrid-attention target context parallelism is not "
@@ -553,50 +607,189 @@ class Glm5NextOnlineTarget(DeepseekV4OnlineTarget):
         self.target_layer_ids = [int(layer_id) for layer_id in target_layer_ids]
         self.topology = topology
         self.device = device
+        # GLM always stages target features through the isolated disk-cache
+        # phase. Moving each requested layer to CPU in its hook releases the
+        # 128K GPU activation before later layers run and avoids a second
+        # multi-GiB GPU allocation when the three features are concatenated.
+        self.feature_output_device = torch.device("cpu")
         self.rank_local_cache_dir = str(rank_local_cache_dir)
+        self.require_phase_guard = bool(require_phase_guard)
+        self.execution_phase = None
+        self._released_model_weakref = None
         target_config = AutoConfig.from_pretrained(self.model_name_or_path)
-        if str(target_config.model_type) != "glm5_next":
-            raise ValueError(
-                "Glm5NextOnlineTarget requires a glm5_next checkpoint, got "
-                f"{target_config.model_type!r}."
-            )
-        text_config = target_config.text_config
+        text_config = validate_glm5_next_target_config(target_config)
         decoder_layer_ids = [
             layer_id for layer_id in self.target_layer_ids if layer_id >= 0
         ]
         if not decoder_layer_ids:
             raise ValueError("Online target requires at least one decoder layer.")
-        retained_layers = max(decoder_layer_ids) + 1
         original_layers = int(text_config.num_hidden_layers)
-        if retained_layers > original_layers:
+        if max(decoder_layer_ids) >= original_layers:
             raise ValueError(
-                f"Requested target layer {retained_layers - 1}, but the checkpoint "
+                f"Requested target layer {max(decoder_layer_ids)}, but the checkpoint "
                 f"contains only {original_layers} decoder layers."
             )
-        text_config.num_hidden_layers = retained_layers
+        ep_size = int(topology.expert_parallel_size)
+        if int(text_config.n_routed_experts) % ep_size:
+            raise ValueError(
+                f"GLM-5.3 target EP={ep_size} must divide "
+                f"n_routed_experts={text_config.n_routed_experts}."
+            )
         # Text-only training never calls the vision tower. Avoid constructing
         # its 24 transformer blocks while retaining the checkpoint's composite
         # model wrapper and parameter names.
         target_config.vision_config.depth = 0
-        self.target_num_hidden_layers = retained_layers
+        self.target_num_hidden_layers = original_layers
 
-        model = _build_rank_local_ep_target_model(
-            model_name_or_path=self.model_name_or_path,
-            target_config=target_config,
-            topology=topology,
-        ).eval()
+        # Construct no checkpoint-sized tensors yet. TP/EP slicing and FSDP2
+        # wrapping happen on meta tensors, after which DCP reads only this
+        # rank's final parameter shards from the native HF safetensors.
+        with torch.device("meta"):
+            model = AutoModel.from_config(
+                target_config,
+                dtype=torch.bfloat16,
+            )
+        model = model.eval()
         model.requires_grad_(False)
-        if topology.tensor_parallel_size > 1:
+        if ep_size > 1 or topology.tensor_parallel_size > 1:
             parallelize_glm5_next_model(
                 _get_target_backbone(model),
                 topology=topology,
                 draft=False,
             )
+        install_glm5_next_bounded_target_prefill(model)
         self.model = _wrap_target_model_with_fsdp(
             target_model=model,
             device=device,
             topology=topology,
+            deferred_init=True,
         ).eval()
+        load_glm5_huggingface_checkpoint(
+            model=self.model,
+            checkpoint_dir=self.model_name_or_path,
+            config=target_config,
+            topology=topology,
+        )
+        # The only non-persistent GLM buffer belongs to the disabled vision
+        # tower and is therefore absent from the checkpoint state dict. Keep
+        # it off meta so generic module/device utilities remain safe.
+        vision_rotary = self.model.visual.rotary_pos_emb
+        vision_rotary._buffers["inv_freq"] = torch.nn.Buffer(
+            1.0
+            / (
+                vision_rotary.theta
+                ** (
+                    torch.arange(
+                        0,
+                        vision_rotary.dim,
+                        2,
+                        dtype=torch.float32,
+                        device=device,
+                    )
+                    / vision_rotary.dim
+                )
+            ),
+            persistent=False,
+        )
+
+    def set_execution_phase(self, phase: str | None) -> None:
+        self.execution_phase = phase
+
+    def close(self) -> None:
+        """Synchronously release every reference to the full GLM target state."""
+
+        model = getattr(self, "model", None)
+        if model is None:
+            return
+        device = self.device
+        before = _cuda_memory_snapshot(device)
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        if dist.is_initialized():
+            dist.barrier()
+
+        uninstall_glm5_next_bounded_target_prefill(model)
+        backbone = _get_target_backbone(model)
+        module_references = [weakref.ref(module) for module in model.modules()]
+        parameter_references = [
+            weakref.ref(parameter) for parameter in model.parameters()
+        ]
+        module = None
+        parameter = None
+        for module in model.modules():
+            for parameter in module.parameters(recurse=False):
+                parameter.grad = None
+            module._forward_hooks.clear()
+            module._forward_pre_hooks.clear()
+            module._backward_hooks.clear()
+            module._backward_pre_hooks.clear()
+        for owner in (model, backbone):
+            for name in (
+                "_deepspec_parallel_topology",
+                "_deepspec_ep_tp_installed",
+                "_deepspec_context_layout",
+            ):
+                if hasattr(owner, name):
+                    delattr(owner, name)
+
+        model_reference = weakref.ref(model)
+        self.model = None
+        self.execution_phase = None
+        self.topology = None
+        self.feature_output_device = None
+        # Python loop targets outlive their loops. In particular, ``owner`` is
+        # the text backbone here; retaining it would keep every target shard
+        # allocated even though the composite model weakref is already dead.
+        owner = None
+        module = None
+        parameter = None
+        del backbone
+        del model
+        gc.collect()
+        reachable_modules = sum(
+            reference() is not None for reference in module_references
+        )
+        reachable_parameters = sum(
+            reference() is not None for reference in parameter_references
+        )
+        if (
+            model_reference() is not None
+            or reachable_modules
+            or reachable_parameters
+        ):
+            raise RuntimeError(
+                "GLM target teardown left target state reachable: "
+                f"modules={reachable_modules}, parameters={reachable_parameters}."
+            )
+        self._released_model_weakref = model_reference
+
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+            ipc_collect = getattr(torch.cuda, "ipc_collect", None)
+            if callable(ipc_collect):
+                ipc_collect()
+            torch.cuda.synchronize(device)
+        if dist.is_initialized():
+            dist.barrier()
+        after = _cuda_memory_snapshot(device)
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        print(
+            "[deepspec-glm-target-unload] "
+            f"rank={rank} allocated_before={before['allocated']} "
+            f"reserved_before={before['reserved']} "
+            f"allocated_after={after['allocated']} "
+            f"reserved_after={after['reserved']} model_reachable=false",
+            flush=True,
+        )
+
+
+def _cuda_memory_snapshot(device) -> dict[str, int]:
+    if getattr(device, "type", None) != "cuda":
+        return {"allocated": 0, "reserved": 0}
+    return {
+        "allocated": int(torch.cuda.memory_allocated(device)),
+        "reserved": int(torch.cuda.memory_reserved(device)),
+    }
 
 
 class Qwen3_8OnlineTarget(DeepseekV4OnlineTarget):

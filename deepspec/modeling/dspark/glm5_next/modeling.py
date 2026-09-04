@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from types import SimpleNamespace
 from typing import ClassVar
 
@@ -8,11 +9,17 @@ import torch.nn.functional as F
 from torch import nn
 from transformers.models.glm5_next.modeling_glm5_next import (
     Glm5NextPreTrainedModel,
+    Glm5NextTextExperts,
     Glm5NextTextHyperConnection,
     Glm5NextTextHyperHead,
+    Glm5NextTextMLP,
     Glm5NextTextMoE,
     Glm5NextTextRMSNorm,
+    Glm5NextTextTopkRouter,
     Glm5NextTextUnweightedRMSNorm,
+)
+from transformers.models.glm5_next.configuration_glm5_next import (
+    Glm5NextTextConfig,
 )
 
 from deepspec.modeling.dspark.deepseek_v4.modeling import (
@@ -148,12 +155,53 @@ class Glm5NextDSparkAttention(nn.Module):
         return self.o_proj(output)
 
 
+class Glm5NextDSparkMoE(Glm5NextTextMoE):
+    """Construct only this EP rank's routed experts, while keeping the router global."""
+
+    def __init__(self, config, *, expert_parallel_size: int = 1):
+        expert_parallel_size = int(expert_parallel_size)
+        global_experts = int(config.num_local_experts)
+        if expert_parallel_size == 1:
+            super().__init__(config)
+            return
+        if global_experts % expert_parallel_size:
+            raise ValueError(
+                f"n_routed_experts={global_experts} must be divisible by "
+                f"expert_parallel_size={expert_parallel_size}."
+            )
+
+        nn.Module.__init__(self)
+        self.config = config
+        local_config = copy.copy(config)
+        local_config.n_routed_experts = global_experts // expert_parallel_size
+        self.experts = Glm5NextTextExperts(local_config)
+        self.gate = Glm5NextTextTopkRouter(config)
+        self.shared_experts = Glm5NextTextMLP(
+            config=config,
+            intermediate_size=(
+                config.moe_intermediate_size * config.n_shared_experts
+            ),
+        )
+        # The parallel adapter must install dispatch without slicing this
+        # already-local allocation a second time.
+        self.experts._deepspec_expert_parameters_distributed = True
+
+
 class Glm5NextDSparkDecoderLayer(nn.Module):
-    def __init__(self, config, layer_idx: int):
+    def __init__(
+        self,
+        config,
+        layer_idx: int,
+        *,
+        expert_parallel_size: int = 1,
+    ):
         super().__init__()
         self.layer_idx = int(layer_idx)
         self.self_attn = Glm5NextDSparkAttention(config, layer_idx)
-        self.mlp = Glm5NextTextMoE(config)
+        self.mlp = Glm5NextDSparkMoE(
+            config,
+            expert_parallel_size=expert_parallel_size,
+        )
         self.input_layernorm = Glm5NextTextRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
@@ -197,15 +245,31 @@ class Glm5NextDSparkDecoderLayer(nn.Module):
 
 
 class Glm5NextDSparkModel(Glm5NextPreTrainedModel):
+    config_class = Glm5NextTextConfig
     _no_split_modules: ClassVar[list[str]] = ["Glm5NextDSparkDecoderLayer"]
 
     @classmethod
     def _can_set_experts_implementation(cls) -> bool:
         return True
 
-    def __init__(self, config) -> None:
+    def __init__(
+        self,
+        config,
+        *,
+        expert_parallel_size: int = 1,
+        expert_parallel_rank: int = 0,
+    ) -> None:
         super().__init__(config)
         self.config = config
+        expert_parallel_size = int(expert_parallel_size)
+        expert_parallel_rank = int(expert_parallel_rank)
+        if expert_parallel_size < 1:
+            raise ValueError("expert_parallel_size must be positive.")
+        if not 0 <= expert_parallel_rank < expert_parallel_size:
+            raise ValueError(
+                f"expert_parallel_rank={expert_parallel_rank} must be in "
+                f"[0, {expert_parallel_size})."
+            )
         if self.config._experts_implementation != "grouped_mm":
             raise RuntimeError(
                 "GLM-5.3 draft MoE requires experts_implementation="
@@ -229,7 +293,11 @@ class Glm5NextDSparkModel(Glm5NextPreTrainedModel):
         )
         self.layers = nn.ModuleList(
             [
-                Glm5NextDSparkDecoderLayer(config, layer_idx)
+                Glm5NextDSparkDecoderLayer(
+                    config,
+                    layer_idx,
+                    expert_parallel_size=expert_parallel_size,
+                )
                 for layer_idx in range(config.num_hidden_layers)
             ]
         )
@@ -281,6 +349,37 @@ class Glm5NextDSparkModel(Glm5NextPreTrainedModel):
         self.tensor_parallel_group = None
         self.pure_expert_parallel = False
         self.post_init()
+        self._initialize_rank_local_experts(
+            expert_parallel_size=expert_parallel_size,
+            expert_parallel_rank=expert_parallel_rank,
+        )
+
+    @torch.no_grad()
+    def _initialize_rank_local_experts(
+        self,
+        *,
+        expert_parallel_size: int,
+        expert_parallel_rank: int,
+    ) -> None:
+        if expert_parallel_size == 1:
+            return
+        base_seed = int(torch.initial_seed())
+        for layer_index, layer in enumerate(self.layers):
+            experts = layer.mlp.experts
+            if experts.gate_up_proj.is_meta:
+                continue
+            if experts.gate_up_proj.device.type != "cpu":
+                raise RuntimeError(
+                    "Pre-sharded GLM draft experts must be constructed on CPU."
+                )
+            expert_seed = (
+                base_seed
+                + 1_000_003 * (expert_parallel_rank + 1)
+                + 10_007 * (layer_index + 1)
+            ) % (2**63 - 1)
+            with torch.random.fork_rng(devices=[]):
+                torch.random.default_generator.manual_seed(expert_seed)
+                self._init_weights(experts)
 
     # The sampling, loss-alignment, embedding initialization, and bounded CP
     # mechanics are model-independent DSpark behavior. Reuse the exercised V4

@@ -68,17 +68,19 @@ class HeterogeneousTargetDataBatchTest(unittest.TestCase):
             ep=math.gcd(local_world_size, 288),
         )
         if local_world_size % 4 == 0:
+            target_dp_shard = local_world_size // 4
             target_config = ParallelConfig(
                 dp_replicate=node_count,
-                dp_shard=local_world_size // 4,
+                dp_shard=target_dp_shard,
                 tp=4,
-                ep=1,
+                ep=math.gcd(target_dp_shard * 4, 288),
             )
         else:
+            target_dp_shard = runtime.world_size // 4
             target_config = ParallelConfig(
-                dp_shard=runtime.world_size // 4,
+                dp_shard=target_dp_shard,
                 tp=4,
-                ep=1,
+                ep=math.gcd(target_dp_shard * 4, 288),
             )
         draft = ParallelContext.build(
             draft_config,

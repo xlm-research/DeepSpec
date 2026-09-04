@@ -53,6 +53,10 @@ class TrainingProgress:
     parallel_config: dict[str, Any]
     model_config: dict[str, Any]
     scaler: object | None = None
+    partition_id: int | None = None
+    partition_start_next_micro_step: int | None = None
+    partition_end_next_micro_step: int | None = None
+    checkpointed: bool = False
 
     def state_dict(self):
         cuda_rng = (
@@ -60,7 +64,7 @@ class TrainingProgress:
             if torch.cuda.is_available()
             else torch.empty(0, dtype=torch.uint8)
         )
-        return {
+        state = {
             "next_micro_step": self.next_micro_step,
             "global_step": self.global_step,
             "epoch": self.epoch,
@@ -75,6 +79,18 @@ class TrainingProgress:
             "python_rng_pickle": pickle.dumps(random.getstate()),
             "scaler": self.scaler.state_dict() if self.scaler is not None else {},
         }
+        if self.partition_id is not None:
+            state.update(
+                partition_id=int(self.partition_id),
+                partition_start_next_micro_step=int(
+                    self.partition_start_next_micro_step
+                ),
+                partition_end_next_micro_step=int(
+                    self.partition_end_next_micro_step
+                ),
+                checkpointed=bool(self.checkpointed),
+            )
+        return state
 
     def load_state_dict(self, state_dict):
         for name in (
@@ -96,6 +112,15 @@ class TrainingProgress:
         random.setstate(pickle.loads(state_dict["python_rng_pickle"]))
         if self.scaler is not None and state_dict.get("scaler"):
             self.scaler.load_state_dict(state_dict["scaler"])
+        if "partition_id" in state_dict:
+            self.partition_id = int(state_dict["partition_id"])
+            self.partition_start_next_micro_step = int(
+                state_dict["partition_start_next_micro_step"]
+            )
+            self.partition_end_next_micro_step = int(
+                state_dict["partition_end_next_micro_step"]
+            )
+            self.checkpointed = bool(state_dict["checkpointed"])
 
 
 def _model_config_dict(model) -> dict[str, Any]:
@@ -198,9 +223,34 @@ def write_checkpoint_metadata(
         "parallel_config": progress.parallel_config,
         "model_config": progress.model_config,
     }
-    with open(os.path.join(checkpoint_dir, "distributed_checkpoint_metadata.json"), "w", encoding="utf-8") as handle:
+    if progress.partition_id is not None:
+        metadata.update(
+            partition_id=int(progress.partition_id),
+            partition_start_next_micro_step=int(
+                progress.partition_start_next_micro_step
+            ),
+            partition_end_next_micro_step=int(
+                progress.partition_end_next_micro_step
+            ),
+            checkpointed=bool(progress.checkpointed),
+        )
+    path = os.path.join(checkpoint_dir, "distributed_checkpoint_metadata.json")
+    tmp_path = f"{path}.tmp-{os.getpid()}"
+    with open(tmp_path, "w", encoding="utf-8") as handle:
         json.dump(metadata, handle, indent=2, sort_keys=True)
         handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp_path, path)
+
+
+def read_checkpoint_metadata(checkpoint_dir: str) -> dict[str, Any]:
+    path = os.path.join(checkpoint_dir, "distributed_checkpoint_metadata.json")
+    with open(path, "r", encoding="utf-8") as handle:
+        metadata = json.load(handle)
+    if not isinstance(metadata, dict):
+        raise ValueError(f"Invalid distributed checkpoint metadata: {path}")
+    return metadata
 
 
 __all__ = [
@@ -210,6 +260,7 @@ __all__ = [
     "full_model_state_dict",
     "has_distributed_checkpoint",
     "load_training_checkpoint",
+    "read_checkpoint_metadata",
     "save_training_checkpoint",
     "write_checkpoint_metadata",
 ]

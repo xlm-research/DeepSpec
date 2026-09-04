@@ -26,6 +26,7 @@ runtime_target_dp_shard = (
     if runtime_target_is_node_local
     else max(runtime_world_size // 4, 1)
 )
+runtime_target_ep = math.gcd(runtime_target_dp_shard * 4, 288)
 
 model = dict(
     target_model_name_or_path=(
@@ -33,7 +34,11 @@ model = dict(
     ),
     block_size=7,
     num_draft_layers=3,
-    target_layer_ids=[0, 1, 2],
+    # Sample the end of the dense prefix plus middle/late sparse layers. This
+    # preserves progressive target depth instead of feeding the draft three
+    # nearly adjacent early representations. The full 45-layer target still
+    # runs so L1/confidence supervision uses its true final normalized state.
+    target_layer_ids=[2, 22, 42],
     # GLM-5.3 has no mask token. Use the final reserved vocabulary row.
     mask_token_id=154879,
     num_anchors=512,
@@ -59,6 +64,13 @@ train = dict(
     # caps it at the remaining optimizer steps so short runs and resumes keep
     # every partition non-empty.
     data_batch_size=256,
+    # Opt-in lifecycle that alternates the full GLM target with the complete
+    # draft training state. The launcher sets data_batch_size=null when this is
+    # enabled because max_samples defines a different partitioning contract.
+    partitioned_model_swap=dict(
+        enabled=False,
+        max_samples=512,
+    ),
     num_train_epochs=1,
     # Derive the full schedule from the usable dataset by default. Launchers
     # may set a positive max_train_steps for bounded diagnostics.
@@ -82,20 +94,18 @@ train = dict(
         reduce_dtype="bf16",
         fsdp_wrap_granularity="block",
     ),
-    # target_layer_ids=[0, 1, 2] truncates GLM before its first MoE layer
-    # (index 3), so the retained target has no experts to partition. Keep EP=1;
-    # the draft's 288 routed experts use the independent EP=8 view above.
-    target_parallel=dict(ep=1),
+    target_parallel=dict(ep=runtime_draft_ep),
     # Both the reusable full-cache runner and bounded offline data batches use
     # a target mesh independent of draft training. TP remains fixed at four;
     # the DP-replicate/FSDP dimensions scale with the torchrun node layout.
-    # EP remains 1 because the truncated target is dense.
+    # EP overlays the target FSDP/TP rank domain so all 288 routed experts can
+    # be loaded rank-locally while dense state remains TP4 + FSDP2 per node.
     offline_target_parallel=dict(
         dp_replicate=runtime_target_dp_replicate,
         dp_shard=runtime_target_dp_shard,
         cp=1,
         tp=4,
-        ep=1,
+        ep=runtime_target_ep,
         expert_tp=1,
         use_fsdp=True,
     ),
@@ -142,6 +152,7 @@ def finalize_cfg(cfg):
         "runtime_target_is_node_local",
         "runtime_target_dp_replicate",
         "runtime_target_dp_shard",
+        "runtime_target_ep",
     ):
         cfg.pop(runtime_key, None)
     logging_cfg = dict(cfg["logging"])

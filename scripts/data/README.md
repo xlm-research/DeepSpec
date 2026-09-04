@@ -161,8 +161,10 @@ the DeepSeek-V4 DFlash/DFlash2 scripts under `scripts/fsdp/`. Their caches omit
 the unused final hidden state. DSpark uses `DATA_BATCH_CACHE_DIR` only for its
 bounded transient blocks; it does not require a completed offline manifest.
 
-GLM-5.3 DSpark uses the same bounded target-first lifecycle, but retains the
-final hidden state required by its L1 and confidence losses. It keeps
+GLM-5.3 DSpark uses the same bounded target-first lifecycle. The frozen target
+runs all 45 decoder layers: draft features come from layers `[2,22,42]`, while
+the normalized output after layer 44 supplies the logits required by its L1
+and confidence losses. It keeps
 `data.online_target=false`: each target partition is completed on disk before
 the draft consumes it, and the partition is deleted before the next one is
 generated. Configure the partition count and transient location with:
@@ -185,30 +187,137 @@ When `MAX_TRAIN_STEPS` is unset, the launcher trains the full usable dataset for
 footprint, or decrease it for fewer target/draft phase switches.
 `MAX_TRAIN_STEPS` is an optional diagnostic override and is not imposed by the
 multi-node launcher.
-On an eight-GPU node, the target phase uses `FSDP2 x TP4`, providing two
-effective sample replicas with CP disabled. Four serial target passes cover the
-eight draft sample owners per micro-step. EP stays at 1 because
-`target_layer_ids=[0,1,2]` truncates GLM before its first MoE layer (index 3).
-The draft uses `FSDP8 x EP8` on that node. With multiple eight-GPU nodes, both
-meshes become HSDP automatically: they shard within a node and replicate across
-nodes, while keeping target TP at 4.
 
-For a scheduler-managed SenseCore or Slurm multi-node job, configure this exact
-command once; the scheduler runs it on every node and the wrapper consumes the
-injected topology automatically:
+To prevent the full target and the complete draft optimizer state from sharing
+GPU memory, enable the GLM-only partitioned model-swap mode. It is disabled by
+default:
+
+```bash
+PARTITIONED_MODEL_SWAP=true PARTITION_MAX_SAMPLES=512 \
+SAVE_CHECKPOINTS=true \
+DATA_BATCH_CACHE_DIR=/local-nvme/glm5-target-partitions \
+OUTPUT_ROOT=/shared/jobs/glm5-dspark \
+  bash scripts/fsdp/train_glm5_3_flash_dspark_fsdp2.sh
+```
+
+`PARTITION_MAX_SAMPLES` is the maximum number of global logical samples, not a
+partition count. The launcher passes `train.data_batch_size=null` in this mode.
+The trainer uses
+`floor(PARTITION_MAX_SAMPLES / GLOBAL_BATCH_SIZE)` complete optimizer steps per
+ordinary partition, never crosses an epoch, and rejects a limit smaller than
+one global batch. Each partition runs this fixed sequence:
+
+```text
+PREPARE_PARTITION -> TARGET_LOAD -> TARGET_GENERATE_FEATURES
+-> PARTITION_FEATURES_READY -> TARGET_UNLOAD -> DRAFT_LOAD
+-> DRAFT_TRAIN_PARTITION -> DRAFT_SAVE_CHECKPOINT -> DRAFT_UNLOAD
+-> PARTITION_CACHE_DELETE -> NEXT_PARTITION
+```
+
+Each rank writes only the sample owned by that draft rank, even though TP4/EP
+replicate target work. Files are fsynced and atomically renamed below
+`rank_<rank>/epoch_<epoch>/partition_<id>.ready`; the local manifest records the
+writer, logical sample and dataset indices, stream range, token/file sizes,
+tensor shape/dtype metadata, and target shard layout. Only after every rank has
+validated its local manifest does the cache become READY. The shared
+`partition_journal.json` lives beside `step_latest`. A partition cache is
+deleted only after its HF export and full distributed model/optimizer/scheduler/
+RNG checkpoint are atomically committed. On restart, READY skips target loading,
+TRAINING retries from the partition-start checkpoint, and CHECKPOINTED skips
+duplicate optimizer steps and finishes cleanup. Identity mismatches retain the
+cache and stop the job for inspection.
+
+On an eight-GPU node, the target phase uses `FSDP2 x TP4 x EP8`, providing two
+effective sample replicas with CP disabled. Four serial target passes cover the
+eight draft sample owners per micro-step. EP is an overlay on the same
+`FSDP x TP` rank domain, so each rank loads only 36 of GLM's 288 routed experts;
+dense parameters remain TP4/FSDP2. GLM's KDA fallback batches its exact
+64-token recurrence (`DEEPSPEC_GLM_KDA_CHUNKS_PER_BATCH`, default 8), while the
+DSA indexer is query-chunked (`DEEPSPEC_GLM_INDEX_QUERY_CHUNK`, default 128).
+On SM100/SM103, the selected-token NoPE MLA runs through FlashInfer's native
+GLM kernel in query blocks (`DEEPSPEC_GLM_NATIVE_ATTN_QUERY_CHUNK`, default
+4096) with a reusable workspace (`DEEPSPEC_GLM_DSA_WORKSPACE_BYTES`, default
+384 MiB). This path was validated with `flashinfer-python==0.6.18`; FlashInfer
+is optional, and an unavailable or unsupported kernel selects the exact
+bounded PyTorch fallback
+(`DEEPSPEC_GLM_ATTN_QUERY_CHUNK`, default 32). Captured target features are
+staged to CPU as their selected layers finish, before the transient cache is
+written. Thus the target never expands all KDA chunk workspaces at once or
+creates an `S x S` mask or score tensor, and it does not retain all selected
+128K features on GPU. The draft uses `FSDP8 x EP8` on that node. With multiple
+eight-GPU nodes, both meshes become HSDP automatically: they shard within a
+node and replicate across nodes, while keeping target TP at 4.
+
+A direct single-node diagnostic run is:
+
+```bash
+MAX_TRAIN_STEPS=1 SAVE_CHECKPOINTS=false \
+  bash scripts/fsdp/train_glm5_3_flash_dspark_fsdp2.sh
+```
+
+For a real full-data 128K run, leave the step limit unset and state the length
+explicitly:
+
+```bash
+MAX_LENGTH=131072 NUM_TRAIN_EPOCHS=1 \
+TRAIN_DATA_PATH=/shared/data/glm5-train.jsonl \
+OUTPUT_ROOT=/shared/jobs/glm5-dspark \
+DATA_BATCH_CACHE_DIR=/local-nvme/glm5-target-blocks \
+  bash scripts/fsdp/train_glm5_3_flash_dspark_fsdp2.sh
+```
+
+For a scheduler-managed SenseCore or Slurm multi-node job, this launcher now
+uses the same production startup contract as
+`train_qwen3_8_27b_dspark_128gpu.sh`: configure this exact command once; the
+scheduler runs it on every node and the wrapper consumes the injected topology
+automatically:
 
 ```bash
 bash scripts/fsdp/train_glm5_3_flash_dspark_fsdp2.sh
 ```
+
+The launcher automatically uses every visible GPU on each node and starts
+`PYTHON_BIN -m torch.distributed.run`; `PYTHON_BIN` defaults to the current
+`python`. SenseCore/Slurm topology takes precedence over stale manual
+`NNODES`/`NODE_RANK` values. Node and per-rank logs are written below
+`OUTPUT_ROOT/logs` by default. Each launch replaces its node summary log and
+starts it with a timestamped `[deepspec-launch-start]` record. It tees only
+local rank 0 there; complete stdout/stderr remains in a timestamped per-launch
+directory of per-rank files. On failure, the exit diagnosis identifies the
+first available worker error record. Set `LOGGING_STEPS` to change the training
+metric interval. Setting `TORCHRUN_PER_RANK_LOGS=false` disables the per-rank
+files and sends every local worker's output to the node log instead.
+
+The launcher also stages the 306 GiB GLM checkpoint once per physical node
+into `${TMPDIR:-/tmp}/deepspec-model-cache` by default. The copy is published
+atomically only after all 62 shards, the index, and the config match the source
+fingerprint; concurrent launches share a file lock, and later launches reuse
+the completed cache. This turns the eight ranks' interleaved AFS reads into one
+bounded parallel copy followed by local reads. Eight shard-copy workers are
+used by default; override that with `TARGET_MODEL_CACHE_COPY_WORKERS` only after
+measuring the storage backend. The first uncached launch pays this one-time
+copy cost; model-swap reloads and later launches reuse it. Set
+`TARGET_MODEL_CACHE_DIR` to a specific node-local NVMe directory, or set it to
+`off` (or an empty string) to load directly from `TARGET_MODEL_PATH`. Automatic
+caching falls back to the source checkpoint if the default cache cannot be
+created or lacks the required space; an explicitly requested cache fails fast
+instead.
+
+The GLM FSDP2 checkpoint reader uses eight I/O/dequantization threads by
+default, selected from an eight-GPU measurement on the production checkpoint.
+Set `DEEPSPEC_DCP_LOAD_THREADS` to a positive integer to retune this for a
+different local storage backend.
 
 No DP/FSDP/TP/EP variables are required. On multi-node jobs, the bundled full
 training JSONL is selected automatically; `TRAIN_DATA_PATH` remains an optional
 dataset override. A scheduler must provide a reachable `MASTER_ADDR` (Slurm
 node lists are resolved automatically), because independent machines cannot
 discover a rendezvous endpoint themselves. The transient target cache defaults
-to a node-local directory under `TMPDIR` (or `/tmp`) and materializes only one
-of the effective, at-most-256 partitions at a time; checkpoints and the JSONL
-index remain under the shared `OUTPUT_ROOT`.
+below `OUTPUT_ROOT/data_batch_cache`, using both target and draft topology in
+its directory name. For example, a two-node/eight-GPU-per-node launch uses
+`target_dp2_fsdp2_cp1_tp4_ep8_etp1__draft_dp2_fsdp8_cp1_tp1_ep8_etp1`.
+It materializes only one of the effective, at-most-256 partitions at a time;
+checkpoints and the JSONL index also remain under `OUTPUT_ROOT`.
 
 For a non-scheduler manual torchrun deployment, launch the wrapper once on every
 node with the same rendezvous address. For two eight-GPU nodes, use
@@ -230,7 +339,9 @@ node count or GPUs per node. The total GPU count must be divisible by 4 because
 the requested target TP degree is 4. Draft EP is selected as the greatest
 common divisor of the node-local FSDP width and GLM's 288 experts; explicit
 `DP_REPLICATE`, `DP_SHARD`, `DRAFT_EP`, `TARGET_DP_REPLICATE`, and
-`TARGET_DP_SHARD` overrides remain available.
+`TARGET_DP_SHARD` overrides remain available. Target EP is independently the
+greatest common divisor of `TARGET_DP_SHARD*4` and 288; use `TARGET_EP` only
+when an explicit divisor is needed.
 
 The model, training JSONL, `OUTPUT_ROOT`, and `JSONL_INDEX_CACHE_DIR` must be
 visible at the same path on every node (or identically provisioned where
