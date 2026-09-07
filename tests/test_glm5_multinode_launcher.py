@@ -32,6 +32,14 @@ class Glm5MultiNodeLauncherTest(unittest.TestCase):
             "DATA_BATCH_SIZE",
             "PARTITIONED_MODEL_SWAP",
             "PARTITION_MAX_SAMPLES",
+            "TARGET_BACKEND",
+            "VLLM_PYTHON_BIN",
+            "VLLM_SOURCE_DIR",
+            "VLLM_MAX_NUM_BATCHED_TOKENS",
+            "VLLM_GPU_MEMORY_UTILIZATION",
+            "VLLM_LOAD_FORMAT",
+            "VLLM_TIMEOUT_SECONDS",
+            "VLLM_RAW_CACHE_DIR",
             "MASTER_ADDR",
             "MASTER_PORT",
             "SLURM_NNODES",
@@ -54,12 +62,16 @@ class Glm5MultiNodeLauncherTest(unittest.TestCase):
             "TARGET_MODEL_CACHE_DIR",
             "TARGET_MODEL_CACHE_COPY_WORKERS",
             "DEEPSPEC_DCP_LOAD_THREADS",
+            "MULTIMODAL",
+            "MEDIA_ROOT",
         ):
             env.pop(name, None)
         env.update(
             {
                 "DRY_RUN": "true",
                 "SAVE_CHECKPOINTS": "false",
+                "PARTITIONED_MODEL_SWAP": "false",
+                "TARGET_BACKEND": "native",
                 "OUTPUT_ROOT": "/shared/deepspec-glm-launcher-test",
                 "TRAIN_DATA_PATH": os.fspath(REPO_ROOT / "README.md"),
                 "TARGET_MODEL_PATH": os.fspath(REPO_ROOT),
@@ -75,6 +87,71 @@ class Glm5MultiNodeLauncherTest(unittest.TestCase):
             capture_output=True,
             check=False,
         )
+
+    def test_default_vllm_launch_uses_eight_data_partitions(self):
+        for nodes in (1, 16):
+            with self.subTest(nodes=nodes):
+                result = self._run_launcher(
+                    TARGET_BACKEND="",
+                    PARTITIONED_MODEL_SWAP="true",
+                    SAVE_CHECKPOINTS="true",
+                    NNODES=nodes,
+                    NODE_RANK=0,
+                    NPROC_PER_NODE=8,
+                    MASTER_ADDR="10.0.0.1",
+                    PYTHON_BIN="/bin/echo",
+                    CUDA_VISIBLE_DEVICES=",".join(str(i) for i in range(8)),
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                for expected in (
+                    "train.partitioned_model_swap.target_backend=vllm",
+                    "train.data_batch_size=8",
+                    "train.partitioned_model_swap.max_samples=null",
+                    "train.partitioned_model_swap.vllm.raw_cache_dir=/tmp/deepspec-vllm-raw",
+                    f"train.global_batch_size={nodes * 8}",
+                ):
+                    self.assertIn(expected, result.stdout)
+
+    def test_vllm_launch_preserves_partition_bounds_and_worker_settings(self):
+        result = self._run_launcher(
+            TARGET_BACKEND="vllm",
+            PARTITIONED_MODEL_SWAP="true",
+            SAVE_CHECKPOINTS="true",
+            PARTITION_MAX_SAMPLES=64,
+            PYTHON_BIN="/bin/echo",
+            VLLM_PYTHON_BIN="/bin/echo",
+            CUDA_VISIBLE_DEVICES=",".join(str(i) for i in range(8)),
+            VLLM_MAX_NUM_BATCHED_TOKENS=1152,
+            VLLM_RAW_CACHE_DIR="/tmp/custom-vllm-raw",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for expected in (
+            "train.partitioned_model_swap.target_backend=vllm",
+            "train.partitioned_model_swap.max_samples=64",
+            "train.data_batch_size=null",
+            "train.partitioned_model_swap.vllm.python_executable=/bin/echo",
+            "train.partitioned_model_swap.vllm.max_num_batched_tokens=1152",
+            "train.partitioned_model_swap.vllm.raw_cache_dir=/tmp/custom-vllm-raw",
+        ):
+            self.assertIn(expected, result.stdout)
+
+    def test_vllm_rejects_cross_node_tp_and_disabled_swap(self):
+        result = self._run_launcher(TARGET_BACKEND="vllm")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("requires PARTITIONED_MODEL_SWAP=true", result.stderr)
+        result = self._run_launcher(
+            TARGET_BACKEND="vllm",
+            PARTITIONED_MODEL_SWAP="true",
+            SAVE_CHECKPOINTS="true",
+            NNODES=2,
+            NODE_RANK=0,
+            NPROC_PER_NODE=2,
+            CUDA_VISIBLE_DEVICES="0,1",
+            MASTER_ADDR="10.0.0.1",
+            PYTHON_BIN="/bin/echo",
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("node-local TP4", result.stderr)
 
     def test_real_launch_replaces_node_log_and_tees_only_rank_zero(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -280,6 +357,17 @@ class Glm5MultiNodeLauncherTest(unittest.TestCase):
             result.stderr,
         )
 
+    def test_multimodal_target_inputs_can_be_enabled(self):
+        result = self._run_launcher(
+            PARTITIONED_MODEL_SWAP="false",
+            MULTIMODAL="true",
+            MEDIA_ROOT="/data/vision",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("multimodal=true, media root=/data/vision", result.stdout)
+        self.assertIn("data.multimodal=true", result.stdout)
+        self.assertIn("data.media_root=/data/vision", result.stdout)
+
     def test_non_multiple_of_four_local_shape_uses_global_tp4_mesh(self):
         result = self._run_launcher(
             NNODES=2,
@@ -329,7 +417,7 @@ class Glm5MultiNodeLauncherTest(unittest.TestCase):
             "target HSDP: DP_REPLICATE=2, DP_SHARD=2, TP=4, EP=8",
             result.stdout,
         )
-        self.assertIn("train.data_batch_size=256", result.stdout)
+        self.assertIn("train.data_batch_size=8", result.stdout)
         self.assertIn(
             "data.data_batch_cache_dir=/shared/deepspec-glm-launcher-test/"
             "data_batch_cache/"
@@ -402,7 +490,7 @@ class Glm5MultiNodeLauncherTest(unittest.TestCase):
     def test_explicit_step_limit_remains_a_diagnostic_override(self):
         result = self._run_launcher(MAX_TRAIN_STEPS=5)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("data partitions=256", result.stdout)
+        self.assertIn("data partitions=8", result.stdout)
         self.assertIn("schedule: diagnostic max steps=5", result.stdout)
         self.assertIn("train.max_train_steps=5", result.stdout)
         self.assertNotIn("train.max_train_steps=null", result.stdout)

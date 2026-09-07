@@ -573,12 +573,18 @@ def load_glm5_huggingface_checkpoint(
 
     load_started = time.perf_counter()
     if not dist.is_initialized() or dist.get_rank() == 0:
+        vision_depth = int(
+            getattr(getattr(config, "vision_config", None), "depth", 0)
+        )
+        vision_detail = (
+            "visual tower included" if vision_depth > 0 else "visual tower skipped"
+        )
         print(
-            "[deepspec-target-load] loading full-depth GLM-5 text target with FSDP2 DCP "
+            "[deepspec-target-load] loading full-depth GLM-5 target with FSDP2 DCP "
             f"(TP={planner_topology.tensor_parallel_size}, "
             f"EP={planner_topology.expert_parallel_size}, "
             f"reader={reader_kind}, reader_threads={reader_threads}; "
-            "visual tower skipped, "
+            f"{vision_detail}, "
             "lm_head handled by draft initializer)",
             flush=True,
         )

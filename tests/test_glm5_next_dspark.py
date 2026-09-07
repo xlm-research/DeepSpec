@@ -160,10 +160,12 @@ class Glm5NextDSparkTest(unittest.TestCase):
         self.assertEqual(config.train.offline_target_parallel.dp_shard, 2)
         self.assertEqual(config.train.offline_target_parallel.tp, 4)
         self.assertEqual(config.train.offline_target_parallel.ep, 8)
-        self.assertEqual(config.train.data_batch_size, 256)
+        self.assertEqual(config.train.data_batch_size, 8)
         self.assertIsNone(config.train.max_train_steps)
         self.assertFalse(config.data.online_target)
         self.assertTrue(config.data.offline_target_data_batches)
+        self.assertFalse(config.data.multimodal)
+        self.assertIsNone(config.data.media_root)
         self.assertTrue(config.data.train_data_path)
         self.assertTrue(config.data.source_jsonl_path)
         self.assertTrue(config.data.store_target_last_hidden_states)
@@ -215,6 +217,34 @@ class Glm5NextDSparkTest(unittest.TestCase):
         )
         self.assertEqual(target_name, "GLM-5.3")
         self.assertIs(target_cls, Glm5NextOnlineTarget)
+
+    def test_trainer_enables_multimodal_online_target(self):
+        trainer = object.__new__(Glm5NextDSparkTrainer)
+        trainer.args = SimpleNamespace(
+            model=SimpleNamespace(
+                target_model_name_or_path="target",
+                target_layer_ids=[2, 22, 42],
+            )
+        )
+        trainer.target_parallel = object()
+        trainer.device = torch.device("cpu")
+        trainer.checkpoint_dir_root = "/tmp/checkpoint"
+        trainer.partitioned_model_swap_enabled = True
+        trainer.multimodal_enabled = True
+
+        with patch("deepspec.modeling.target.Glm5NextOnlineTarget") as target_cls:
+            target = trainer.build_online_target()
+
+        self.assertIs(target, target_cls.return_value)
+        target_cls.assert_called_once_with(
+            model_name_or_path="target",
+            target_layer_ids=[2, 22, 42],
+            topology=trainer.target_parallel,
+            device=trainer.device,
+            rank_local_cache_dir="/tmp/checkpoint/target_rank_local",
+            require_phase_guard=True,
+            multimodal=True,
+        )
 
     def test_target_ep_matches_retained_glm_layers(self):
         target_config = AutoConfig.from_pretrained(TARGET)
@@ -796,7 +826,7 @@ class Glm5NextDSparkTest(unittest.TestCase):
             target_model_name_or_path=TARGET,
         )
 
-    def test_online_target_keeps_all_layers_and_installs_bounded_prefill(self):
+    def test_multimodal_online_target_keeps_visual_and_all_text_layers(self):
         class FakeBackbone(torch.nn.Module):
             def __init__(self, config):
                 super().__init__()
@@ -821,6 +851,7 @@ class Glm5NextDSparkTest(unittest.TestCase):
                 )
 
         target_config = AutoConfig.from_pretrained(TARGET)
+        original_vision_depth = int(target_config.vision_config.depth)
         fake_target = FakeTarget(target_config)
         topology = SimpleNamespace(
             expert_parallel_size=8,
@@ -859,11 +890,13 @@ class Glm5NextDSparkTest(unittest.TestCase):
                 topology=topology,
                 device=torch.device("cpu"),
                 rank_local_cache_dir="unused",
+                multimodal=True,
             )
 
         loaded_config = from_config.call_args.args[0]
         self.assertEqual(loaded_config.text_config.num_hidden_layers, 45)
-        self.assertEqual(loaded_config.vision_config.depth, 0)
+        self.assertEqual(loaded_config.vision_config.depth, original_vision_depth)
+        self.assertTrue(target.multimodal)
         self.assertEqual(target.target_num_hidden_layers, 45)
         self.assertEqual(target.feature_output_device, torch.device("cpu"))
         self.assertFalse(fake_target.sentinel.requires_grad)

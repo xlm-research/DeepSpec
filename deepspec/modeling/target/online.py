@@ -62,8 +62,7 @@ def _get_hook_tensor(output):
 def _run_target_forward_with_hooks(
     *,
     target_model,
-    input_ids: torch.Tensor,
-    attention_mask: torch.Tensor,
+    model_inputs,
     target_layer_ids,
     output_device: torch.device | str | None = None,
 ):
@@ -98,8 +97,7 @@ def _run_target_forward_with_hooks(
                 )
             )
         output = target_model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
+            **model_inputs,
             output_hidden_states=False,
             use_cache=False,
         )
@@ -110,6 +108,16 @@ def _run_target_forward_with_hooks(
         last_hidden = output.last_hidden_state.detach()
         if output_device is not None:
             last_hidden = last_hidden.to(device=output_device)
+        expected_sequence_length = int(model_inputs["input_ids"].shape[1])
+        if (
+            int(hidden.shape[1]) != expected_sequence_length
+            or int(last_hidden.shape[1]) != expected_sequence_length
+        ):
+            raise RuntimeError(
+                "Target hidden-state length must match processor input_ids "
+                f"length ({expected_sequence_length}), got {hidden.shape[1]} "
+                f"and {last_hidden.shape[1]}."
+            )
     finally:
         for handle in handles:
             handle.remove()
@@ -530,9 +538,17 @@ class DeepseekV4OnlineTarget:
         ):
             raise ValueError("Online target requires a right-padded attention mask.")
         model_inputs = {
-            "input_ids": batch["input_ids"][:, :sequence_length],
-            "attention_mask": attention_mask[:, :sequence_length],
+            key: value for key, value in batch.items() if key != "loss_mask"
         }
+        for key in (
+            "input_ids",
+            "attention_mask",
+            "position_ids",
+            "token_type_ids",
+            "mm_token_type_ids",
+        ):
+            if key in model_inputs:
+                model_inputs[key] = model_inputs[key][:, :sequence_length]
         with torch.no_grad():
             if self.topology.context_parallel_size > 1:
                 result = _run_target_forward_context_parallel(
@@ -545,8 +561,7 @@ class DeepseekV4OnlineTarget:
             else:
                 result = _run_target_forward_with_hooks(
                     target_model=self.model,
-                    input_ids=model_inputs["input_ids"],
-                    attention_mask=model_inputs["attention_mask"],
+                    model_inputs=model_inputs,
                     target_layer_ids=self.target_layer_ids,
                     output_device=getattr(self, "feature_output_device", None),
                 )
@@ -588,6 +603,7 @@ class Glm5NextOnlineTarget(DeepseekV4OnlineTarget):
         device,
         rank_local_cache_dir: str,
         require_phase_guard: bool = False,
+        multimodal: bool = False,
     ):
         # Import lazily: the GLM draft model reuses DeepSeek draft operations,
         # whose module imports the target package for CP helpers. Importing the
@@ -614,6 +630,7 @@ class Glm5NextOnlineTarget(DeepseekV4OnlineTarget):
         self.feature_output_device = torch.device("cpu")
         self.rank_local_cache_dir = str(rank_local_cache_dir)
         self.require_phase_guard = bool(require_phase_guard)
+        self.multimodal = bool(multimodal)
         self.execution_phase = None
         self._released_model_weakref = None
         target_config = AutoConfig.from_pretrained(self.model_name_or_path)
@@ -635,10 +652,11 @@ class Glm5NextOnlineTarget(DeepseekV4OnlineTarget):
                 f"GLM-5.3 target EP={ep_size} must divide "
                 f"n_routed_experts={text_config.n_routed_experts}."
             )
-        # Text-only training never calls the vision tower. Avoid constructing
-        # its 24 transformer blocks while retaining the checkpoint's composite
-        # model wrapper and parameter names.
-        target_config.vision_config.depth = 0
+        if not self.multimodal:
+            # Text-only training never calls the vision tower. Avoid constructing
+            # its 24 transformer blocks while retaining the checkpoint's composite
+            # model wrapper and parameter names.
+            target_config.vision_config.depth = 0
         self.target_num_hidden_layers = original_layers
 
         # Construct no checkpoint-sized tensors yet. TP/EP slicing and FSDP2
@@ -888,8 +906,7 @@ class Qwen3_8OnlineTarget(DeepseekV4OnlineTarget):
             else:
                 result = _run_target_forward_with_hooks(
                     target_model=self.model,
-                    input_ids=model_inputs["input_ids"],
-                    attention_mask=model_inputs["attention_mask"],
+                    model_inputs=model_inputs,
                     target_layer_ids=self.target_layer_ids,
                 )
 

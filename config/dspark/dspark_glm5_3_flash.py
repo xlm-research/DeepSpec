@@ -1,5 +1,6 @@
 import os
 import math
+import sys
 
 from deepspec.trainer import Glm5NextDSparkTrainer
 from deepspec.utils.constant import BASE_CKPT_DIR, BASE_TB_DIR
@@ -60,16 +61,28 @@ train = dict(
     precision="bf16",
     local_batch_size=1,
     global_batch_size=max(runtime_world_size, 8),
-    # Requested optimizer-aligned target-cache partition count. The trainer
-    # caps it at the remaining optimizer steps so short runs and resumes keep
-    # every partition non-empty.
-    data_batch_size=256,
+    # Requested optimizer-aligned target-cache partition count. With model
+    # swap, partition the entire dataset and repeat its boundaries each epoch.
+    data_batch_size=8,
     # Opt-in lifecycle that alternates the full GLM target with the complete
-    # draft training state. The launcher sets data_batch_size=null when this is
-    # enabled because max_samples defines a different partitioning contract.
+    # draft training state. The launcher uses data_batch_size by default, or
+    # clears it when PARTITION_MAX_SAMPLES selects a per-partition sample cap.
     partitioned_model_swap=dict(
         enabled=False,
         max_samples=512,
+        target_backend="native",
+        # Independent node-local TP4 vLLM processes exit before draft loading.
+        # Use TARGET_BACKEND=vllm with the FSDP launcher to enable this backend.
+        vllm=dict(
+            python_executable=sys.executable,
+            source_dir=None,
+            tensor_parallel_size=4,
+            max_num_batched_tokens=8192,
+            gpu_memory_utilization=0.8,
+            load_format="instanttensor",
+            timeout_seconds=86400,
+            raw_cache_dir=None,
+        ),
     ),
     num_train_epochs=1,
     # Derive the full schedule from the usable dataset by default. Launchers
@@ -122,6 +135,11 @@ profiling = dict(enabled=False)
 
 data = dict(
     online_target=False,
+    # Keep production text-only by default; visual debug runs opt in through
+    # MULTIMODAL=true and resolve relative media paths under media_root.
+    multimodal=False,
+    media_root=None,
+    media_uri_map=None,
     # Preserve target-first/offline semantics without materializing the full
     # dataset: generate one bounded cache partition, train it, then delete it.
     offline_target_data_batches=True,

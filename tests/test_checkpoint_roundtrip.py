@@ -8,12 +8,14 @@ import unittest
 import numpy as np
 import torch
 from torch import nn
+from torch.distributed.tensor import DTensor
 
 from deepspec.distributed.distributed_checkpoint import (
     TrainingProgress,
     load_training_checkpoint,
     save_training_checkpoint,
     write_checkpoint_metadata,
+    full_model_state_dict,
 )
 from deepspec.distributed.config import ParallelConfig
 from deepspec.distributed.fsdp import apply_fsdp2
@@ -33,6 +35,147 @@ class _Model(nn.Module):
 
 
 class DistributedCheckpointRoundTripTest(unittest.TestCase):
+    def _ep_model(self, runtime):
+        torch.manual_seed(11)
+        model = _Model().to(runtime.device)
+        model.experts = nn.Module()
+        model.experts.weight = nn.Parameter(
+            torch.full((2, 4), float(runtime.global_rank + 1), device=runtime.device)
+        )
+        model.experts._deepspec_pure_expert_parallel = True
+        model.expert_parallel_group = torch.distributed.group.WORLD
+        if runtime.device.type == "cuda":
+            config = ParallelConfig(dp_shard=2, ep=2, use_fsdp=True)
+            parallel = ParallelContext.build(config, device_type="cuda")
+            model = apply_fsdp2(model, parallel, config, param_dtype=torch.float32)
+        return model
+
+    def test_rank_local_experts_optimizer_and_rng_roundtrip(self):
+        runtime = require_torchrun(self, world_size=2)
+        model = self._ep_model(runtime)
+        optimizer = BF16Optimizer(model, 1e-3, 4, 0, 0)
+        loss = (
+            model(torch.ones(1, 4, device=runtime.device)).square().mean()
+            + model.experts.weight.square().mean()
+        )
+        loss.backward()
+        optimizer.step()
+        expected_parameters = {
+            name: p.detach().clone() for name, p in model.named_parameters()
+        }
+        expected_optimizer = copy.deepcopy(optimizer.state_dict())
+        torch.manual_seed(100 + runtime.global_rank)
+        random.seed(200 + runtime.global_rank)
+        np.random.seed(300 + runtime.global_rank)
+        rng = torch.get_rng_state().clone()
+        expected_random = torch.rand(5)
+        torch.set_rng_state(rng)
+        python_rng, numpy_rng = random.getstate(), np.random.get_state()
+        expected_python, expected_numpy = random.random(), float(np.random.random())
+        random.setstate(python_rng)
+        np.random.set_state(numpy_rng)
+        progress = TrainingProgress(
+            next_micro_step=1,
+            global_step=1,
+            epoch=0,
+            data_position=1,
+            local_batch_size=1,
+            saved_world_size=2,
+            parallel_config={"ep": 2},
+            model_config={},
+        )
+        paths = [
+            tempfile.mkdtemp(prefix="deepspec-ep-checkpoint-")
+            if runtime.global_rank == 0
+            else None
+        ]
+        torch.distributed.broadcast_object_list(paths, src=0)
+        try:
+            save_training_checkpoint(
+                checkpoint_dir=paths[0],
+                model=model,
+                optimizer_bundle=optimizer,
+                progress=progress,
+            )
+            with torch.no_grad():
+                for parameter in model.parameters():
+                    parameter.add_(7)
+            load_training_checkpoint(
+                checkpoint_dir=paths[0],
+                model=model,
+                optimizer_bundle=optimizer,
+                progress=progress,
+            )
+
+            def local(value):
+                return value.to_local() if isinstance(value, DTensor) else value
+
+            errors = [
+                float(
+                    (local(p.detach()) - local(expected_parameters[name])).abs().max()
+                )
+                for name, p in model.named_parameters()
+            ]
+            actual_optimizer = optimizer.state_dict()
+            expected_state = expected_optimizer["optimizer_state_dict"]["state"]
+            actual_state = actual_optimizer["optimizer_state_dict"]["state"]
+            for key in expected_state:
+                for name, expected in expected_state[key].items():
+                    if torch.is_tensor(expected):
+                        errors.append(
+                            float(
+                                (local(actual_state[key][name]) - local(expected))
+                                .abs()
+                                .max()
+                            )
+                        )
+            errors.append(float((torch.rand(5) - expected_random).abs().max()))
+            errors.extend(
+                [
+                    abs(random.random() - expected_python),
+                    abs(float(np.random.random()) - expected_numpy),
+                ]
+            )
+            maximum = torch.tensor(max(errors), device=runtime.device)
+            torch.distributed.all_reduce(maximum, op=torch.distributed.ReduceOp.MAX)
+            self.assertEqual(
+                maximum.item(),
+                0.0,
+                "EP weights, optimizer moments, or rank-local RNG were lost",
+            )
+            legacy = os.path.join(paths[0], "legacy")
+            torch.distributed.checkpoint.save(
+                {"model": model.state_dict()},
+                checkpoint_id=os.path.join(legacy, "distributed_checkpoint"),
+            )
+            with self.assertRaisesRegex(ValueError, "complete EP tensor"):
+                load_training_checkpoint(
+                    checkpoint_dir=legacy,
+                    model=model,
+                    optimizer_bundle=optimizer,
+                    progress=progress,
+                )
+        finally:
+            torch.distributed.barrier()
+            if runtime.global_rank == 0:
+                shutil.rmtree(paths[0])
+
+    def test_full_model_export_gathers_experts_in_ep_rank_order(self):
+        runtime = require_torchrun(self, world_size=2)
+        model = self._ep_model(runtime)
+        state = full_model_state_dict(model)
+        error = torch.zeros((), device=runtime.device)
+        if runtime.global_rank == 0:
+            actual = state["experts.weight"]
+            expected = torch.cat([torch.ones(2, 4), torch.full((2, 4), 2.0)])
+            error.fill_(
+                1
+                if actual.shape != expected.shape
+                else float((actual - expected).abs().max())
+            )
+        torch.distributed.all_reduce(error, op=torch.distributed.ReduceOp.MAX)
+        self.assertEqual(error.item(), 0.0, "HF export must contain all EP experts")
+
     @unittest.skipIf("LOCAL_RANK" in os.environ, "single-process no-dist test")
     def test_model_optimizer_scheduler_progress_and_rng(self):
         torch.manual_seed(99)

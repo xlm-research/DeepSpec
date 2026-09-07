@@ -33,22 +33,25 @@ class Glm5TrainingPartition:
 
 def compute_glm5_training_partitions(
     *,
-    max_samples: int,
+    max_samples: int | None,
     global_batch_size: int,
     gradient_accumulation_steps: int,
     micro_batches_per_epoch: int,
     max_train_steps: int,
+    data_batch_size: int | str | None = None,
 ) -> tuple[Glm5TrainingPartition, ...]:
-    """Return optimizer-aligned partitions that never cross an epoch boundary."""
+    """Partition a complete dataset epoch; max_train_steps only truncates execution."""
 
-    max_samples = int(max_samples)
+    if (max_samples is None) == (data_batch_size is None):
+        raise ValueError("Configure exactly one of max_samples and data_batch_size.")
+    max_samples = int(max_samples) if max_samples is not None else None
     global_batch_size = int(global_batch_size)
     gradient_accumulation_steps = int(gradient_accumulation_steps)
     micro_batches_per_epoch = int(micro_batches_per_epoch)
     max_train_steps = int(max_train_steps)
     if global_batch_size <= 0:
         raise ValueError("global_batch_size must be positive.")
-    if max_samples < global_batch_size:
+    if max_samples is not None and max_samples < global_batch_size:
         raise ValueError(
             "train.partitioned_model_swap.max_samples must be at least one "
             f"global batch: {max_samples} < {global_batch_size}."
@@ -66,7 +69,20 @@ def compute_glm5_training_partitions(
     if max_train_steps < 0:
         raise ValueError("max_train_steps must be non-negative.")
 
-    max_steps_per_partition = max_samples // global_batch_size
+    requested_partition_index = 0
+    if data_batch_size is not None:
+        steps_per_epoch = micro_batches_per_epoch // gradient_accumulation_steps
+        requested_count = (
+            steps_per_epoch
+            if str(data_batch_size).strip().lower() == "auto"
+            else int(data_batch_size)
+        )
+        if requested_count <= 0:
+            raise ValueError("data_batch_size must be positive or 'auto'.")
+        partition_count = min(requested_count, steps_per_epoch)
+        base_steps, extra_partitions = divmod(steps_per_epoch, partition_count)
+    else:
+        max_steps_per_partition = max_samples // global_batch_size
     total_micro_steps = max_train_steps * gradient_accumulation_steps
     partitions: list[Glm5TrainingPartition] = []
     cursor = 0
@@ -75,6 +91,15 @@ def compute_glm5_training_partitions(
         epoch_end = (epoch + 1) * micro_batches_per_epoch
         remaining_micro_steps = min(epoch_end, total_micro_steps) - cursor
         remaining_steps = remaining_micro_steps // gradient_accumulation_steps
+        if data_batch_size is not None:
+            next_partition_end_step = (
+                epoch * steps_per_epoch
+                + (requested_partition_index + 1) * base_steps
+                + min(requested_partition_index + 1, extra_partitions)
+            )
+            max_steps_per_partition = (
+                next_partition_end_step - cursor // gradient_accumulation_steps
+            )
         optimizer_steps = min(max_steps_per_partition, remaining_steps)
         if optimizer_steps <= 0:
             raise RuntimeError("Failed to make progress while planning GLM partitions.")
@@ -90,6 +115,10 @@ def compute_glm5_training_partitions(
             )
         )
         cursor = end
+        if data_batch_size is not None and (
+            cursor // gradient_accumulation_steps == next_partition_end_step
+        ):
+            requested_partition_index = (requested_partition_index + 1) % partition_count
     return tuple(partitions)
 
 
@@ -428,7 +457,9 @@ class Glm5PartitionCache:
             actual_file_size = int(os.path.getsize(path))
             if actual_file_size != int(sample["file_size"]):
                 raise ValueError(f"Cached sample size changed: {path}")
-            batch = torch.load(path, map_location="cpu", weights_only=True)
+            # Validation reads shapes/dtypes; avoid rereading multi-GiB tensor
+            # payloads at each READY/recovery check.
+            batch = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
             validation = validate_glm5_cached_batch(batch)
             if validation["tensors"] != sample["tensors"]:
                 raise ValueError(f"Cached tensor metadata changed: {path}")

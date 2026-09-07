@@ -1,4 +1,6 @@
 import gc
+from dataclasses import asdict
+from datetime import timedelta
 import json
 import os
 import random
@@ -9,7 +11,7 @@ import torch
 import torch.distributed as dist
 from torch.profiler import record_function
 
-from deepspec.data import CacheCollator, ConversationCollator
+from deepspec.data import CacheCollator
 from deepspec.data.cuda_prefetcher import move_batch_to_device
 from deepspec.data.jsonl_dataset import JsonLineDataset
 from deepspec.distributed import apply_parallelism
@@ -312,6 +314,7 @@ class Glm5NextDSparkTrainer(DeepseekV4DSparkTrainer):
                 self.checkpoint_dir_root, "target_rank_local"
             ),
             require_phase_guard=bool(self.partitioned_model_swap_enabled),
+            multimodal=bool(self.multimodal_enabled),
         )
 
     def _initialize_partitioned_model_swap(self) -> None:
@@ -347,12 +350,7 @@ class Glm5NextDSparkTrainer(DeepseekV4DSparkTrainer):
                 paths,
                 cache_dir=self.args.data.get("jsonl_index_cache_dir"),
             )
-        self.data_collator = ConversationCollator(
-            tokenizer=self.tokenizer,
-            chat_template=self.args.data.chat_template,
-            max_length=int(self.args.data.max_length),
-            min_loss_tokens=int(self.args.data.get("min_loss_tokens", 1)),
-        )
+        self.data_collator = self._build_conversation_collator()
 
         (
             self.gradient_accumulation_steps,
@@ -372,6 +370,7 @@ class Glm5NextDSparkTrainer(DeepseekV4DSparkTrainer):
         )
         self._partitions = compute_glm5_training_partitions(
             max_samples=self.partitioned_model_swap_max_samples,
+            data_batch_size=self.args.train.get("data_batch_size"),
             global_batch_size=int(self.args.train.global_batch_size),
             gradient_accumulation_steps=self.gradient_accumulation_steps,
             micro_batches_per_epoch=self.micro_batches_per_epoch,
@@ -437,6 +436,13 @@ class Glm5NextDSparkTrainer(DeepseekV4DSparkTrainer):
             "target_parallel": self.target_parallel_config.to_dict(),
         }
 
+        if self.partitioned_model_swap_max_samples is None:
+            self._partition_run_identity["data_batch_size"] = self.args.train.data_batch_size
+
+        if self.target_backend == "vllm":
+            self._initialize_vllm_partition_backend()
+            self._partition_run_identity["teacher"] = self._vllm_teacher_identity
+
         if self.target_parallel_config.tp > 1 and not self.heterogeneous_target_data_batches:
             raise ValueError(
                 "GLM target TP requires the existing heterogeneous target-data-batch "
@@ -494,7 +500,9 @@ class Glm5NextDSparkTrainer(DeepseekV4DSparkTrainer):
                 payload[0] = callback()
             except Exception as exc:
                 payload[1] = f"{type(exc).__name__}: {exc}"
-        dist.broadcast_object_list(payload, src=0)
+        dist.broadcast_object_list(
+            payload, src=0, group=getattr(self, "_partition_control_group", None)
+        )
         if payload[1] is not None:
             raise RuntimeError(f"{description} failed: {payload[1]}")
         return payload[0]
@@ -508,7 +516,9 @@ class Glm5NextDSparkTrainer(DeepseekV4DSparkTrainer):
             local_error = f"rank {self.global_rank}: {type(exc).__name__}: {exc}"
         if dist.is_initialized():
             errors = [None] * self.world_size
-            dist.all_gather_object(errors, local_error)
+            dist.all_gather_object(
+                errors, local_error, group=getattr(self, "_partition_control_group", None)
+            )
         else:
             errors = [local_error]
         failures = [error for error in errors if error is not None]
@@ -635,6 +645,13 @@ class Glm5NextDSparkTrainer(DeepseekV4DSparkTrainer):
         return checkpoint_dir
 
     def _target_shard_layout(self) -> dict:
+        if getattr(self, "target_backend", "native") == "vllm":
+            return {
+                "global_rank": self.global_rank,
+                "world_size": self.world_size,
+                "owner_ranks": self._vllm_owner_ranks,
+                "teacher": self._vllm_teacher_identity,
+            }
         return {
             "global_rank": self.global_rank,
             "world_size": self.world_size,
@@ -645,6 +662,8 @@ class Glm5NextDSparkTrainer(DeepseekV4DSparkTrainer):
         }
 
     def _generate_partition_features(self, partition, *, recovering: bool) -> dict:
+        if getattr(self, "target_backend", "native") == "vllm":
+            return self._generate_vllm_partition_features(partition, recovering=recovering)
         self._set_swap_phase("PREPARE_PARTITION")
         self._collective_action(
             "prepare incomplete partition cache",
@@ -780,6 +799,196 @@ class Glm5NextDSparkTrainer(DeepseekV4DSparkTrainer):
         self._write_partition_journal("READY", partition)
         self._ready_cache_dir = ready_dir
         self._ready_cache_manifest = manifest
+        return manifest
+
+    def _initialize_vllm_partition_backend(self):
+        from deepspec.trainer.glm5_vllm import (
+            VllmPartitionConfig,
+            rank_group,
+            teacher_identity,
+        )
+
+        if (
+            self.context_parallel_size != 1
+            or self.parallel_config.tp != 1
+            or self.data_parallel_size != self.world_size
+            or self.data_parallel_rank != self.global_rank
+        ):
+            raise ValueError(
+                "vLLM partition extraction requires draft CP=TP=1 and one data rank per GPU."
+            )
+        settings = self.args.train.partitioned_model_swap.get("vllm") or {}
+        self._vllm_config = VllmPartitionConfig(**settings)
+        local_rank = int(os.environ["LOCAL_RANK"])
+        local_size = int(os.environ["LOCAL_WORLD_SIZE"])
+        visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+        devices = (
+            visible.split(",")
+            if visible
+            else [str(i) for i in range(torch.cuda.device_count())]
+        )
+        self._vllm_owner_ranks, self._vllm_devices = rank_group(
+            global_rank=self.global_rank,
+            local_rank=local_rank,
+            local_world_size=local_size,
+            tp_size=self._vllm_config.tensor_parallel_size,
+            devices=devices,
+        )
+        # A follower can wait for hours while another process uses its GPU.
+        # Keep those waits on Gloo, with no outstanding training NCCL work.
+        self._partition_control_group = dist.new_group(
+            backend="gloo",
+            timeout=timedelta(seconds=self._vllm_config.timeout_seconds + 300),
+        )
+        self._vllm_teacher_identity = self._collective_action(
+            "inspect vLLM teacher runtime",
+            lambda: teacher_identity(
+                model_path=self.args.model.target_model_name_or_path,
+                layer_ids=list(self.args.model.target_layer_ids),
+                config=self._vllm_config,
+            ),
+        )
+        identities = [None] * self.world_size
+        dist.all_gather_object(
+            identities,
+            self._vllm_teacher_identity,
+            group=self._partition_control_group,
+        )
+        if any(identity != identities[0] for identity in identities):
+            raise ValueError(
+                "All nodes must use the same vLLM teacher weights and extraction runtime."
+            )
+
+    def _generate_vllm_partition_features(self, partition, *, recovering):
+        from deepspec.trainer.glm5_vllm import run_worker_process, write_request
+
+        self._set_swap_phase("PREPARE_PARTITION")
+        self._assert_no_draft_state()
+        incomplete, ready = self._partition_cache.partition_paths(partition)
+
+        def prepare():
+            if os.path.lexists(ready):
+                if not recovering:
+                    raise FileExistsError(f"Unexpected READY cache: {ready}")
+                self._partition_cache.validate_ready(partition)
+                return True
+            self._partition_cache.prepare_incomplete(partition, replace_matching=True)
+            return False
+
+        already_ready = self._collective_action("prepare vLLM partition cache", prepare)
+
+        def write_inputs():
+            if already_ready:
+                return
+            count = partition.end_next_micro_step - partition.start_next_micro_step
+            dataloader = BaseTrainer._build_train_dataloader(
+                self,
+                start_offset_samples=partition.start_next_micro_step,
+                num_samples=count,
+                persistent_workers=False,
+            )
+            indices = iter(dataloader.sampler)
+            iterator = iter(dataloader)
+            requests = []
+            try:
+                for offset, batch in enumerate(iterator):
+                    index = int(next(indices))
+                    if batch is None:
+                        raise ValueError(
+                            f"Dataset index {index} produced no training sample."
+                        )
+                    step = partition.start_next_micro_step + offset
+                    requests.append(
+                        write_request(
+                            incomplete,
+                            batch,
+                            logical_sample_id=step * self.data_parallel_size
+                            + self.data_parallel_rank,
+                            dataset_index=index,
+                            stream_micro_step=step,
+                        )
+                    )
+                if len(requests) != count:
+                    raise ValueError(
+                        "vLLM input stream does not match the partition boundary."
+                    )
+                atomic_write_json(
+                    os.path.join(incomplete, "vllm_requests.json"),
+                    {
+                        "requests": requests,
+                        "teacher": self._vllm_teacher_identity,
+                        "target_shard_layout": self._target_shard_layout(),
+                    },
+                )
+            finally:
+                shutdown = getattr(iterator, "_shutdown_workers", None)
+                if callable(shutdown):
+                    shutdown()
+                self.train_dataset.close()
+
+        self._collective_action("write vLLM partition inputs", write_inputs)
+        ready_by_rank = [None] * self.world_size
+        dist.all_gather_object(
+            ready_by_rank, already_ready, group=self._partition_control_group
+        )
+        self._set_swap_phase("TARGET_LOAD")
+        self._set_swap_phase("TARGET_GENERATE_FEATURES")
+
+        def generate():
+            if self.global_rank != self._vllm_owner_ranks[0]:
+                return
+            owners = [
+                rank for rank in self._vllm_owner_ranks if not ready_by_rank[rank]
+            ]
+            if not owners:
+                return
+            job_path = os.path.join(
+                self._partition_cache.rank_root,
+                f"vllm_partition_{partition.partition_id:06d}.json",
+            )
+            job = {
+                "partition": partition.identity(),
+                "cache_root": self.data_batch_cache_root,
+                "owner_ranks": owners,
+                "teacher": self._vllm_teacher_identity,
+                "model_path": self.args.model.target_model_name_or_path,
+                "max_length": int(self.args.data.max_length),
+                "config": asdict(self._vllm_config),
+            }
+            atomic_write_json(job_path, job)
+            complete_path = job_path + ".complete"
+            if os.path.exists(complete_path):
+                os.unlink(complete_path)
+            run_worker_process(
+                job_path=job_path, config=self._vllm_config, devices=self._vllm_devices
+            )
+            if load_json(complete_path) != {
+                "partition": partition.identity(),
+                "teacher": self._vllm_teacher_identity,
+            }:
+                raise ValueError(
+                    f"vLLM did not complete the requested partition: {job_path}"
+                )
+
+        # Only CPU collectives run until every independent vLLM process has exited.
+        self._collective_action("generate vLLM partition features", generate)
+        self._collective_action(
+            "validate vLLM completed features",
+            lambda: (
+                None
+                if already_ready
+                else self._partition_cache.validate_incomplete(partition)
+            ),
+        )
+        self._collective_action(
+            "commit vLLM READY features",
+            lambda: (
+                None if already_ready else self._partition_cache.commit_ready(partition)
+            ),
+        )
+        self._set_swap_phase("PARTITION_FEATURES_READY")
+        _, manifest = self._validate_ready_partition(partition)
+        self._write_partition_journal("READY", partition)
         return manifest
 
     def _validate_ready_partition(self, partition):

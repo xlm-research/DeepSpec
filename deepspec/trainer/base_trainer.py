@@ -14,6 +14,7 @@ from deepspec.data import (
     CacheCollator,
     CacheDataset,
     ConversationCollator,
+    MultimodalConversationCollator,
     validate_train_cache,
 )
 from deepspec.data.cuda_prefetcher import CUDAPrefetcher, move_batch_to_device
@@ -344,12 +345,21 @@ class BaseTrainer:
             self.args.data.get("offline_target_data_batches", False)
         )
         partitioned_model_swap = self.args.train.get("partitioned_model_swap") or {}
+        self.target_backend = str(partitioned_model_swap.get("target_backend", "native"))
+        if self.target_backend not in ("native", "vllm"):
+            raise ValueError("partitioned_model_swap.target_backend must be native or vllm.")
         self.partitioned_model_swap_enabled = bool(
             partitioned_model_swap.get("enabled", False)
         )
-        self.partitioned_model_swap_max_samples = int(
-            partitioned_model_swap.get("max_samples", 512)
+        partition_max_samples = partitioned_model_swap.get("max_samples", 512)
+        self.partitioned_model_swap_max_samples = (
+            int(partition_max_samples) if partition_max_samples is not None else None
         )
+        if self.target_backend == "vllm" and (
+            not self.partitioned_model_swap_enabled
+            or bool(self.args.data.get("multimodal", False))
+        ):
+            raise ValueError("vLLM extraction requires text-only partitioned_model_swap.")
         if self.partitioned_model_swap_enabled and not bool(
             self.supports_partitioned_model_swap
         ):
@@ -464,14 +474,19 @@ class BaseTrainer:
             )
         configured_data_batch_size = self.args.train.get("data_batch_size")
         configured_data_partitions = self.args.train.get("data_partitions")
-        if self.partitioned_model_swap_enabled and (
-            configured_data_batch_size is not None
-            or configured_data_partitions is not None
-        ):
-            raise ValueError(
-                "train.data_batch_size and train.data_partitions must both be "
-                "null when train.partitioned_model_swap.enabled=true."
-            )
+        if self.partitioned_model_swap_enabled:
+            if configured_data_partitions is not None:
+                raise ValueError(
+                    "Use train.data_batch_size for partition counts with GLM "
+                    "model swap; train.data_partitions must be null."
+                )
+            if (configured_data_batch_size is None) == (
+                self.partitioned_model_swap_max_samples is None
+            ):
+                raise ValueError(
+                    "GLM model swap requires exactly one of train.data_batch_size "
+                    "and train.partitioned_model_swap.max_samples."
+                )
         if (
             configured_data_batch_size is not None
             and configured_data_partitions is not None
@@ -622,12 +637,7 @@ class BaseTrainer:
                     paths,
                     cache_dir=self.args.data.get("jsonl_index_cache_dir"),
                 )
-            self.data_collator = ConversationCollator(
-                tokenizer=self.tokenizer,
-                chat_template=self.args.data.chat_template,
-                max_length=int(self.args.data.max_length),
-                min_loss_tokens=int(self.args.data.get("min_loss_tokens", 1)),
-            )
+            self.data_collator = self._build_conversation_collator()
         else:
             expected_context_layout = (
                 "contiguous"
@@ -946,10 +956,16 @@ class BaseTrainer:
             )
         if self.partitioned_model_swap_enabled:
             print_on_local_main("  Model lifecycle = GLM partitioned model swap")
-            print_on_local_main(
-                "  Maximum global samples per partition = "
-                f"{self.partitioned_model_swap_max_samples}"
-            )
+            if self.partitioned_model_swap_max_samples is None:
+                print_on_local_main(
+                    f"  Requested dataset partitions per epoch = {self.args.train.data_batch_size}"
+                )
+            else:
+                print_on_local_main(
+                    "  Maximum global samples per partition = "
+                    f"{self.partitioned_model_swap_max_samples}"
+                )
+            print_on_local_main(f"  Planned training partitions = {len(self._partitions)}")
             print_on_local_main(
                 f"  Transactional target cache = {self.data_batch_cache_root}"
             )
@@ -1049,11 +1065,19 @@ class BaseTrainer:
         target_config = AutoConfig.from_pretrained(
             model_args.target_model_name_or_path,
         )
-        if is_multimodal_config(target_config):
-            processor = AutoProcessor.from_pretrained(
+        data_args = getattr(self.args, "data", {})
+        self.multimodal_enabled = bool(data_args.get("multimodal", False))
+        target_is_multimodal = is_multimodal_config(target_config)
+        if self.multimodal_enabled and not target_is_multimodal:
+            raise ValueError(
+                "data.multimodal=true requires a multimodal target checkpoint."
+            )
+        self.processor = None
+        if target_is_multimodal:
+            self.processor = AutoProcessor.from_pretrained(
                 model_args.target_model_name_or_path,
             )
-            tokenizer = processor.tokenizer
+            tokenizer = self.processor.tokenizer
         else:
             tokenizer = AutoTokenizer.from_pretrained(
                 model_args.target_model_name_or_path,
@@ -1063,6 +1087,23 @@ class BaseTrainer:
             tokenizer=tokenizer,
         )
         return target_config, tokenizer
+
+    def _build_conversation_collator(self):
+        common = dict(
+            chat_template=self.args.data.chat_template,
+            max_length=int(self.args.data.max_length),
+            min_loss_tokens=int(self.args.data.get("min_loss_tokens", 1)),
+        )
+        if bool(getattr(self, "multimodal_enabled", False)):
+            if self.processor is None:
+                raise RuntimeError("Multimodal training requires a target processor.")
+            return MultimodalConversationCollator(
+                processor=self.processor,
+                media_root=self.args.data.get("media_root"),
+                media_uri_map=self.args.data.get("media_uri_map"),
+                **common,
+            )
+        return ConversationCollator(tokenizer=self.tokenizer, **common)
 
     def validate_target_tokenizer(self, *, target_config, tokenizer) -> None:
         """Run family-specific tokenizer/checkpoint compatibility checks."""
@@ -1195,33 +1236,47 @@ class BaseTrainer:
             )
         owner_global_rank = group_ranks[int(owner_index)]
         is_owner = self.global_rank == owner_global_rank
-        local_input_ids = local_batch["input_ids"]
-        shape = torch.tensor(
-            list(local_input_ids.shape) if is_owner else [0, 0],
-            dtype=torch.long,
+        metadata = [None]
+        if is_owner:
+            non_tensors = [
+                key
+                for key, value in local_batch.items()
+                if not isinstance(value, torch.Tensor)
+            ]
+            if non_tensors:
+                raise TypeError(
+                    "Target input batches must contain only tensors, got "
+                    f"non-tensor fields {non_tensors}."
+                )
+            metadata[0] = [
+                (key, tuple(value.shape), value.dtype)
+                for key, value in sorted(local_batch.items())
+            ]
+        dist.broadcast_object_list(
+            metadata,
+            src=owner_global_rank,
+            group=group,
             device=self.device,
         )
-        dist.broadcast(shape, src=owner_global_rank, group=group)
-        batch_size, sequence_length = (int(value) for value in shape.tolist())
+
+        replicated = {}
+        for key, shape, dtype in metadata[0]:
+            value = (
+                local_batch[key].contiguous()
+                if is_owner
+                else torch.empty(shape, dtype=dtype, device=self.device)
+            )
+            dist.broadcast(value, src=owner_global_rank, group=group)
+            replicated[key] = value
+
+        if "input_ids" not in replicated:
+            raise RuntimeError("Target input batch is missing input_ids.")
+        batch_size, sequence_length = replicated["input_ids"].shape
         if batch_size != 1 or sequence_length < 1:
             raise RuntimeError(
                 "Heterogeneous target data batches require one non-empty sample "
                 f"per draft rank, got shape={(batch_size, sequence_length)}."
             )
-
-        replicated = {}
-        for key in ("input_ids", "attention_mask", "loss_mask"):
-            source_value = local_batch[key]
-            if is_owner:
-                value = source_value.contiguous()
-            else:
-                value = torch.empty(
-                    (batch_size, sequence_length),
-                    dtype=source_value.dtype,
-                    device=self.device,
-                )
-            dist.broadcast(value, src=owner_global_rank, group=group)
-            replicated[key] = value
         return owner_global_rank, replicated
 
     def _cache_heterogeneous_target_data_batch(

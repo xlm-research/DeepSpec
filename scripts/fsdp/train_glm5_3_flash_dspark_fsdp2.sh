@@ -198,11 +198,16 @@ else
     target_model_cache_mode="explicit"
 fi
 target_model_cache_copy_workers="${TARGET_MODEL_CACHE_COPY_WORKERS:-8}"
+target_model_cache_lock_timeout_seconds="${TARGET_MODEL_CACHE_LOCK_TIMEOUT_SECONDS:-86400}"
 dcp_load_threads="${DEEPSPEC_DCP_LOAD_THREADS:-8}"
 target_model_cache_status="disabled"
 if [[ -n "${target_model_cache_dir}" && "${target_model_cache_dir}" != "off" ]]; then
     if [[ ! "${target_model_cache_copy_workers}" =~ ^[1-9][0-9]*$ ]]; then
         echo "TARGET_MODEL_CACHE_COPY_WORKERS must be a positive integer; got ${target_model_cache_copy_workers}." >&2
+        exit 2
+    fi
+    if [[ ! "${target_model_cache_lock_timeout_seconds}" =~ ^[1-9][0-9]*$ ]]; then
+        echo "TARGET_MODEL_CACHE_LOCK_TIMEOUT_SECONDS must be a positive integer." >&2
         exit 2
     fi
     target_model_cache_status="pending"
@@ -212,6 +217,8 @@ if [[ ! "${dcp_load_threads}" =~ ^[1-9][0-9]*$ ]]; then
     exit 2
 fi
 train_data_path="${TRAIN_DATA_PATH:-}"
+multimodal="${MULTIMODAL:-false}"
+media_root="${MEDIA_ROOT:-${repo_root}}"
 jsonl_index_cache_dir="${JSONL_INDEX_CACHE_DIR:-${output_root}/jsonl_index_cache}"
 data_batch_cache_dir="${DATA_BATCH_CACHE_DIR:-}"
 max_length="${MAX_LENGTH:-131072}"
@@ -219,9 +226,19 @@ num_anchors="${NUM_ANCHORS:-512}"
 learning_rate="${LEARNING_RATE:-0.00001}"
 num_train_epochs="${NUM_TRAIN_EPOCHS:-1}"
 max_train_steps="${MAX_TRAIN_STEPS:-}"
-data_batch_size="${DATA_BATCH_SIZE:-256}"
-partitioned_model_swap="${PARTITIONED_MODEL_SWAP:-false}"
-partition_max_samples="${PARTITION_MAX_SAMPLES:-512}"
+data_batch_size="${DATA_BATCH_SIZE:-8}"
+partitioned_model_swap="${PARTITIONED_MODEL_SWAP:-true}"
+partition_max_samples="${PARTITION_MAX_SAMPLES:-null}"
+target_backend="${TARGET_BACKEND:-vllm}"
+vllm_python_bin="${VLLM_PYTHON_BIN:-${python_bin}}"
+vllm_source_dir="${VLLM_SOURCE_DIR:-null}"
+vllm_max_num_batched_tokens="${VLLM_MAX_NUM_BATCHED_TOKENS:-8192}"
+vllm_gpu_memory_utilization="${VLLM_GPU_MEMORY_UTILIZATION:-0.8}"
+vllm_load_format="${VLLM_LOAD_FORMAT:-instanttensor}"
+vllm_timeout_seconds="${VLLM_TIMEOUT_SECONDS:-86400}"
+# The quick launcher overrides this with its AFS output directory; the worker
+# retries lock contention there until the asynchronous writer has finished.
+vllm_raw_cache_dir="${VLLM_RAW_CACHE_DIR:-/tmp/deepspec-vllm-raw}"
 local_batch_size="${LOCAL_BATCH_SIZE:-1}"
 save_steps="${SAVE_STEPS:-3000}"
 save_checkpoints="${SAVE_CHECKPOINTS:-true}"
@@ -388,13 +405,18 @@ if [[ -z "${data_batch_cache_dir}" ]]; then
 fi
 
 global_batch_size="${GLOBAL_BATCH_SIZE:-${train_world_size}}"
-for positive_var in max_length num_train_epochs local_batch_size global_batch_size save_steps partition_max_samples logging_steps; do
+for positive_var in max_length num_train_epochs local_batch_size global_batch_size save_steps logging_steps; do
     positive_value=${!positive_var}
     if [[ ! "${positive_value}" =~ ^[1-9][0-9]*$ ]]; then
         echo "${positive_var} must be a positive integer; got ${positive_value}." >&2
         exit 2
     fi
 done
+if [[ "${partition_max_samples}" != "null" ]] \
+    && [[ ! "${partition_max_samples}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "PARTITION_MAX_SAMPLES must be 'null' or a positive integer." >&2
+    exit 2
+fi
 if [[ "${data_batch_size}" != "auto" ]] \
     && [[ ! "${data_batch_size}" =~ ^[1-9][0-9]*$ ]]; then
     echo "DATA_BATCH_SIZE must be 'auto' or a positive integer." >&2
@@ -422,7 +444,7 @@ if ((global_batch_size % (train_world_size * local_batch_size) != 0)); then
     echo "GLOBAL_BATCH_SIZE must be divisible by TRAIN_WORLD_SIZE*LOCAL_BATCH_SIZE=$((train_world_size * local_batch_size))." >&2
     exit 2
 fi
-for boolean_var in dry_run save_checkpoints torchrun_per_rank_logs partitioned_model_swap; do
+for boolean_var in dry_run save_checkpoints torchrun_per_rank_logs partitioned_model_swap multimodal; do
     boolean_value=${!boolean_var}
     if [[ "${boolean_value}" != "true" && "${boolean_value}" != "false" ]]; then
         echo "${boolean_var} must be true or false." >&2
@@ -434,13 +456,41 @@ if [[ "${partitioned_model_swap}" == "true" ]]; then
         echo "PARTITIONED_MODEL_SWAP=true requires SAVE_CHECKPOINTS=true." >&2
         exit 2
     fi
-    if ((partition_max_samples < global_batch_size)); then
-        echo "PARTITION_MAX_SAMPLES must be at least GLOBAL_BATCH_SIZE=${global_batch_size}." >&2
-        exit 2
+    if [[ "${partition_max_samples}" != "null" ]]; then
+        if ((partition_max_samples < global_batch_size)); then
+            echo "PARTITION_MAX_SAMPLES must be at least GLOBAL_BATCH_SIZE=${global_batch_size}." >&2
+            exit 2
+        fi
+        configured_data_batch_size="null"
+    else
+        configured_data_batch_size="${data_batch_size}"
     fi
-    configured_data_batch_size="null"
 else
     configured_data_batch_size="${data_batch_size}"
+fi
+if [[ "${target_backend}" != "native" && "${target_backend}" != "vllm" ]]; then
+    echo "TARGET_BACKEND must be native or vllm." >&2
+    exit 2
+fi
+if [[ "${target_backend}" == "vllm" ]]; then
+    if [[ "${partitioned_model_swap}" != "true" || "${multimodal}" != "false" ]]; then
+        echo "TARGET_BACKEND=vllm requires PARTITIONED_MODEL_SWAP=true and MULTIMODAL=false." >&2
+        exit 2
+    fi
+    if ((nproc_per_node % 4 != 0)); then
+        echo "TARGET_BACKEND=vllm requires NPROC_PER_NODE divisible by 4 for node-local TP4." >&2
+        exit 2
+    fi
+    if ! vllm_python_bin=$(command -v "${vllm_python_bin}"); then
+        echo "VLLM_PYTHON_BIN is not available on PATH." >&2
+        exit 2
+    fi
+    for positive_var in vllm_max_num_batched_tokens vllm_timeout_seconds; do
+        if [[ ! "${!positive_var}" =~ ^[1-9][0-9]*$ ]]; then
+            echo "${positive_var} must be a positive integer." >&2
+            exit 2
+        fi
+    done
 fi
 if [[ ! -d "${target_model_source_path}" ]]; then
     echo "Target model directory does not exist: ${target_model_source_path}" >&2
@@ -470,6 +520,29 @@ checkpoint_fingerprint() {
         find . -maxdepth 1 -type f -name 'model-*-of-00062.safetensors' \
             -printf '%f %s\n' | LC_ALL=C sort
     ) | sha256sum | cut -d' ' -f1
+}
+
+lock_target_model_cache() {
+    local lock_fd=$1
+    local deadline=$((SECONDS + target_model_cache_lock_timeout_seconds))
+    local status
+    # AFS can return EAGAIN even for a blocking flock (including flock -w).
+    # Exit code 75 identifies contention; other lock errors remain fatal.
+    while true; do
+        if flock -x -n -E 75 "${lock_fd}"; then
+            return 0
+        else
+            status=$?
+        fi
+        if ((status != 75)); then
+            return "${status}"
+        fi
+        if ((SECONDS >= deadline)); then
+            echo "[deepspec-model-cache] timed out waiting for cache lock in ${target_model_cache_dir}" >&2
+            return 1
+        fi
+        sleep 1
+    done
 }
 
 stage_target_model_checkpoint() {
@@ -511,7 +584,7 @@ stage_target_model_checkpoint() {
         echo "[deepspec-model-cache] cannot open lock ${lock_path}" >&2
         return 1
     fi
-    if ! flock -x "${lock_fd}"; then
+    if ! lock_target_model_cache "${lock_fd}"; then
         echo "[deepspec-model-cache] cannot lock ${lock_path}" >&2
         exec {lock_fd}>&-
         return 1
@@ -668,8 +741,9 @@ echo "  scheduler WORLD_SIZE=${scheduler_world_size:-<unset>} (${scheduler_world
 echo "  topology source=${topology_source}"
 echo "  draft HSDP: DP_REPLICATE=${dp_replicate}, DP_SHARD=${dp_shard}, EP=${draft_ep}"
 echo "  target HSDP: DP_REPLICATE=${target_dp_replicate}, DP_SHARD=${target_dp_shard}, TP=4, EP=${target_ep}"
-echo "  batch: local=${local_batch_size}, global=${global_batch_size}, data partitions=${data_batch_size}"
+echo "  batch: local=${local_batch_size}, global=${global_batch_size}, data partitions=${configured_data_batch_size}"
 echo "  partitioned model swap=${partitioned_model_swap}, max global samples=${partition_max_samples}"
+echo "  target backend=${target_backend}; vLLM uses independent node-local TP4 replicas"
 if [[ -n "${max_train_steps}" ]]; then
     echo "  schedule: diagnostic max steps=${max_train_steps}"
 else
@@ -682,6 +756,7 @@ echo "  target model effective path=${target_model_path}"
 echo "  target model cache=${target_model_cache_status} (${target_model_cache_dir:-off}, copy workers=${target_model_cache_copy_workers})"
 echo "  target DCP reader threads=${dcp_load_threads}"
 echo "  training data=${train_data_path}"
+echo "  multimodal=${multimodal}, media root=${media_root}"
 echo "  launcher=${python_bin} -m torch.distributed.run"
 if [[ "${dry_run}" != "true" ]]; then
     echo "  node log=${node_log}"
@@ -732,11 +807,13 @@ fi
     --master_addr "${master_addr}" \
     --master_port "${master_port}" \
     "${torchrun_log_args[@]}" \
-    train.py \
+    "${TRAIN_ENTRYPOINT:-train.py}" \
     --config config/dspark/dspark_glm5_3_flash.py \
     --opts "model.target_model_name_or_path=${target_model_path}" \
     --opts "data.train_data_path=${train_data_path}" \
     --opts "data.source_jsonl_path=${train_data_path}" \
+    --opts "data.multimodal=${multimodal}" \
+    --opts "data.media_root=${media_root}" \
     --opts "data.jsonl_index_cache_dir=${jsonl_index_cache_dir}" \
     --opts "data.data_batch_cache_dir=${data_batch_cache_dir}" \
     --opts "data.store_target_last_hidden_states=true" \
@@ -748,6 +825,14 @@ fi
     --opts "train.data_batch_size=${configured_data_batch_size}" \
     --opts "train.partitioned_model_swap.enabled=${partitioned_model_swap}" \
     --opts "train.partitioned_model_swap.max_samples=${partition_max_samples}" \
+    --opts "train.partitioned_model_swap.target_backend=${target_backend}" \
+    --opts "train.partitioned_model_swap.vllm.python_executable=${vllm_python_bin}" \
+    --opts "train.partitioned_model_swap.vllm.source_dir=${vllm_source_dir}" \
+    --opts "train.partitioned_model_swap.vllm.max_num_batched_tokens=${vllm_max_num_batched_tokens}" \
+    --opts "train.partitioned_model_swap.vllm.gpu_memory_utilization=${vllm_gpu_memory_utilization}" \
+    --opts "train.partitioned_model_swap.vllm.load_format=${vllm_load_format}" \
+    --opts "train.partitioned_model_swap.vllm.timeout_seconds=${vllm_timeout_seconds}" \
+    --opts "train.partitioned_model_swap.vllm.raw_cache_dir=${vllm_raw_cache_dir}" \
     "${train_schedule_args[@]}" \
     --opts "train.parallel.dp_replicate=${dp_replicate}" \
     --opts "train.parallel.dp_shard=${dp_shard}" \

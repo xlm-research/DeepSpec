@@ -288,11 +288,16 @@ def _bounded_linear_attention_forward(
     attention_mask: torch.Tensor | None = None,
     **kwargs,
 ):
-    """Run full-prefill GLM KDA without sequence-sized chunk workspace."""
+    """Run bounded KDA prefill, optionally seeding native cached decoding."""
 
-    if cache_params is not None:
-        raise NotImplementedError(
-            "Bounded GLM-5.3 target KDA supports full prefill only."
+    if cache_params is not None and cache_params.has_previous_state(self.layer_idx):
+        if hidden_states.shape[1] != 1:
+            raise NotImplementedError("GLM cached continuation requires one token.")
+        return self._deepspec_original_forward(
+            hidden_states,
+            cache_params=cache_params,
+            attention_mask=attention_mask,
+            **kwargs,
         )
     _require_full_prefill_mask(attention_mask)
     batch_size, sequence_length = hidden_states.shape[:2]
@@ -310,6 +315,10 @@ def _bounded_linear_attention_forward(
         ],
         dim=-1,
     ).transpose(1, 2)
+    if cache_params is not None:
+        mixed_qkv = cache_params.update_conv_state(
+            mixed_qkv, self.layer_idx, conv_kernel_size=self.conv_kernel_size
+        )
     mixed_qkv = _causal_conv1d_prefill(
         mixed_qkv,
         weight=self.conv1d.weight.squeeze(1),
@@ -328,14 +337,17 @@ def _bounded_linear_attention_forward(
     value = value.view(hidden_shape)
     gate_decay = self.forget_gate(hidden_states)
     beta = torch.sigmoid(self.b_proj(hidden_states))
-    core_output, _ = _bounded_chunk_kimi_delta_attention(
+    core_output, recurrent_state = _bounded_chunk_kimi_delta_attention(
         query,
         key,
         value,
         g=gate_decay,
         beta=beta,
         use_qk_l2norm_in_kernel=True,
+        output_final_state=cache_params is not None,
     )
+    if cache_params is not None:
+        cache_params.update_recurrent_state(recurrent_state.float(), self.layer_idx)
     output_gate = self.g_b_proj(self.g_a_proj(hidden_states)).view(
         hidden_shape
     )
@@ -357,9 +369,14 @@ def _bounded_indexer_forward(
 ) -> torch.LongTensor:
     """Run exact GLM k-pool selection without a quadratic score tensor."""
 
-    if past_key_values is not None:
-        raise NotImplementedError(
-            "The bounded GLM-5.3 target indexer supports full prefill only."
+    if past_key_values is not None and past_key_values.layers[
+        self.layer_idx
+    ].is_indexer_initialized:
+        return self._deepspec_original_forward(
+            hidden_states=hidden_states,
+            q_resid=q_resid,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
         )
     _require_full_prefill_mask(attention_mask)
     batch_size, sequence_length = hidden_states.shape[:2]
@@ -376,6 +393,8 @@ def _bounded_indexer_forward(
         device=keys.device,
     )
     packed_states = torch.cat([keys, gate_scores, valid_channel], dim=-1)
+    if past_key_values is not None:
+        packed_states = past_key_values.update_indexer(packed_states, self.layer_idx)
     pool_keys, pool_indices, pool_valid = self.get_pooled_states(
         packed_states=packed_states
     )
@@ -710,10 +729,15 @@ def _bounded_sparse_attention_forward(
 ):
     """Run selected-token MLA attention without constructing a dense mask."""
 
-    del kwargs
-    if past_key_values is not None:
-        raise NotImplementedError(
-            "Bounded GLM-5.3 target DSA supports full prefill only."
+    if past_key_values is not None and past_key_values.get_seq_length(self.layer_idx):
+        if hidden_states.shape[1] != 1:
+            raise NotImplementedError("GLM cached continuation requires one token.")
+        return self._deepspec_original_forward(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            prev_topk_indices=prev_topk_indices,
+            **kwargs,
         )
     _require_full_prefill_mask(attention_mask)
     batch_size, sequence_length = hidden_states.shape[:2]
@@ -737,12 +761,18 @@ def _bounded_sparse_attention_forward(
         sequence_length,
         self.qk_rope_head_dim,
     )
+    if past_key_values is not None:
+        # Keep the expanded native K/V layout so the existing Transformers
+        # single-token decode path can continue from this bounded prefill.
+        cached_keys, cached_values = self.expand_kv(kv_pass, k_rot)
+        past_key_values.update(cached_keys, cached_values, self.layer_idx)
+        del cached_keys, cached_values
     if self.indexer is not None:
         topk_indices = self.indexer(
             hidden_states=hidden_states,
             q_resid=q_resid,
             attention_mask=attention_mask,
-            past_key_values=None,
+            past_key_values=past_key_values,
         )
     else:
         if prev_topk_indices is None:

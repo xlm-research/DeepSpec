@@ -17,6 +17,8 @@ from torch.distributed.checkpoint.state_dict import (
     get_state_dict,
     set_state_dict,
 )
+from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.tensor import DTensor, Shard
 
 
 DISTRIBUTED_CHECKPOINT_DIR_NAME = "distributed_checkpoint"
@@ -85,9 +87,7 @@ class TrainingProgress:
                 partition_start_next_micro_step=int(
                     self.partition_start_next_micro_step
                 ),
-                partition_end_next_micro_step=int(
-                    self.partition_end_next_micro_step
-                ),
+                partition_end_next_micro_step=int(self.partition_end_next_micro_step),
                 checkpointed=bool(self.checkpointed),
             )
         return state
@@ -139,6 +139,61 @@ def _model_config_dict(model) -> dict[str, Any]:
     return {"repr": repr(config)}
 
 
+def _ep_checkpoint_layout(model):
+    """Describe plain rank-local experts without changing training Parameters."""
+    expert_ids = {
+        id(parameter)
+        for module in model.modules()
+        if getattr(module, "_deepspec_pure_expert_parallel", False)
+        for parameter in module.parameters()
+        if not isinstance(parameter, DTensor)
+    }
+    parameters = {
+        name.replace("_orig_mod.", ""): parameter
+        for name, parameter in model.named_parameters()
+        if id(parameter) in expert_ids
+    }
+    if not parameters:
+        return parameters, None
+    group = getattr(model, "expert_parallel_group", None)
+    if group is None or not dist.is_initialized():
+        raise ValueError(
+            "Saving rank-local experts requires the model's EP process group."
+        )
+    mesh = DeviceMesh.from_group(
+        group,
+        device_type=next(iter(parameters.values())).device.type,
+        mesh_dim_names=("ep",),
+    )
+    return parameters, mesh
+
+
+def _ep_tensor_view(tensor, mesh):
+    return DTensor.from_local(tensor, mesh, [Shard(0)], run_check=False)
+
+
+def _wrap_ep_checkpoint_state(model_state, optimizer_state, parameters, mesh):
+    # DCP deduplicates plain tensors across ranks. These views supply global
+    # expert dimensions and shard offsets, also deduplicating true DP replicas.
+    for name, parameter in parameters.items():
+        model_state[name] = _ep_tensor_view(model_state[name], mesh)
+        for key, value in optimizer_state["state"].get(name, {}).items():
+            if torch.is_tensor(value) and value.shape == parameter.shape:
+                optimizer_state["state"][name][key] = _ep_tensor_view(value, mesh)
+
+
+def _unwrap_ep_checkpoint_state(model_state, optimizer_state, parameters):
+    for name in parameters:
+        model_state[name] = model_state[name].to_local()
+        for key, value in optimizer_state["state"].get(name, {}).items():
+            if isinstance(value, DTensor):
+                optimizer_state["state"][name][key] = value.to_local()
+
+
+def _rank_training_key():
+    return f"training_rank_{dist.get_rank() if dist.is_initialized() else 0}"
+
+
 def save_training_checkpoint(
     *,
     checkpoint_dir: str,
@@ -151,11 +206,14 @@ def save_training_checkpoint(
         model,
         optimizer_bundle.optimizer,
     )
+    ep_parameters, ep_mesh = _ep_checkpoint_layout(model)
+    _wrap_ep_checkpoint_state(model_state, optimizer_state, ep_parameters, ep_mesh)
     state = {
         "model": model_state,
         "optimizer": optimizer_state,
         "scheduler": _StatefulAdapter(optimizer_bundle.scheduler),
         "training": progress,
+        _rank_training_key(): progress,
     }
     distributed_checkpoint.save(state, checkpoint_id=path)
 
@@ -175,16 +233,37 @@ def load_training_checkpoint(
         model,
         optimizer_bundle.optimizer,
     )
+    ep_parameters, ep_mesh = _ep_checkpoint_layout(model)
+    _wrap_ep_checkpoint_state(model_state, optimizer_state, ep_parameters, ep_mesh)
+    metadata = distributed_checkpoint.FileSystemReader(
+        distributed_checkpoint_path(checkpoint_dir)
+    ).read_metadata()
+    for name in ep_parameters:
+        saved = metadata.state_dict_metadata.get(f"model.{name}")
+        if saved is None or tuple(getattr(saved, "size", ())) != tuple(
+            model_state[name].shape
+        ):
+            raise ValueError(
+                f"Checkpoint lacks the complete EP tensor {name}; legacy plain-tensor "
+                "checkpoints lost expert shards and cannot safely resume EP training."
+            )
+    rank_key = _rank_training_key()
+    training_key = (
+        rank_key
+        if f"{rank_key}.torch_rng" in metadata.state_dict_metadata
+        else "training"
+    )
     state = {
         "model": model_state,
         "optimizer": optimizer_state,
         "scheduler": _StatefulAdapter(optimizer_bundle.scheduler),
-        "training": progress,
+        training_key: progress,
     }
     distributed_checkpoint.load(
         state,
         checkpoint_id=distributed_checkpoint_path(checkpoint_dir),
     )
+    _unwrap_ep_checkpoint_state(model_state, optimizer_state, ep_parameters)
     set_state_dict(
         model,
         optimizer_bundle.optimizer,
@@ -199,10 +278,17 @@ def load_training_checkpoint(
 def full_model_state_dict(model) -> dict[str, torch.Tensor]:
     """Collect a CPU full state for the backward-compatible HF export."""
 
-    return get_model_state_dict(
+    state = get_model_state_dict(
         model,
         options=StateDictOptions(full_state_dict=True, cpu_offload=True),
     )
+    parameters, mesh = _ep_checkpoint_layout(model)
+    for name, parameter in parameters.items():
+        full = _ep_tensor_view(parameter.detach(), mesh).full_tensor()
+        if state:
+            state[name] = full.cpu()
+        del full
+    return state
 
 
 def write_checkpoint_metadata(
@@ -214,7 +300,7 @@ def write_checkpoint_metadata(
         return
     metadata = {
         "format": "torch.distributed.checkpoint",
-        "version": 1,
+        "version": 2,
         "next_micro_step": progress.next_micro_step,
         "global_step": progress.global_step,
         "epoch": progress.epoch,
@@ -229,9 +315,7 @@ def write_checkpoint_metadata(
             partition_start_next_micro_step=int(
                 progress.partition_start_next_micro_step
             ),
-            partition_end_next_micro_step=int(
-                progress.partition_end_next_micro_step
-            ),
+            partition_end_next_micro_step=int(progress.partition_end_next_micro_step),
             checkpointed=bool(progress.checkpointed),
         )
     path = os.path.join(checkpoint_dir, "distributed_checkpoint_metadata.json")
