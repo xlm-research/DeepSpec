@@ -268,7 +268,8 @@ if [[ -z "${train_data_path}" ]]; then
     if ((nnodes > 1 || train_world_size > 8)); then
         train_data_path="${repo_root}/train_data/spec_o3_coldstartsft.repeat60.deepspec.jsonl"
     else
-        train_data_path="${repo_root}/train_data/spec_o3_coldstartsft.first8.repeat1.deepspec.jsonl"
+        #train_data_path="${repo_root}/train_data/spec_o3_coldstartsft.first8.repeat1.deepspec.jsonl"
+        train_data_path="${repo_root}/train_data/spec_o3_coldstartsft.repeat60.deepspec.jsonl"
     fi
 fi
 if [[ -n "${scheduler_world_size}" ]]; then
