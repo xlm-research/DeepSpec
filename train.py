@@ -10,11 +10,9 @@ import torch.distributed as dist
 from torch.distributed.elastic.multiprocessing.errors import record
 from deepspec.utils import (
     CustomJSONEncoder,
-    get_git_diff,
     load_config,
     parse_opts_to_config,
     seed_all,
-    get_git_sha,
 )
 
 os.environ['USE_TORCH']='true'
@@ -112,9 +110,6 @@ def main(local_rank):
 
 
 if __name__ == "__main__":
-    if os.path.exists(".git") and int(os.environ.get("RANK", "0")) == 0:
-        print("git status:", "\n\n".join(get_git_sha(detail_info=True)))
-        print("git diff:", get_git_diff())
     if "LOCAL_RANK" in os.environ:
         # Standard torchrun contract: one Python process per worker.
         main(int(os.environ["LOCAL_RANK"]))

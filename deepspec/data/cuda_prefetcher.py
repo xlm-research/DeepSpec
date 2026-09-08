@@ -111,3 +111,19 @@ class CUDAPrefetcher:
 
     def __len__(self):
         return len(self.dataloader)
+
+    def close(self):
+        thread = getattr(self, "_thread", None)
+        if thread is not None:
+            thread.join()
+            self._thread = None
+        self.stream.synchronize()
+        self._gpu_batch = None
+        iterator = getattr(self, "_iter", None)
+        shutdown_workers = getattr(iterator, "_shutdown_workers", None)
+        if callable(shutdown_workers):
+            shutdown_workers()
+        close_loader = getattr(self.dataloader, "close", None)
+        if callable(close_loader):
+            close_loader()
+        self._iter = None

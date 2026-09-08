@@ -75,7 +75,7 @@ def _parallelize_linear_attention(attention, *, topology) -> None:
     attention.conv_dim //= size
 
 
-def _parallelize_sparse_attention(attention, *, topology) -> None:
+def _parallelize_draft_sparse_attention(attention, *, topology) -> None:
     size = int(topology.tensor_parallel_size)
     if size == 1:
         return
@@ -101,11 +101,40 @@ def _parallelize_sparse_attention(attention, *, topology) -> None:
     )
 
 
+def _parallelize_target_sparse_attention(attention, *, topology) -> None:
+    """Shard GLM's MLA query/KV heads while keeping its indexer replicated."""
+
+    size = int(topology.tensor_parallel_size)
+    if size == 1:
+        return
+    rank = int(topology.tensor_parallel_rank)
+    group = topology.tensor_parallel_group
+    local_heads = _require_divisible(
+        int(attention.num_heads), size, "num_attention_heads"
+    )
+    _column_parallel_linear(
+        attention.q_b_proj, group=group, rank=rank, size=size
+    )
+    _column_parallel_linear(
+        attention.kv_b_proj, group=group, rank=rank, size=size
+    )
+    _row_parallel_linear(
+        attention.o_proj,
+        group=group,
+        rank=rank,
+        size=size,
+        split_input=False,
+    )
+    attention.num_heads = local_heads
+
+
 def _parallelize_attention(attention, *, topology) -> None:
-    if hasattr(attention, "q_proj"):
-        _parallelize_linear_attention(attention, topology=topology)
+    if hasattr(attention, "kv_b_proj"):
+        _parallelize_target_sparse_attention(attention, topology=topology)
+    elif hasattr(attention, "kv_proj"):
+        _parallelize_draft_sparse_attention(attention, topology=topology)
     else:
-        _parallelize_sparse_attention(attention, topology=topology)
+        _parallelize_linear_attention(attention, topology=topology)
 
 
 def parallelize_glm5_next_model(model, *, topology, draft: bool = False):
