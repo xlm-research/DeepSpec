@@ -2,6 +2,7 @@ import math
 import os
 import json
 import shutil
+import time
 
 import torch
 import torch.distributed as dist
@@ -268,6 +269,25 @@ def _compute_samples_per_epoch(*, dataset_size: int, global_batch_size: int) -> 
 def _release_target_features(batch) -> None:
     batch.pop("target_hidden_states", None)
     batch.pop("target_last_hidden_states", None)
+
+
+def _format_duration(seconds: float | int | None) -> str:
+    if seconds is None:
+        return "unknown"
+    seconds = max(0, int(seconds))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours:d}h{minutes:02d}m{secs:02d}s"
+    if minutes:
+        return f"{minutes:d}m{secs:02d}s"
+    return f"{secs:d}s"
+
+
+def _format_progress_rate(count: int, elapsed: float) -> str:
+    if elapsed <= 0 or count <= 0:
+        return "unknown"
+    return f"{count / elapsed:.2f}/s"
 
 
 def _compute_training_schedule(
@@ -1182,6 +1202,7 @@ class BaseTrainer:
         data_batch_index: int,
         processed_samples: int,
         total_samples: int,
+        started_at: float | None = None,
     ) -> None:
         """Bound rank skew while a large target-cache partition is produced."""
 
@@ -1194,10 +1215,23 @@ class BaseTrainer:
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
         dist.barrier()
+        elapsed = None if started_at is None else time.monotonic() - started_at
+        rate = "unknown" if elapsed is None else _format_progress_rate(
+            processed_samples,
+            elapsed,
+        )
+        if elapsed is not None and processed_samples > 0:
+            remaining = max(0, total_samples - processed_samples)
+            eta = remaining / max(processed_samples / max(elapsed, 1e-9), 1e-9)
+        else:
+            eta = None
+        percent = 100.0 * processed_samples / max(total_samples, 1)
         print_on_global_main(
             f"Data batch {data_batch_index}/"
             f"{len(self.data_batch_micro_batches)} target inference progress: "
-            f"{processed_samples}/{total_samples} local samples cached."
+            f"{processed_samples}/{total_samples} local samples cached "
+            f"({percent:.1f}%); elapsed={_format_duration(elapsed)}, "
+            f"eta={_format_duration(eta)}, rate={rate}."
         )
 
     def iter_training_batches(self, batches):
@@ -1206,6 +1240,21 @@ class BaseTrainer:
             return
 
         batches = iter(batches)
+        total_data_batches = len(self.data_batch_micro_batches)
+        total_remaining_micro_batches = sum(self.data_batch_micro_batches)
+        run_started_at = time.monotonic()
+        target_mode = (
+            "bounded offline"
+            if self.offline_target_data_batches_enabled
+            else "online"
+        )
+        print_on_global_main(
+            f"Target data-batch progress enabled: mode={target_mode}, "
+            f"partitions={total_data_batches}, "
+            f"remaining_local_micro_batches={total_remaining_micro_batches}, "
+            f"start_micro_step={self.next_micro_step}, "
+            f"start_global_step={self.global_step}."
+        )
         for data_batch_index, micro_batch_count in enumerate(
             self.data_batch_micro_batches,
             start=1,
@@ -1213,12 +1262,25 @@ class BaseTrainer:
             cached_paths = []
             self._active_data_batch_cache = cached_paths
             self._data_batch_phase = "target_inference"
-            if dist.is_initialized():
-                print_on_global_main(
-                    f"Data batch {data_batch_index}/"
-                    f"{len(self.data_batch_micro_batches)}: "
-                    "starting isolated target inference; draft training is idle."
-                )
+            data_batch_started_at = time.monotonic()
+            target_started_at = data_batch_started_at
+            optimizer_steps = self.optimizer_steps_per_data_batch[
+                data_batch_index - 1
+            ]
+            global_samples = (
+                micro_batch_count
+                * self.data_parallel_size
+                * int(self.args.train.local_batch_size)
+            )
+            print_on_global_main(
+                f"Data batch {data_batch_index}/{total_data_batches}: "
+                "starting isolated target inference; draft training is idle; "
+                f"local_micro_batches={micro_batch_count}, "
+                f"global_samples={global_samples}, "
+                f"optimizer_steps={optimizer_steps}, "
+                f"global_step={self.global_step}, "
+                f"cache_root={self.data_batch_cache_root}."
+            )
             if getattr(self, "heterogeneous_target_data_batches", False):
                 self._cache_heterogeneous_target_data_batch(
                     batches,
@@ -1254,6 +1316,7 @@ class BaseTrainer:
                         data_batch_index=data_batch_index,
                         processed_samples=sample_index + 1,
                         total_samples=micro_batch_count,
+                        started_at=target_started_at,
                     )
 
             if not cached_paths:
@@ -1277,9 +1340,11 @@ class BaseTrainer:
                     f"Target data batch {data_batch_index} ready: "
                     f"global_samples={global_samples}; "
                     "all ranks finished inference and cached it on disk; "
-                    "starting isolated draft training."
+                    "starting isolated draft training; "
+                    f"target_elapsed={_format_duration(time.monotonic() - target_started_at)}."
                 )
             self._data_batch_phase = "draft_training"
+            draft_started_at = time.monotonic()
             for path_index, path in enumerate(cached_paths):
                 with record_function("deepspec::target_cache_disk_read"):
                     cached_batch = torch.load(
@@ -1294,6 +1359,38 @@ class BaseTrainer:
                 )
                 yield gpu_batch
                 self._data_batch_end_after_current = False
+                trained_local_micro_batches = path_index + 1
+                if (
+                    trained_local_micro_batches == len(cached_paths)
+                    or trained_local_micro_batches % self.gradient_accumulation_steps == 0
+                ):
+                    elapsed = time.monotonic() - draft_started_at
+                    rate = _format_progress_rate(
+                        trained_local_micro_batches,
+                        elapsed,
+                    )
+                    if trained_local_micro_batches > 0:
+                        remaining = len(cached_paths) - trained_local_micro_batches
+                        eta = remaining / max(
+                            trained_local_micro_batches / max(elapsed, 1e-9),
+                            1e-9,
+                        )
+                    else:
+                        eta = None
+                    percent = (
+                        100.0
+                        * trained_local_micro_batches
+                        / max(len(cached_paths), 1)
+                    )
+                    print_on_global_main(
+                        f"Data batch {data_batch_index}/{total_data_batches} "
+                        "draft training progress: "
+                        f"{trained_local_micro_batches}/{len(cached_paths)} "
+                        f"local micro-batches ({percent:.1f}%); "
+                        f"global_step={self.global_step}/{self.max_train_steps}; "
+                        f"elapsed={_format_duration(elapsed)}, "
+                        f"eta={_format_duration(eta)}, rate={rate}."
+                    )
                 del gpu_batch
 
             # A rank may delete the block only after every rank has completed
@@ -1311,7 +1408,9 @@ class BaseTrainer:
             if dist.is_initialized():
                 dist.barrier()
                 print_on_global_main(
-                    f"Data batch {data_batch_index} draft training finished; "
+                    f"Data batch {data_batch_index}/{total_data_batches} finished; "
+                    f"batch_elapsed={_format_duration(time.monotonic() - data_batch_started_at)}, "
+                    f"total_elapsed={_format_duration(time.monotonic() - run_started_at)}; "
                     "deleted its transient disk cache before the next target "
                     "inference phase."
                 )
