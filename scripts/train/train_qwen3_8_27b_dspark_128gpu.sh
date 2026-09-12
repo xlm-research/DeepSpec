@@ -169,7 +169,7 @@ fi
 FSDP_SIZE=${FSDP_SIZE:-$((NPROC_PER_NODE / (CONTEXT_PARALLEL_SIZE * TENSOR_PARALLEL_SIZE)))}
 TARGET_CACHE_FSDP_SIZE=${TARGET_CACHE_FSDP_SIZE:-$((NPROC_PER_NODE / CONTEXT_PARALLEL_SIZE))}
 LOGGING_STEPS=${LOGGING_STEPS:-10}
-SAVE_STEPS=${SAVE_STEPS:-3000}
+SAVE_STEPS=${SAVE_STEPS:-10}
 SAVE_CHECKPOINTS=${SAVE_CHECKPOINTS:-true}
 DEFAULT_TORCH_COMPILE=false
 DEFAULT_TARGET_CACHE_FSDP=false
@@ -465,7 +465,7 @@ set -x
     --master_port "${MASTER_PORT}" \
     "${TORCHRUN_LOG_ARGS[@]}" \
     train.py \
-    --config config/dspark/dspark_qwen3_8_27b.py \
+    --config "${CONFIG_PATH:-config/dspark/dspark_qwen3_8_27b.py}" \
     --opts "model.target_model_name_or_path=${TARGET_MODEL_PATH}" \
     "${TARGET_DATA_ARGS[@]}" \
     --opts "data.max_length=${MAX_LENGTH}" \
