@@ -134,15 +134,15 @@ if ((NNODES > 1)) && [[ "${MASTER_ADDR}" == "localhost" || "${MASTER_ADDR}" == "
     exit 1
 fi
 
+# MAX_LENGTH=${MAX_LENGTH:-131072}
 MAX_LENGTH=${MAX_LENGTH:-131072}
-MAX_LENGTH=${MAX_LENGTH:-65536}
 CONTEXT_PARALLEL_SIZE=${CONTEXT_PARALLEL_SIZE:-${CP:-1}}
 TENSOR_PARALLEL_SIZE=${TENSOR_PARALLEL_SIZE:-${TP:-4}}
 if [[ ! "${CONTEXT_PARALLEL_SIZE}" =~ ^[1-9][0-9]*$ ]]; then
     echo "CONTEXT_PARALLEL_SIZE must be a positive integer; got ${CONTEXT_PARALLEL_SIZE}." >&2
     exit 1
 fi
-TARGET_MODEL_PATH=${TARGET_MODEL_PATH:-/mnt/afs_rl/hongjiawei1/code/ms-swift-hjw/outputs/sensenova-flash-lite-v42-20260830/v1-20260903-021230/checkpoint-1600}
+TARGET_MODEL_PATH=${TARGET_MODEL_PATH:-/mnt/afs_rl/hongjiawei1/code/ms-swift-hjw/outputs/sensenova-flash-lite-v42-20260830/v2-20260904-112039/checkpoint-3800}
 SOURCE_JSONL_PATH=${SOURCE_JSONL_PATH:-${BASE_DIR}/train_dataset/sensenova-flash-lite-v42-text-all.jsonl}
 TARGET_CACHE_PATH=${TARGET_CACHE_PATH:-${BASE_DIR}/output/sensenova-flash-lite-v42-dspark-32p/cp${CONTEXT_PARALLEL_SIZE}_maxlen${MAX_LENGTH}}
 DEFAULT_OUTPUT_ROOT=${BASE_DIR}/output/sensenova-flash-lite-v42-dspark-32p
@@ -168,7 +168,7 @@ JSONL_INDEX_CACHE_DIR=${JSONL_INDEX_CACHE_DIR:-${OUTPUT_ROOT}/jsonl_index_cache}
 # Keep those as zero-weight batches instead of letting the collator return None.
 MIN_LOSS_TOKENS=${MIN_LOSS_TOKENS:-14}
 WANDB_ENABLE=${WANDB_ENABLE:-true}
-WANDB_PROJECT=${WANDB_PROJECT:-sensenova-flash-lite-v42-dspark-32p}
+WANDB_PROJECT=${WANDB_PROJECT:-sensenova-flash-lite-dspark}
 WANDB_NAME=${WANDB_NAME:-$(basename "${OUTPUT_ROOT}")}
 WANDB_GROUP=${WANDB_GROUP:-qwen3_8_27b_v42_128k_32p}
 WANDB_DIR=${WANDB_DIR:-${OUTPUT_ROOT}/wandb}
