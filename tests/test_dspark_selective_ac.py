@@ -19,10 +19,8 @@ from deepspec.utils.config import to_config_node
 from deepspec.utils import training_logger
 from deepspec.utils.metrics import configure_reduction_group
 from tests.distributed_test_utils import require_torchrun
-from tests.test_dspark_training_baseline import (
-    DSparkTrainingBaselineTest,
-    FixedFeatureTrainer,
-)
+from tests import test_dspark_training_baseline as baseline
+from tests.test_dspark_training_baseline import FixedFeatureTrainer
 
 
 class DSparkSelectiveACTest(unittest.TestCase):
@@ -111,7 +109,7 @@ class DSparkSelectiveACTest(unittest.TestCase):
                 torch.set_rng_state(fixture["initial_cpu_rng"])
                 torch.cuda.set_rng_state(fixture["initial_cuda_rng"], runtime.device)
                 actual = trainer.train_and_observe()
-                DSparkTrainingBaselineTest().assert_state_close(
+                baseline.DSparkTrainingBaselineTest().assert_state_close(
                     actual, fixture["result"]
                 )
                 self.assertEqual(actual["next_micro_step"], 4)
@@ -193,7 +191,7 @@ class DSparkSelectiveACTest(unittest.TestCase):
                 if "result" not in fixture:
                     fixture["result"] = actual
                 else:
-                    DSparkTrainingBaselineTest().assert_state_close(
+                    baseline.DSparkTrainingBaselineTest().assert_state_close(
                         actual, fixture["result"]
                     )
                 del trainer

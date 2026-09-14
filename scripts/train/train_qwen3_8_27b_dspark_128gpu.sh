@@ -372,6 +372,26 @@ if [[ -n "${MAX_TRAIN_STEPS}" ]]; then
     TRAIN_SCHEDULE_ARGS=(--opts "train.max_train_steps=${MAX_TRAIN_STEPS}")
 fi
 
+TARGET_CONTEXT_PARALLEL_SIZE=${TARGET_CONTEXT_PARALLEL_SIZE:-${CONTEXT_PARALLEL_SIZE}}
+TARGET_TENSOR_PARALLEL_SIZE=${TARGET_TENSOR_PARALLEL_SIZE:-${TENSOR_PARALLEL_SIZE}}
+TARGET_FSDP_SIZE=${TARGET_FSDP_SIZE:-${FSDP_SIZE}}
+for target_integer_var in TARGET_CONTEXT_PARALLEL_SIZE TARGET_TENSOR_PARALLEL_SIZE TARGET_FSDP_SIZE; do
+    if [[ ! "${!target_integer_var}" =~ ^[1-9][0-9]*$ ]]; then
+        echo "${target_integer_var} must be a positive integer." >&2
+        exit 1
+    fi
+done
+TARGET_DENSE_GROUP_SIZE=$((TARGET_CONTEXT_PARALLEL_SIZE * TARGET_TENSOR_PARALLEL_SIZE * TARGET_FSDP_SIZE))
+if ((TRAIN_WORLD_SIZE % TARGET_DENSE_GROUP_SIZE != 0)); then
+    echo "The fixed target layout must divide the training world size." >&2
+    exit 1
+fi
+TARGET_DP_REPLICATE=${TARGET_DP_REPLICATE:-$((TRAIN_WORLD_SIZE / TARGET_DENSE_GROUP_SIZE))}
+if [[ ! "${TARGET_DP_REPLICATE}" =~ ^[1-9][0-9]*$ ]] || ((TARGET_DP_REPLICATE * TARGET_DENSE_GROUP_SIZE != TRAIN_WORLD_SIZE)); then
+    echo "The fixed target layout must cover the training world size." >&2
+    exit 1
+fi
+
 TARGET_DATA_ARGS=(
     --opts "data.online_target=false"
     --opts "data.offline_target_data_batches=true"
@@ -380,10 +400,10 @@ TARGET_DATA_ARGS=(
     --opts "data.data_batch_cache_dir=${DATA_BATCH_CACHE_DIR}"
     --opts "data.target_cache_path=null"
     --opts "train.data_partitions=${DATA_PARTITIONS}"
-    --opts "train.offline_target_parallel.dp_replicate=${DP_REPLICATE}"
-    --opts "train.offline_target_parallel.dp_shard=${FSDP_SIZE}"
-    --opts "train.offline_target_parallel.cp=${CONTEXT_PARALLEL_SIZE}"
-    --opts "train.offline_target_parallel.tp=${TENSOR_PARALLEL_SIZE}"
+    --opts "train.offline_target_parallel.dp_replicate=${TARGET_DP_REPLICATE}"
+    --opts "train.offline_target_parallel.dp_shard=${TARGET_FSDP_SIZE}"
+    --opts "train.offline_target_parallel.cp=${TARGET_CONTEXT_PARALLEL_SIZE}"
+    --opts "train.offline_target_parallel.tp=${TARGET_TENSOR_PARALLEL_SIZE}"
     --opts "train.offline_target_parallel.ep=1"
     --opts "train.offline_target_parallel.expert_tp=1"
     --opts "train.offline_target_parallel.use_fsdp=true"

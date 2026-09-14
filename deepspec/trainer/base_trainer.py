@@ -191,8 +191,9 @@ def _compute_epoch_data_partition_schedule(
     start_micro_step: int,
     total_micro_batches: int,
     gradient_accumulation_steps: int,
+    optimizer_aligned: bool = False,
 ) -> tuple[tuple[int, ...], tuple[int, ...]]:
-    """Repeat one exact dataset-partition layout for every training epoch."""
+    """Repeat per-epoch partitions in microbatch or complete-update units."""
 
     micro_batches_per_epoch = int(micro_batches_per_epoch)
     start_micro_step = int(start_micro_step)
@@ -206,6 +207,19 @@ def _compute_epoch_data_partition_schedule(
         )
     if gradient_accumulation_steps <= 0:
         raise ValueError("gradient_accumulation_steps must be positive.")
+    micro_step_unit = gradient_accumulation_steps if optimizer_aligned else 1
+    if optimizer_aligned:
+        if any(
+            value % micro_step_unit
+            for value in (micro_batches_per_epoch, start_micro_step, total_micro_batches)
+        ):
+            raise ValueError(
+                "Draft phases require complete optimizer-update boundaries."
+            )
+        micro_batches_per_epoch //= micro_step_unit
+        start_micro_step //= micro_step_unit
+        total_micro_batches //= micro_step_unit
+        gradient_accumulation_steps = 1
     partition_count = _resolve_data_partition_count(
         data_partitions,
         remaining_micro_batches=micro_batches_per_epoch,
@@ -254,7 +268,10 @@ def _compute_epoch_data_partition_schedule(
             cursor = partition_end
             if cursor == final_micro_step:
                 break
-    return tuple(micro_batches), tuple(optimizer_steps)
+    return (
+        tuple(count * micro_step_unit for count in micro_batches),
+        tuple(optimizer_steps),
+    )
 
 
 def _compute_samples_per_epoch(*, dataset_size: int, global_batch_size: int) -> int:
@@ -333,6 +350,7 @@ def _launch_eval(
 
 
 class BaseTrainer:
+    optimizer_aligned_data_partitions = False
     data_collator_cls = None
 
     def __init__(self, local_rank, args):
@@ -470,7 +488,9 @@ class BaseTrainer:
             else configured_data_batch_size
         )
         self.data_batch_size = None
-        self.data_batch_optimizer_aligned = configured_data_partitions is None
+        self.data_batch_optimizer_aligned = (
+            configured_data_partitions is None or self.optimizer_aligned_data_partitions
+        )
         self.data_batch_micro_batches = None
         self.optimizer_steps_per_data_batch = None
         self.data_batch_cache_root = None
@@ -484,7 +504,7 @@ class BaseTrainer:
                     "Partitioned target caching requires online target training "
                     "or offline target data batches."
                 )
-            if self.data_batch_optimizer_aligned:
+            if configured_data_partitions is None:
                 self.data_batch_size = _resolve_data_batch_partition_count(
                     configured_partition_count,
                     remaining_optimizer_steps=1,
@@ -708,7 +728,7 @@ class BaseTrainer:
             remaining_micro_batches = (
                 remaining_optimizer_steps * self.gradient_accumulation_steps
             )
-            if self.data_batch_optimizer_aligned:
+            if configured_data_partitions is None:
                 self.data_batch_size = _resolve_data_batch_partition_count(
                     configured_partition_count,
                     remaining_optimizer_steps=remaining_optimizer_steps,
@@ -716,13 +736,17 @@ class BaseTrainer:
             else:
                 self.data_batch_size = _resolve_data_partition_count(
                     configured_partition_count,
-                    remaining_micro_batches=self.micro_batches_per_epoch,
+                    remaining_micro_batches=(
+                        self.steps_per_epoch
+                        if self.optimizer_aligned_data_partitions
+                        else self.micro_batches_per_epoch
+                    ),
                 )
             if remaining_optimizer_steps == 0:
                 self.data_batch_micro_batches = ()
                 self.optimizer_steps_per_data_batch = ()
             else:
-                if self.data_batch_optimizer_aligned:
+                if configured_data_partitions is None:
                     (
                         self.data_batch_micro_batches,
                         self.optimizer_steps_per_data_batch,
@@ -745,6 +769,7 @@ class BaseTrainer:
                         micro_batches_per_epoch=self.micro_batches_per_epoch,
                         start_micro_step=self.next_micro_step,
                         total_micro_batches=remaining_micro_batches,
+                        optimizer_aligned=self.optimizer_aligned_data_partitions,
                         gradient_accumulation_steps=(
                             self.gradient_accumulation_steps
                         ),
@@ -845,7 +870,7 @@ class BaseTrainer:
             print_on_local_main(f"  Target data-batch mode = {target_mode}")
             partition_label = (
                 "Data batch partitions"
-                if self.data_batch_optimizer_aligned
+                if self.args.train.get("data_partitions") is None
                 else "Data partitions per epoch"
             )
             print_on_local_main(
