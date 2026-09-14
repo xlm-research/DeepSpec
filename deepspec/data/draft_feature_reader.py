@@ -46,6 +46,7 @@ class DraftFeatureIndex:
 
     def __init__(self, manifest):
         self._manifest = copy.deepcopy(manifest)
+        self.partition_id = int(manifest["partition_id"])
         self.start_micro_step = int(manifest["start_micro_step"])
         self.data_parallel_size = int(manifest["data_parallel_size"])
         self.gradient_accumulation_steps = int(manifest["gradient_accumulation_steps"])

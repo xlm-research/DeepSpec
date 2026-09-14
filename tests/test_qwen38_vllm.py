@@ -136,6 +136,7 @@ def test_two_feature_partitions_preserve_inflight_gradients(tmp_path):
     trainer.data_parallel_size = 1
     trainer.samples_per_epoch = 2
     trainer.gradient_accumulation_steps = 2
+    trainer.max_train_steps = 1
     trainer._producer_identity = {"teacher": "CPU-reference", "layout": {"cp": 1}}
     trainer.device = torch.device("cpu")
     trainer.qwen_vllm_config = QwenVllmConfig(tensor_parallel_size=1)
@@ -143,6 +144,7 @@ def test_two_feature_partitions_preserve_inflight_gradients(tmp_path):
     trainer.args = SimpleNamespace(
         model=SimpleNamespace(target_model_name_or_path="unused"),
         data=SimpleNamespace(max_length=7),
+        logging={"save_checkpoints": False},
     )
     trainer.checkpoint_dir_root = str(tmp_path / "checkpoints")
     trainer.data_batch_cache_root = str(tmp_path / "cache")

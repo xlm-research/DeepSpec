@@ -2,6 +2,7 @@
 
 from dataclasses import asdict, replace
 from datetime import timedelta
+import json
 import os
 from pathlib import Path
 import shutil
@@ -16,6 +17,12 @@ from deepspec.utils.distributed import StatelessResumableDistributedSampler
 from deepspec.data.cuda_prefetcher import move_batch_to_device
 from deepspec.data.draft_feature_reader import DraftFeatureIndex, feature_input_identity
 from deepspec.trainer.dspark_trainer import Qwen3_8DSparkTrainer
+from deepspec.distributed.distributed_checkpoint import TrainingProgress
+from deepspec.trainer.draft_phase_checkpoint import (
+    discover_draft_phase_checkpoint,
+    save_draft_phase_checkpoint,
+    validate_draft_phase_resume,
+)
 from deepspec.trainer.glm5_partitioned_swap import atomic_write_json, load_json
 from deepspec.trainer.qwen3_8_vllm import (
     QwenVllmConfig,
@@ -94,6 +101,8 @@ class Qwen3_8VllmDSparkTrainer(Qwen3_8DSparkTrainer):
                 "Qwen vLLM owner does not match the producer model-parallel mesh."
             )
         self._bind_producer_identity()
+        self._active_draft_feature_index = None
+        self._last_draft_phase_checkpoint = None
         print(
             f"[qwen38-vllm] rank={self.global_rank} owner={self._vllm_owner} "
             f"teacher_tp={self.qwen_vllm_config.tensor_parallel_size} "
@@ -106,6 +115,39 @@ class Qwen3_8VllmDSparkTrainer(Qwen3_8DSparkTrainer):
         # Both meshes already validate against the world size. Indexed files
         # support independent consumers without the native teacher's TP scatter.
         return
+
+    def discover_resume_checkpoint(self):
+        return discover_draft_phase_checkpoint(self.checkpoint_dir_root)
+
+    def load_resume_checkpoint(self, progress):
+        metadata = validate_draft_phase_resume(
+            self.resume_checkpoint_dir, train_config=self.args, progress=progress
+        )
+        # DCP requests only keys present in the Stateful load template.
+        progress.partition_id = -1
+        progress.partition_start_next_micro_step = -1
+        progress.partition_end_next_micro_step = -1
+        progress = super().load_resume_checkpoint(progress)
+
+        def validate_progress():
+            for name in (
+                "next_micro_step",
+                "global_step",
+                "epoch",
+                "data_position",
+                "partition_id",
+                "partition_start_next_micro_step",
+                "partition_end_next_micro_step",
+                "checkpointed",
+                "saved_world_size",
+                "parallel_config",
+                "model_config",
+            ):
+                if json.loads(json.dumps(getattr(progress, name))) != metadata[name]:
+                    raise ValueError(f"Draft resume DCP {name} progress mismatch.")
+
+        self._collective_stage(validate_progress)
+        return progress
 
     def _build_train_dataloader(self, *args, **kwargs):
         # Producer owners collate the fixed global sample stream on CPU. Draft
@@ -169,15 +211,23 @@ class Qwen3_8VllmDSparkTrainer(Qwen3_8DSparkTrainer):
                 return
             path = Path(self.checkpoint_dir_root) / "qwen38_vllm_producer.json"
             previous = load_json(path)
-            if previous is not None and previous != self._producer_identity:
+            checkpoint_identity = (
+                self._checkpoint_producer_identity()
+                if self.resume_checkpoint_dir is not None
+                else None
+            )
+            if any(
+                identity is not None and identity != self._producer_identity
+                for identity in (previous, checkpoint_identity)
+            ):
                 raise ValueError("The fixed Qwen producer configuration changed.")
-            if previous is None and self.resume_checkpoint_dir is not None:
-                raise ValueError(
-                    "A Qwen resume requires its producer identity sidecar."
-                )
             atomic_write_json(path, self._producer_identity)
 
         self._collective_stage(persist)
+
+    def _checkpoint_producer_identity(self):
+        checkpoint = Path(self.resume_checkpoint_dir)
+        return load_json(checkpoint / "draft_feature_index.json")["producer_identity"]
 
     def _build_draft_model(self, *, target_config, model_args):
         self._teacher_identity = teacher_identity(
@@ -188,13 +238,17 @@ class Qwen3_8VllmDSparkTrainer(Qwen3_8DSparkTrainer):
         if self.global_rank == 0:
             try:
                 previous = load_json(identity_path)
-                if previous is not None and previous != self._teacher_identity:
+                checkpoint_identity = (
+                    self._checkpoint_producer_identity()["teacher"]
+                    if self.resume_checkpoint_dir is not None
+                    else None
+                )
+                if any(
+                    identity is not None and identity != self._teacher_identity
+                    for identity in (previous, checkpoint_identity)
+                ):
                     raise ValueError(
                         "The Qwen vLLM checkpoint directory belongs to a different teacher."
-                    )
-                if self.resume_checkpoint_dir is not None and previous is None:
-                    raise ValueError(
-                        "A Qwen vLLM resume requires its teacher identity sidecar."
                     )
                 atomic_write_json(identity_path, self._teacher_identity)
             except Exception as exc:
@@ -230,7 +284,9 @@ class Qwen3_8VllmDSparkTrainer(Qwen3_8DSparkTrainer):
         except Exception as exc:
             error = f"rank {self.global_rank}: {type(exc).__name__}: {exc}"
         errors: list[str | None] = [None] * self.world_size
-        dist.all_gather_object(errors, error, group=self._vllm_control_group)
+        dist.all_gather_object(
+            errors, error, group=getattr(self, "_vllm_control_group", None)
+        )
         if any(errors):
             raise RuntimeError(
                 "Qwen vLLM partition failed: " + "; ".join(e for e in errors if e)
@@ -240,9 +296,18 @@ class Qwen3_8VllmDSparkTrainer(Qwen3_8DSparkTrainer):
     def iter_training_batches(self, batches):
         if self.data_batch_micro_batches is None:
             raise RuntimeError("Qwen vLLM requires a bounded data partition schedule.")
-        for partition_index, count in enumerate(self.data_batch_micro_batches, start=1):
+        end_step = getattr(self, "_active_train_end_step", self.max_train_steps)
+        if end_step is None:
+            raise RuntimeError("Qwen draft training requires a bounded update count.")
+        end_micro_step = int(end_step) * self.gradient_accumulation_steps
+        for count in self.data_batch_micro_batches:
+            if self.next_micro_step >= end_micro_step:
+                break
+            count = min(count, end_micro_step - self.next_micro_step)
             self._data_batch_phase = "target_inference"
             start_micro_step = self.next_micro_step
+            # A phase keeps its identity when a fresh process starts at its cursor.
+            partition_index = start_micro_step // self.gradient_accumulation_steps + 1
             start_position = start_micro_step * self.data_parallel_size
             end_position = start_position + count * self.data_parallel_size
             job_dir = None
@@ -396,13 +461,63 @@ class Qwen3_8VllmDSparkTrainer(Qwen3_8DSparkTrainer):
                         gradient_accumulation_steps=self.gradient_accumulation_steps,
                     )
                 )
+            self._active_draft_feature_index = index
             owned_paths = index.owned_paths(self.global_rank)
             self._active_data_batch_cache = owned_paths
             yield from self.iter_ready_features(index)
+            if bool(self.args.logging.get("save_checkpoints", True)):
+                self.save_and_eval_checkpoint()
             # iter_ready_features waits for every consumer after the last update.
             self._collective_stage(lambda: self._delete_data_batch_cache(owned_paths))
             self._active_data_batch_cache = None
+            self._active_draft_feature_index = None
             self._data_batch_phase = None
+
+    def save_and_eval_checkpoint(self):
+        # Ordinary Qwen saves follow complete phases. BaseTrainer's periodic
+        # and final calls share this entry without forcing HF exports.
+        index = self._active_draft_feature_index
+        if index is None or self.next_micro_step != index.end_micro_step:
+            return self._last_draft_phase_checkpoint
+        if (
+            self._last_draft_phase_checkpoint is not None
+            and Path(self._last_draft_phase_checkpoint).name
+            == f"step_{self.global_step}"
+        ):
+            return self._last_draft_phase_checkpoint
+        progress = TrainingProgress(
+            next_micro_step=self.next_micro_step,
+            global_step=self.global_step,
+            epoch=self.next_micro_step // self.micro_batches_per_epoch,
+            data_position=self.next_micro_step * int(self.args.train.local_batch_size),
+            local_batch_size=int(self.args.train.local_batch_size),
+            saved_world_size=self.world_size,
+            parallel_config=self.parallel_config.to_dict(),
+            model_config=self.draft_model.config.to_dict(),
+            partition_id=index.partition_id,
+            partition_start_next_micro_step=index.start_micro_step,
+            partition_end_next_micro_step=index.end_micro_step,
+            checkpointed=True,
+        )
+        with record_function("deepspec::draft_phase_checkpoint"):
+            checkpoint = save_draft_phase_checkpoint(
+                checkpoint_dir_root=self.checkpoint_dir_root,
+                model=self.model,
+                optimizer_bundle=self.optimizer,
+                progress=progress,
+                train_config=self.args,
+                feature_index=index,
+                control_group=self._vllm_control_group,
+            )
+        self._last_draft_phase_checkpoint = checkpoint
+        return checkpoint
+
+    def _save_and_suspend(self):
+        self.save_and_eval_checkpoint()
+        dist.barrier(group=self._vllm_control_group)
+        if self.global_rank == 0:
+            self.suspend_controller.go_suspend()
+        dist.barrier(group=self._vllm_control_group)
 
     def iter_ready_features(self, index: DraftFeatureIndex):
         """Feed an indexed producer phase to the retained Qwen update loop."""

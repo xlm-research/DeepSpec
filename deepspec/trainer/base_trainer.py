@@ -462,9 +462,7 @@ class BaseTrainer:
         )
         self.precision_dtype = _PRECISION_DTYPES[self.args.train.precision]
         self.checkpoint_dir_root = self.args.logging.checkpoint_dir
-        self.resume_checkpoint_dir = discover_latest_checkpoint(
-            self.checkpoint_dir_root
-        )
+        self.resume_checkpoint_dir = self.discover_resume_checkpoint()
         self.suspend_controller = SuspendController(device=self.device)
         self.next_micro_step = 0
         self.online_target = None
@@ -687,12 +685,7 @@ class BaseTrainer:
                 parallel_config=self.parallel_config.to_dict(),
                 model_config=model_config,
             )
-            progress = load_distributed_training_checkpoint(
-                checkpoint_dir=self.resume_checkpoint_dir,
-                model=self.model,
-                optimizer_bundle=self.optimizer,
-                progress=progress,
-            )
+            progress = self.load_resume_checkpoint(progress)
             if int(progress.local_batch_size) != int(self.args.train.local_batch_size):
                 raise ValueError(
                     "Resume local_batch_size mismatch: "
@@ -777,6 +770,17 @@ class BaseTrainer:
         if self.target_runtime_enabled:
             self.online_target = self.build_online_target()
         self.info_board()
+
+    def discover_resume_checkpoint(self):
+        return discover_latest_checkpoint(self.checkpoint_dir_root)
+
+    def load_resume_checkpoint(self, progress):
+        return load_distributed_training_checkpoint(
+            checkpoint_dir=self.resume_checkpoint_dir,
+            model=self.model,
+            optimizer_bundle=self.optimizer,
+            progress=progress,
+        )
 
     @property
     def target_runtime_enabled(self) -> bool:
@@ -1560,7 +1564,10 @@ class BaseTrainer:
                             with record_function("deepspec::checkpoint"):
                                 self.save_and_eval_checkpoint()
 
-                        if self.suspend_controller.requested():
+                        if self.suspend_controller.requested() and (
+                            not self.optimizer_aligned_data_partitions
+                            or self._data_batch_end_after_current
+                        ):
                             training_logger.finish_optimizer_step(pending_log)
                             pending_log = None
                             self._save_and_suspend()
