@@ -31,20 +31,30 @@
 | TorchTitan 源码 | `f6b9152e9bedcc18f5dc339b9f88265e5a07e988`，工作树干净 |
 | vLLM 源码 | `1ee54c40df7ffe2c8934f5bd1c79917f34cb954e`，工作树干净 |
 | vLLM 扩展与 engine | 从本地 `vllm/` 导入 `_C_stable_libtorch` 和 `vllm.v1.engine.core` 成功 |
-| TorchTitan 导入 | 失败：`ModuleNotFoundError: No module named 'spmd_types'` |
+| TorchTitan 实施前导入 | 失败：`ModuleNotFoundError: No module named 'spmd_types'`；依赖已在下述后续安装中补齐 |
 
 `environment.log` 保存实际导入证据，`packages.json` 保存该环境的已安装版本，
 `vllm-binaries.sha256.json` 保存 12 个已有编译扩展的散列，`gpu.csv` 保存 GPU 身份与驱动。
 shell 默认 `/usr/local/bin/python` 使用 PyTorch 2.11.0，不能替代上述训练环境。
 
 TorchTitan 的固定 checkout 要求 `spmd_types==0.2.5`，其 AC 模块还导入
-当前环境缺失的 `torch_remat`、`tyro`。按母规格 Implementation Decision 3，
-已提出补齐这些依赖且保持 PyTorch/CUDA/vLLM 不变，或指定另一个现有环境的选择，
-尚待用户确定。用全部已安装版本作为 constraints 的 pip dry run 已确认只需新增
-`spmd_types 0.2.5`、固定 commit 的 `torch_remat 0.2.0`、`tyro 1.0.16`、
-`typeguard 4.6.0`，没有替换现有包；具体计划保存在 `dependency-plan.json`。
-没有修改这些训练依赖。pytest 和 mypy 仅安装到
-`/tmp/deepspec-validation-tools` 用于校验，没有安装进训练环境。
+实施前缺失的 `torch_remat`、`tyro`。2026-09-14 经用户授权，已在同一训练环境中
+新增 `spmd_types 0.2.5`、`torch_remat 0.2.0`、`tyro 1.0.16`、`typeguard 4.6.0`。
+`torch_remat` 固定到 checkout 要求的完整 commit
+`d302699b1c58f83fa2c7b03bc2593967e9530335`。
+
+安装前重新记录全部 212 个已安装包版本并作为 constraints，确认解析计划只包含上述
+四个新包后，使用 `--no-deps` 安装。安装后逐项核对，原有包没有删除或版本变化；
+安装前后的 `pip check` 均通过。证据保存在同一基线输出目录下的
+`dependency-install-20260914T061119Z-e0wrsjkd/`，包括安装 requirements、constraints、
+前后包清单、`package-diff.json`、pip 解析与安装报告及日志。
+pytest 和 mypy 仍仅位于 `/tmp/deepspec-validation-tools`，没有安装进训练环境。
+
+安装后 TorchTitan AC 组件、DSpark trainer、现有 vLLM 编译扩展与 engine 的导入均通过。
+vLLM 继续从本地 `vllm/` 源码及已有编译产物加载，本次没有安装、重装或编译 vLLM。
+使用现有 PyTorch 2.13.0+cu130 / CUDA 13.0 在 B300 上执行小型 MLP 的 SelectiveAC
+前向与反向，对照未启用 AC 的同权重模型，输出、输入梯度和全部参数梯度均通过比较。
+详情见该安装证据目录的 `smoke.log`；这只验证组件环境可用，不代表 DSpark SAC 接入验收。
 
 ## 数值入口
 
