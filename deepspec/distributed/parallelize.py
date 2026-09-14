@@ -10,7 +10,22 @@ from .mesh import ParallelContext
 from .tensor_parallel import apply_tensor_parallelism
 
 
-def apply_activation_checkpoint(model: nn.Module) -> nn.Module:
+def apply_activation_checkpoint(
+    model: nn.Module, *, policy: str = "full"
+) -> nn.Module:
+    if policy == "torchtitan_selective":
+        from torchtitan.distributed.activation_checkpoint import SelectiveAC
+
+        # HF's GradientCheckpointingLayer must not recompute a second time
+        # inside the TorchTitan checkpoint wrapper.
+        disable = getattr(model, "gradient_checkpointing_disable", None)
+        if callable(disable):
+            disable()
+        layers_owner = model if hasattr(model, "layers") else model.model
+        SelectiveAC(SelectiveAC.Config(preserve_rng_state=True)).apply(layers_owner)
+        return model
+    if policy != "full":
+        raise ValueError(f"Unknown activation checkpoint policy: {policy!r}.")
     enable = getattr(model, "gradient_checkpointing_enable", None)
     if callable(enable):
         enable(gradient_checkpointing_kwargs={"use_reentrant": False})
@@ -61,7 +76,9 @@ def apply_parallelism(
         model = apply_tensor_parallelism(model, context, config)
         model = apply_expert_parallelism(model, context, config)
     if config.use_activation_checkpoint:
-        model = apply_activation_checkpoint(model)
+        model = apply_activation_checkpoint(
+            model, policy=config.activation_checkpoint_policy
+        )
     if config.use_compile:
         model = apply_compile(model)
     model = apply_fsdp2(

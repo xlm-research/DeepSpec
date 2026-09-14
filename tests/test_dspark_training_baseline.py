@@ -88,15 +88,25 @@ def reference_loss(output, group):
 class ObservedOptimizer(BF16Optimizer):
     """Observe the public optimizer boundary without replacing its update."""
 
-    def __init__(self, model):
+    def __init__(self, model, parameter_names=None):
         super().__init__(model, lr=1e-3, total_steps=4, warmup_ratio=0.25)
         self.model = model
+        # Public parameter paths from the original model remain addressable
+        # through checkpoint wrappers; observations use the model's own names.
+        self.parameters = {
+            name: model.get_parameter(name)
+            for name in (
+                parameter_names
+                if parameter_names is not None
+                else dict(model.named_parameters())
+            )
+        }
         self.updates = []
 
     def step(self):
         gradients = {
             name: cpu_tensor(parameter.grad)
-            for name, parameter in self.model.named_parameters()
+            for name, parameter in self.parameters.items()
             if parameter.requires_grad and parameter.grad is not None
         }
         super().step()
@@ -104,14 +114,14 @@ class ObservedOptimizer(BF16Optimizer):
             {
                 "gradients_after_clip": gradients,
                 "parameters": {
-                    name: cpu_tensor(p) for name, p in self.model.named_parameters()
+                    name: cpu_tensor(p) for name, p in self.parameters.items()
                 },
                 "adam": {
                     name: {
                         key: cpu_tensor(value)
                         for key, value in self.optimizer.state[p].items()
                     }
-                    for name, p in self.model.named_parameters()
+                    for name, p in self.parameters.items()
                     if p.requires_grad
                 },
                 "scheduler": self.scheduler.state_dict(),
@@ -123,7 +133,14 @@ class FixedFeatureTrainer(Qwen3_8DSparkTrainer):
     """Supply ready features to the retained production training loop."""
 
     def __init__(
-        self, runtime, topology, dtype, *, independent_loss=False, fixture=None
+        self,
+        runtime,
+        topology,
+        dtype,
+        *,
+        independent_loss=False,
+        fixture=None,
+        model_config=None,
     ):
         self.device = runtime.device
         self.global_rank = runtime.global_rank
@@ -145,7 +162,7 @@ class FixedFeatureTrainer(Qwen3_8DSparkTrainer):
                 "logging": {"save_checkpoints": False},
             }
         )
-        config = Qwen3_5TextConfig(
+        config = model_config or Qwen3_5TextConfig(
             vocab_size=128,
             hidden_size=64,
             intermediate_size=128,
@@ -175,10 +192,17 @@ class FixedFeatureTrainer(Qwen3_8DSparkTrainer):
             name: cpu_tensor(p) for name, p in draft.named_parameters()
         }
         self.draft_model = draft
+        draft.configure_context_parallel(
+            size=topology.config.cp,
+            rank=topology.context_parallel_rank,
+            group=topology.cp_mesh.get_group(),
+            model_parallel_group=topology.model_mesh.get_group(),
+            model_parallel_src_rank=topology.model_parallel_src_rank,
+        )
         self.model = apply_parallelism(
             draft, topology, topology.config, param_dtype=dtype
         )
-        self.optimizer = ObservedOptimizer(self.model)
+        self.optimizer = ObservedOptimizer(self.model, self.initial_weights)
         self.suspend_controller = SuspendController(self.device)
         self._pure_expert_modules = []
         self._draft_residency_verified = False
@@ -191,7 +215,7 @@ class FixedFeatureTrainer(Qwen3_8DSparkTrainer):
         self.max_train_steps = 2
         self.micro_batches_per_epoch = 4
         self.features = (
-            fixed_features(self.global_rank, dtype)
+            fixed_features(topology.data_parallel_rank, dtype)
             if fixture is None
             else fixture["features"]
         )

@@ -25,6 +25,7 @@ class ParallelConfig:
     use_sequence_parallel: bool = False
     use_loss_parallel: bool = False
     use_activation_checkpoint: bool = False
+    activation_checkpoint_policy: str = "full"
     use_compile: bool = False
 
     expert_dispatch_backend: str = "native"
@@ -180,6 +181,18 @@ class ParallelConfig:
                 "dynamic_context_parallel is intentionally not implemented. "
                 "Use fixed cp or provide a real micro-batch scheduler/backend."
             )
+        if self.activation_checkpoint_policy not in {"full", "torchtitan_selective"}:
+            raise ValueError(
+                "activation_checkpoint_policy must be full or torchtitan_selective."
+            )
+        if self.activation_checkpoint_policy == "torchtitan_selective":
+            if not self.use_activation_checkpoint:
+                raise ValueError("SelectiveAC requires use_activation_checkpoint=true.")
+            if self.use_compile:
+                raise NotImplementedError(
+                    "SelectiveAC currently requires use_compile=false; "
+                    "combined draft compilation is not yet validated."
+                )
         if self.context_parallel_backend not in {"pytorch", "model_native"}:
             raise ValueError(
                 "context_parallel_backend must be 'pytorch' or 'model_native', "

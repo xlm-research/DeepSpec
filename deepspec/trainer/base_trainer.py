@@ -1,4 +1,5 @@
 import math
+from dataclasses import replace
 import os
 import json
 import shutil
@@ -362,8 +363,13 @@ class BaseTrainer:
         # layout and CP partition. This lets a DeepSeek teacher route its 128K
         # token volume with EP without forcing sparse all-to-all into the
         # anchor-sized draft model.
-        self.target_parallel_config = self.parallel_config
-        self.target_parallel = self.parallel
+        # SelectiveAC is a draft transform, not a target configuration default.
+        self.target_parallel_config = replace(
+            self.parallel_config, activation_checkpoint_policy="full"
+        )
+        self.target_parallel = replace(
+            self.parallel, config=self.target_parallel_config
+        )
         self.heterogeneous_target_data_batches = False
         offline_target_parallel = self.args.train.get("offline_target_parallel")
         if self.offline_target_data_batches_enabled:
@@ -380,8 +386,10 @@ class BaseTrainer:
                 self.target_parallel_config,
                 device_type=self.device.type,
             )
-            self.heterogeneous_target_data_batches = (
-                self.target_parallel_config != self.parallel_config
+            self.heterogeneous_target_data_batches = any(
+                getattr(self.target_parallel_config, dimension)
+                != getattr(self.parallel_config, dimension)
+                for dimension in ("dp_replicate", "dp_shard", "cp", "tp", "pp")
             )
         else:
             target_parallel_overrides = self.args.train.get("target_parallel")
@@ -389,7 +397,7 @@ class BaseTrainer:
             not self.offline_target_data_batches_enabled
             and target_parallel_overrides is not None
         ):
-            merged_target_parallel = self.parallel_config.to_dict()
+            merged_target_parallel = self.target_parallel_config.to_dict()
             merged_target_parallel.update(dict(target_parallel_overrides))
             self.target_parallel_config = ParallelConfig.from_mapping(
                 {"parallel": merged_target_parallel},

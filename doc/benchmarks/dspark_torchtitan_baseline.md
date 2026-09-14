@@ -116,7 +116,8 @@ CE/L1/confidence 分项从实际 TensorBoard 输出读取，并与按日志分�
   完成 FP32/BF16 重放对照，通过（每个 rank 的测试约 67.0 秒），
   日志为 `numerics-replay.log`。这些时长为测试耗时，不是 draft 性能验收数据。
 - `numerics-final.sha256.json` 记录所有最终数值产物的 SHA256；四份精度/rank
-  清单中的测试源码散列均与提交的测试文件一致。
+  清单中的测试源码散列对应初次基线提交 `7e67c3e` 的测试文件。
+  后续测试入口扩展不改写这份实施前参考及其生成源码身份。
 - mypy（包括未标注函数体）、Ruff：通过新增的两个 Python 文件。
 - 快照检查：逐项验证归档内容与 SHA256 清单一致，确认既有目录不能被覆盖。
 - 全量 `tests/`：249 passed、27 skipped、3 failed（35 subtests passed），
