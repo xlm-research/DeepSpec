@@ -1,0 +1,347 @@
+请在当前 DeepSpec 仓库中直接实现“按有限样本分区交替加载 GLM-5.3-Flash target model 和完整 DSpark draft 训练状态”的训练模式，并完成测试和文档。
+
+## 范围限制
+
+本次只支持：
+
+- config/dspark/dspark_glm5_3_flash.py
+- Glm5NextDSparkTrainer
+- Glm5NextOnlineTarget
+- scripts/fsdp/train_glm5_3_flash_dspark_fsdp2.sh
+
+允许为此对 BaseTrainer、checkpoint、cache、DataLoader 生命周期增加最小必要能力，但必须通过配置严格门控，不得改变其他模型的默认行为。
+
+明确不做：
+
+- Qwen、Gemma、DeepSeek-V4 的适配；
+- DFlash、DFlash2、Eagle3；
+- 通用多模型 lifecycle registry/factory；
+- Ray、vLLM、SGLang serving；
+- 与任务无关的重构。
+
+当前 worktree 有用户未提交修改，尤其包含 GLM-5.3 相关改动。禁止 reset、checkout 或覆盖这些修改。
+
+## 当前 GLM 链路
+
+修改前先核对并简要说明：
+
+1. `BaseTrainer.__init__` 当前先构建完整 draft、FSDP2 包装和 `BF16Optimizer`，之后才构建 target，因此 bounded data-batch 模式下两套完整状态同时驻留 GPU。
+2. `train.data_batch_size=256` 表示“分区数量”，不是“每区 256 条样本”。
+3. `data.offline_target_data_batches=true` 当前只隔离 target forward 和 draft forward 的执行阶段，并不卸载模型。
+4. 当前 transient cache 是：
+   `rank_<rank>/data_batch_<id>/sample_<id>.pt`
+   缺少 READY manifest 和持久恢复状态。
+5. 当前 cache 在 draft 训练后直接删除，不保证已经完成对应 partition checkpoint。
+6. `Glm5NextOnlineTarget` 使用完整 45 层 target：
+   - selected hidden states 来自当前配置的 `[2, 22, 42]`；
+   - `target_last_hidden_states` 来自第 44 层后的 final norm；
+   - target 使用现有 bounded prefill、DCP checkpoint loader、TP4/EP/FSDP 布局；
+   - 不得改变这些数学和布局语义。
+7. DSpark draft 内部已包含 backbone、Markov head、confidence head、`embed_tokens`、`lm_head`、draft norm/hidden norm。
+8. draft 阶段只需要冻结的 target embedding/lm_head 副本以及缓存的 normalized final hidden states，不需要额外保留 target transformer 或单独加载 target norm。
+9. 当前实际使用 `BF16Optimizer`，包含 FP32 master weights、Adam moments 和 scheduler，没有启用 GradScaler。
+10. distributed checkpoint 已保存 model、optimizer、scheduler、`next_micro_step` 和 Python/NumPy/CPU/CUDA RNG，但不保存未完成的 `parameter.grad`。
+
+简述后立即实现，不要停留在设计阶段。
+
+## 配置
+
+不要重新解释现有 `train.data_batch_size`。
+
+只在 GLM 配置中增加类似：
+
+```python
+train = dict(
+    partitioned_model_swap=dict(
+        enabled=False,
+        max_samples=512,
+    ),
+)
+```
+
+继续复用：
+
+```python
+data.data_batch_cache_dir
+```
+
+launcher 增加：
+
+```text
+PARTITIONED_MODEL_SWAP=false
+PARTITION_MAX_SAMPLES=512
+```
+
+要求：
+
+- 新模式默认关闭；
+- 启用时 `train.data_batch_size` 必须为 null，避免两种分区语义同时存在；
+- `max_samples` 表示每个 partition 最多包含的全局逻辑训练样本数，不能把 TP/EP rank 的复制计算成额外样本；
+- 启用时必须要求 `logging.save_checkpoints=true`；
+- 不要增加没有实际实现的 token/byte 配置。
+
+## 分区语义
+
+当前 checkpoint 不保存半个 gradient-accumulation window，因此 partition 必须在 optimizer-step 边界结束。
+
+规则：
+
+```text
+max_steps_per_partition =
+    floor(max_samples / global_batch_size)
+```
+
+- 如果 `max_samples < global_batch_size`，启动前报错；
+- 每个普通 partition 不超过 512 个全局逻辑样本；
+- 如果 512 不能整除 global batch，向下选择最大的完整 optimizer-step 边界；
+- partition 不得跨 epoch；
+- epoch 尾部仍遵循现有：
+  `floor(dataset_size / global_batch_size) * global_batch_size`
+- 原数据尾部不足一个 global batch 的样本继续按现有规则丢弃，不得补样或重复；
+- 最后一个可训练 partition 可以不足 512；
+- `next_micro_step` 继续作为唯一进度真值；
+- 必须复用 `StatelessResumableDistributedSampler` 的 epoch shuffle 和恢复顺序；
+- 不得为每个 partition 重置 epoch、sampler、scheduler 或 global step。
+
+## 必须实现的顺序
+
+```text
+PREPARE_PARTITION
+→ TARGET_LOAD
+→ TARGET_GENERATE_FEATURES
+→ PARTITION_FEATURES_READY
+→ TARGET_UNLOAD
+→ DRAFT_LOAD
+→ DRAFT_TRAIN_PARTITION
+→ DRAFT_SAVE_CHECKPOINT
+→ DRAFT_UNLOAD
+→ PARTITION_CACHE_DELETE
+→ NEXT_PARTITION
+```
+
+增加明确的 phase/active-model guard：
+
+- target load 前，draft model、FSDP wrapper 和 optimizer 必须不存在；
+- draft load 前，GLM target model、experts、workspace 和 runtime 引用必须不存在；
+- target forward 只能在 target generation 阶段运行；
+- draft forward/backward 只能在 draft training 阶段运行；
+- guard 失败时所有 rank 必须一致终止。
+
+## GLM target 阶段
+
+必须复用现有：
+
+- `Glm5NextOnlineTarget`
+- `load_glm5_huggingface_checkpoint`
+- `install_glm5_next_bounded_target_prefill`
+- 当前 `offline_target_parallel`
+- TP4、EP、FSDP2 和 heterogeneous target-data-batch 路径
+
+不得：
+
+- 使用外部推理服务；
+- 改变 target 45 层执行；
+- 改变 `[2,22,42]` selected states；
+- 改变 layer-44 final norm 输出；
+- 保存完整 logits；
+- 在 target 阶段提前构建 draft。
+
+保持现有 writer 语义：只有拥有对应 draft 样本的 rank 写缓存；TP/EP 上的复制结果不得重复写。manifest 必须记录 writer rank、逻辑 sample ID 和 target shard 布局。
+
+## 分区缓存事务
+
+兼容 `data_batch_cache_dir` 是每节点本地磁盘的情况。建议布局：
+
+```text
+<data_batch_cache_dir>/
+  rank_00000/
+    epoch_0000/
+      partition_000123.incomplete/
+      partition_000123.ready/
+```
+
+共享状态文件放在：
+
+```text
+<logging.checkpoint_dir>/partition_journal.json
+```
+
+要求：
+
+- `sample_*.pt` 可以继续沿用；
+- 每个文件使用临时文件、flush/fsync、关闭、原子 rename；
+- writer 完成后生成 local manifest；
+- manifest 记录 epoch、partition、训练流范围、dataset index、样本数、token 数、文件大小，以及所有必要 tensor 的 shape/dtype；
+- 必须验证 `input_ids`、`loss_mask`、`target_hidden_states`、`target_last_hidden_states`、`context_start/context_len/seq_len`；
+- 等待所有 writer 结束并通过 collective 达成一致后，才把目录改为 ready；
+- global rank 0 不能假定能读取其他节点的本地缓存；
+- READY 前禁止 draft load；
+- 启动时不得无条件删除已有 ready cache。
+
+## 完整卸载 GLM target
+
+`Glm5NextOnlineTarget.close()` 不能只执行 `model=None` 和 `empty_cache()`。
+
+至少处理：
+
+- 等待所有 target forward 和 cache writer；
+- CUDA synchronize 和全局 barrier；
+- 清空 `_deepspec_native_workspace_state`；
+- 清空 bounded attention/indexer、KV/linear-attention 临时状态；
+- 移除 hook、bound-method 和 target runtime 引用；
+- 释放完整 target model、FSDP wrapper、MoE expert 参数和 buffer；
+- `gc.collect()`；
+- `torch.cuda.empty_cache()`；
+- 可用时 `torch.cuda.ipc_collect()`；
+- 再次 synchronize 和 barrier。
+
+记录每个 rank 卸载前后的 allocated/reserved memory。reserved memory 可能因 allocator/NCCL 不归零，但必须通过 active-model guard、weakref 和对象引用检查证明 target 权重已经不可达。
+
+只有 target teardown 成功后才能构建 draft。
+
+## Draft 加载与训练
+
+将当前 `build_models()` 做最小拆分：
+
+- 初始化阶段只保留 CPU config、tokenizer、dataset、schedule、process groups 和恢复元数据；
+- target 卸载后才调用 `_build_draft_model()`；
+- 然后初始化冻结 embedding/lm_head、放入 GPU、配置 CP/TP/EP/FSDP2、创建 `BF16Optimizer`；
+- 第一 partition 从 scratch；
+- 后续 partition 从上一 partition 的完整 distributed checkpoint 恢复。
+
+首次 draft 初始化必须与相同 seed 的旧流程一致。target 加载和推理可能消耗 RNG，因此需要隔离或恢复首次 draft 初始化所需的 RNG 状态。
+
+恢复必须覆盖：
+
+- draft backbone；
+- Markov head；
+- confidence head；
+- optimizer FP32 master weights和 moments；
+- scheduler；
+- `next_micro_step/global_step`；
+- Python、NumPy、CPU CUDA RNG。
+
+不要新增 GradScaler，不要加载完整 target 获取 embedding/lm_head；复用当前 safetensors 单 tensor 加载路径。不要额外加载 target norm。
+
+保持现有 DSpark loss、anchor sampling、梯度累积、pure-EP gradient sync、gradient clipping 和 optimizer step 逻辑不变。
+
+## Checkpoint 与 draft 卸载
+
+每个 partition 训练完成后强制保存 checkpoint，不依赖 `checkpointing_steps` 是否命中。
+
+顺序：
+
+```text
+训练完成
+→ barrier
+→ 写临时 checkpoint
+→ 保存 HF draft export
+→ 保存 distributed checkpoint
+→ 验证必要文件和进度
+→ 原子提交 checkpoint
+→ 原子更新 step_latest
+→ journal=CHECKPOINTED
+```
+
+checkpoint metadata 增加：
+
+- epoch；
+- partition ID；
+- partition start/end `next_micro_step`；
+- checkpointed 状态。
+
+完成后卸载：
+
+- draft/FSDP wrapper；
+- Markov/confidence heads；
+- optimizer 和 FP32 state；
+- scheduler；
+- gradients和 activation；
+- frozen embedding/lm_head；
+- pending metrics；
+- partition DataLoader、worker、mmap、prefetch thread/stream。
+
+完成 synchronize、barrier、GC 和 CUDA cache cleanup 后，才能删除 partition cache。
+
+## 中断恢复
+
+持久状态至少支持：
+
+- `GENERATING`：只清理当前合法 incomplete 目录并重新生成；
+- `READY`：不加载 target，直接加载 base draft checkpoint；
+- `TRAINING`：若无匹配的完成 checkpoint，从 partition 起点 checkpoint 重新训练；
+- `CHECKPOINTED`：不得重复训练，只卸载残留资源并清理 cache；
+- `CLEANED`：进入下一 partition。
+
+必须处理 checkpoint 已成功更新 `step_latest`、但 journal 仍为 TRAINING 的崩溃窗口：根据 checkpoint metadata 协调成 CHECKPOINTED，不能重复 optimizer step。
+
+状态或 checkpoint 身份不一致时保留缓存并报错，不能猜测后删除。
+
+## 通信组
+
+- 默认进程组、draft ParallelContext 和 GLM `offline_target_parallel` 可以在初始化阶段一次构建并长期保留；
+- 它们不是完整模型权重；
+- partition 循环中不得重复创建 DeviceMesh/process group；
+- 不得在 target/draft 切换时销毁默认进程组；
+- `dist.destroy_process_group()` 只在最终 `clean_up()` 执行。
+
+## 测试范围
+
+重点修改或新增：
+
+- `tests/test_glm5_next_dspark.py`
+- `tests/test_glm5_multinode_launcher.py`
+- `tests/test_heterogeneous_data_batch.py`
+- 新增 `tests/test_glm5_partitioned_model_swap.py`
+- 必要时扩展 `tests/test_checkpoint_roundtrip.py`
+
+至少验证：
+
+1. 完整生命周期顺序；
+2. target 阶段不存在 draft；
+3. target 未卸载时禁止加载 draft；
+4. 每区最多 512 条且 epoch 尾区正确；
+5. 样本顺序与原 sampler 一致；
+6. TP4/EP writer 不重复；
+7. generation/READY 失败时不训练；
+8. training/checkpoint 失败时保留 cache；
+9. checkpoint 成功后才删除；
+10. CHECKPOINTED 恢复不重复训练；
+11. model、optimizer、scheduler、global step 和 RNG 跨区连续；
+12. GLM full-45-layer、`[2,22,42]`、final norm 契约不变；
+13. 新模式关闭时当前 GLM 流程以及其他 trainer 测试不变。
+
+使用 unittest，至少执行：
+
+```bash
+python -m unittest \
+  tests.test_glm5_partitioned_model_swap \
+  tests.test_glm5_next_dspark \
+  tests.test_glm5_multinode_launcher \
+  tests.test_heterogeneous_data_batch \
+  tests.test_checkpoint_roundtrip
+
+git diff --check
+```
+
+有足够 GPU 时再运行修改后的 GLM launcher 小数据 smoke。没有足够 GPU 时，运行 CPU/mock 测试并给出真实多 GPU 命令和预期日志，不得宣称未经执行的测试已通过。
+
+## 最终交付
+
+最终说明：
+
+1. GLM 原流程与两套模型同时驻留的根因；
+2. 修改文件和核心函数；
+3. 新状态机实际调用顺序；
+4. GLM target TP4/EP/FSDP 与 draft 通信组切换方式；
+5. 如何证明完整 target 和完整 draft 不同时驻留；
+6. writer 如何避免 TP/EP 重复；
+7. checkpoint 如何恢复完整 draft 训练状态；
+8. cache 的 READY、删除和中断恢复逻辑；
+9. 配置及启动命令；
+10. 实际测试结果与未执行测试；
+11. GLM workspace、CUDA tensor、显存、cache 和 checkpoint 仍可能产生峰值的具体路径。
+
+最终回复必须基于已完成的代码和测试，不能只给设计。
+
+运行脚本设计参考scripts/fsdp/train_glm5_3_flash_dspark_fsdp2.sh

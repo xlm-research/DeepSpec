@@ -10,6 +10,9 @@ from deepspec.data.parser import (
     preprocess_multimodal_record,
 )
 from deepspec.data.target_cache_dataset import MultimodalConversationCollator
+from deepspec.modeling.target.online import DeepseekV4OnlineTarget
+from deepspec.trainer.base_trainer import BaseTrainer
+from deepspec.utils.config import ConfigNode
 from scripts.data.prepare_target_cache import run_target_forward_with_hooks
 
 
@@ -181,6 +184,30 @@ class MultimodalParserTest(unittest.TestCase):
         self.assertEqual(batch["pixel_values"].shape[0], 32)
         self.assertEqual(batch["image_grid_thw"].shape, (2, 3))
 
+    def test_runtime_trainer_selects_multimodal_collator(self):
+        trainer = object.__new__(BaseTrainer)
+        trainer.args = types.SimpleNamespace(
+            data=ConfigNode(
+                {
+                    "chat_template": "qwen",
+                    "max_length": 64,
+                    "min_loss_tokens": 1,
+                    "media_root": "/data/images",
+                    "media_uri_map": {"s3://bucket/": "/local/"},
+                }
+            )
+        )
+        trainer.tokenizer = self.processor.tokenizer
+        trainer.processor = self.processor
+        trainer.multimodal_enabled = True
+
+        collator = trainer._build_conversation_collator()
+
+        self.assertIsInstance(collator, MultimodalConversationCollator)
+        self.assertIs(collator.processor, self.processor)
+        self.assertEqual(collator.media_root, "/data/images")
+        self.assertEqual(collator.media_uri_map, {"s3://bucket/": "/local/"})
+
 
 class _FakeLayer(nn.Module):
     def forward(self, hidden_states, **_kwargs):
@@ -194,9 +221,20 @@ class _FakeTarget(nn.Module):
         self.language_model.layers = nn.ModuleList([_FakeLayer(), _FakeLayer()])
         self.language_model.norm = nn.Identity()
         self.saw_pixel_values = False
+        self.image_grid_thw = None
+        self.mm_token_type_ids = None
 
-    def forward(self, input_ids, pixel_values=None, **_kwargs):
+    def forward(
+        self,
+        input_ids,
+        pixel_values=None,
+        image_grid_thw=None,
+        mm_token_type_ids=None,
+        **_kwargs,
+    ):
         self.saw_pixel_values = pixel_values is not None
+        self.image_grid_thw = image_grid_thw
+        self.mm_token_type_ids = mm_token_type_ids
         hidden_states = input_ids.float().unsqueeze(-1).repeat(1, 1, 3)
         for layer in self.language_model.layers:
             hidden_states = layer(hidden_states)
@@ -218,6 +256,40 @@ class TargetForwardTest(unittest.TestCase):
         self.assertTrue(model.saw_pixel_values)
         self.assertEqual(result.target_hidden_states.shape, (1, 3, 6))
         self.assertEqual(result.target_last_hidden_states.shape, (1, 3, 3))
+
+    def test_online_target_preserves_visual_inputs_and_trims_sequence_fields(self):
+        model = _FakeTarget()
+        target = object.__new__(DeepseekV4OnlineTarget)
+        target.model = model
+        target.target_layer_ids = [0, 1]
+        target.topology = types.SimpleNamespace(context_parallel_size=1)
+        target.device = torch.device("cpu")
+        target.feature_output_device = None
+        target.require_phase_guard = False
+
+        result = target.forward_training_batch(
+            {
+                "input_ids": torch.tensor([[1, 99, 3, 0]]),
+                "attention_mask": torch.tensor([[1, 1, 1, 0]]),
+                "loss_mask": torch.tensor([[0, 0, 1, 0]]),
+                "mm_token_type_ids": torch.tensor([[0, 1, 0, 0]]),
+                "pixel_values": torch.ones((4, 3)),
+                "image_grid_thw": torch.tensor([[1, 2, 2]]),
+            }
+        )
+
+        self.assertTrue(model.saw_pixel_values)
+        torch.testing.assert_close(
+            model.image_grid_thw,
+            torch.tensor([[1, 2, 2]]),
+        )
+        torch.testing.assert_close(
+            model.mm_token_type_ids,
+            torch.tensor([[0, 1, 0]]),
+        )
+        self.assertEqual(result["input_ids"].shape, (1, 3))
+        self.assertEqual(result["target_hidden_states"].shape, (1, 3, 6))
+        self.assertEqual(result["target_last_hidden_states"].shape, (1, 3, 3))
 
 
 if __name__ == "__main__":

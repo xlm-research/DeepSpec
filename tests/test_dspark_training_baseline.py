@@ -141,6 +141,7 @@ class FixedFeatureTrainer(Qwen3_8DSparkTrainer):
         independent_loss=False,
         fixture=None,
         model_config=None,
+        model_factory=Qwen3_8DSparkModel,
     ):
         self.device = runtime.device
         self.global_rank = runtime.global_rank
@@ -184,7 +185,7 @@ class FixedFeatureTrainer(Qwen3_8DSparkTrainer):
         config.confidence_head_with_markov = True
         config._attn_implementation = "flex_attention"
         torch.manual_seed(20260914)
-        draft = Qwen3_8DSparkModel(config).to(device=self.device, dtype=dtype)
+        draft = model_factory(config).to(device=self.device, dtype=dtype)
         draft.set_embedding_head_trainable(False)
         if fixture is not None:
             draft.load_state_dict(fixture["initial_weights"])

@@ -12,6 +12,7 @@ import sys
 import tempfile
 import unittest
 from unittest.mock import patch
+import weakref
 
 import numpy as np
 import torch
@@ -115,6 +116,7 @@ class QwenDraftPhaseCheckpointTest(unittest.TestCase):
                     "loss_decay_gamma": 4.0,
                 },
                 "train": {
+                    "draft_phase_unload": mode == "lifecycle",
                     "parallel": ParallelConfig(dp_shard=2).to_dict(),
                     "offline_target_parallel": ParallelConfig(tp=2).to_dict(),
                     "precision": "fp32",
@@ -159,6 +161,22 @@ class QwenDraftPhaseCheckpointTest(unittest.TestCase):
 
         def produce(job_path, config, devices):
             teacher_starts.append(trainer.next_micro_step)
+            if mode == "lifecycle" and trainer.next_micro_step:
+                self.assertIsNone(
+                    trainer.model, "draft model remains resident in target phase"
+                )
+                self.assertIsNone(
+                    trainer.optimizer,
+                    "draft optimizer remains resident in target phase",
+                )
+                self.assertTrue(
+                    all(reference() is None for reference in original_state)
+                )
+                # External extraction must not perturb the restored draft RNG.
+                torch.rand(37, device=runtime.device)
+                torch.rand(29)
+                random.random()
+                np.random.rand(31)
             job = load_json(job_path)
             for request in job["requests"]:
                 batch = torch.load(request["input_path"], weights_only=True)
@@ -211,6 +229,21 @@ class QwenDraftPhaseCheckpointTest(unittest.TestCase):
                 temporary.cleanup()
             return
         trainer = ProducerFixtureTrainer(runtime.local_rank, args, fixture)
+        original_state = [
+            weakref.ref(value)
+            for value in (
+                trainer.model,
+                trainer.optimizer,
+                *trainer.model.parameters(),
+                *trainer.model.buffers(),
+                *(
+                    value
+                    for state in trainer.optimizer.optimizer.state.values()
+                    for value in state.values()
+                    if isinstance(value, torch.Tensor)
+                ),
+            )
+        ]
         if mode == "save":
             trainer._active_train_end_step = 1
         if mode == "resume_failure":

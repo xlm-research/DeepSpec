@@ -36,3 +36,11 @@ The DFlash draft-model design and training recipe inform the DSpark/DFlash
 configurations and modeling in this repository.
 
 ================================================================================
+TorchTitan — https://github.com/pytorch/torchtitan
+License: BSD 3-Clause
+--------------------------------------------------------------------------------
+The compact DeepEP training dispatch/combine and permutation design in
+deepspec/distributed/deepep_dispatch.py is adapted from TorchTitan. That file
+retains the copyright notice, license conditions, and disclaimer.
+
+================================================================================

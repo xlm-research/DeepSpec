@@ -1,0 +1,135 @@
+{
+  "benchmark": "glm5_draft_expert_ep_microbenchmark",
+  "microbenchmark": true,
+  "scope": "Production GLM grouped_mm experts and EP dispatch/combine forward+backward; fixed precomputed routing",
+  "excludes": "target, router projection, shared experts, attention, loss, FSDP/replica gradient sync, optimizer, initialization, warmup/JIT",
+  "memory_scope": "PyTorch allocator peaks; separately reported DeepEP communication-buffer capacity is not included in allocator peaks",
+  "dtype": "bfloat16",
+  "world_size": 2,
+  "gpu": "NVIDIA B300 SXM6 AC",
+  "torch": "2.11.0+cu130",
+  "config": {
+    "backend": "both",
+    "hidden": 4096,
+    "intermediate": 2048,
+    "num_experts": 288,
+    "top_k": 8,
+    "tokens": 3584,
+    "chunk": 4096,
+    "warmup": 3,
+    "steps": 10,
+    "seed": 20260908,
+    "output": "/mnt/afs-agentpro/lezewei/.venvs/deepspec-deepep-v2-artifacts/glm5_ep_production_geometry_microbenchmark.json"
+  },
+  "EP_DISABLE_GIN": "1",
+  "results": [
+    {
+      "backend": "native",
+      "effective_chunk": 4096,
+      "deepep_max_tokens_per_rank": null,
+      "max_rank_forward_backward_ms": {
+        "mean": 14.324054284952581,
+        "median": 14.32021998334676,
+        "p95": 14.37894906848669,
+        "min": 14.289533020928502,
+        "max": 14.37894906848669
+      },
+      "max_rank_peak_pytorch_allocated_bytes": 15292115456,
+      "max_rank_peak_pytorch_reserved_bytes": 16949182464,
+      "max_rank_deepep_buffer_bytes": 0,
+      "ranks": [
+        {
+          "rank": 0,
+          "forward_backward_ms": [
+            14.303191099315882,
+            14.34158580377698,
+            14.326703967526555,
+            14.299141941592097,
+            14.289533020928502,
+            14.328423887491226,
+            14.305396936833858,
+            14.37894906848669,
+            14.317470137029886,
+            14.313735999166965
+          ],
+          "peak_pytorch_allocated_bytes": 15290294784,
+          "peak_pytorch_reserved_bytes": 16928210944,
+          "deepep_buffer_bytes": 0
+        },
+        {
+          "rank": 1,
+          "forward_backward_ms": [
+            14.278304995968938,
+            14.356419909745455,
+            14.282780000939965,
+            14.276905916631222,
+            14.285916928201914,
+            14.32093302719295,
+            14.30982700549066,
+            14.316370943561196,
+            14.334616949781775,
+            14.285532059147954
+          ],
+          "peak_pytorch_allocated_bytes": 15292115456,
+          "peak_pytorch_reserved_bytes": 16949182464,
+          "deepep_buffer_bytes": 0
+        }
+      ]
+    },
+    {
+      "backend": "deepep",
+      "effective_chunk": 4096,
+      "deepep_max_tokens_per_rank": 4096,
+      "max_rank_forward_backward_ms": {
+        "mean": 14.309108629822731,
+        "median": 14.27465956658125,
+        "p95": 14.528147177770734,
+        "min": 14.232282061129808,
+        "max": 14.528147177770734
+      },
+      "max_rank_peak_pytorch_allocated_bytes": 15528120832,
+      "max_rank_peak_pytorch_reserved_bytes": 16917725184,
+      "max_rank_deepep_buffer_bytes": 69206016,
+      "ranks": [
+        {
+          "rank": 0,
+          "forward_backward_ms": [
+            14.255085028707981,
+            14.23593214713037,
+            14.245057944208384,
+            14.232282061129808,
+            14.384900918230414,
+            14.328602002933621,
+            14.294234104454517,
+            14.342349953949451,
+            14.528147177770734,
+            14.244494959712029
+          ],
+          "peak_pytorch_allocated_bytes": 15523267072,
+          "peak_pytorch_reserved_bytes": 16917725184,
+          "deepep_buffer_bytes": 69206016
+        },
+        {
+          "rank": 1,
+          "forward_backward_ms": [
+            14.241087017580867,
+            14.208862092345953,
+            14.199592173099518,
+            14.197983080521226,
+            14.334118925035,
+            14.302997151389718,
+            14.245442114770412,
+            14.309685910120606,
+            14.489379012957215,
+            14.202293939888477
+          ],
+          "peak_pytorch_allocated_bytes": 15528120832,
+          "peak_pytorch_reserved_bytes": 16917725184,
+          "deepep_buffer_bytes": 69206016
+        }
+      ]
+    }
+  ],
+  "deep_ep": "2.1.0+01dc3aa",
+  "native_over_deepep_mean_time_ratio": 1.00104448540552
+}

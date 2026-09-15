@@ -167,7 +167,7 @@ def synchronize_module_gradients(
 
 
 def synchronize_pure_expert_gradients(modules: list[nn.Module], *, sparse_mesh) -> None:
-    """Average EP-owned parameters over their orthogonal replica dimensions."""
+    """Normalize EP-owned gradients to the dense model's global-token mean."""
 
     if not modules or sparse_mesh is None:
         return
@@ -178,6 +178,21 @@ def synchronize_pure_expert_gradients(modules: list[nn.Module], *, sparse_mesh) 
         if size > 1:
             process_groups.append((mesh.get_group(), size))
     synchronize_module_gradients(modules, process_groups=process_groups)
+    # DSpark compensates for dense FSDP's average by scaling the local loss
+    # by D = dp_replicate * dp_shard * cp. Expert dispatch sums gradients
+    # across EP, while the replica average above divides by D * TP / EP.
+    # The current pure-EP dispatcher also receives TP-replicated tokens, so
+    # each global token contributes TP times: the remaining factor is EP.
+    # Apply this only to expert parameters; router and input gradients already
+    # follow the dense reduction path and must retain their existing scale.
+    ep_size = int(sparse_mesh["ep"].size())
+    if ep_size > 1:
+        seen_parameters: set[int] = set()
+        for module in modules:
+            for parameter in module.parameters():
+                if id(parameter) not in seen_parameters and parameter.grad is not None:
+                    parameter.grad.div_(ep_size)
+                seen_parameters.add(id(parameter))
 
 
 __all__ = [

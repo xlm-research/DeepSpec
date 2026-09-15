@@ -1,5 +1,6 @@
 import os
 import math
+import sys
 
 from deepspec.trainer import Glm5NextDSparkTrainer
 from deepspec.utils.constant import BASE_CKPT_DIR, BASE_TB_DIR
@@ -26,6 +27,7 @@ runtime_target_dp_shard = (
     if runtime_target_is_node_local
     else max(runtime_world_size // 4, 1)
 )
+runtime_target_ep = math.gcd(runtime_target_dp_shard * 4, 288)
 
 model = dict(
     target_model_name_or_path=(
@@ -33,7 +35,11 @@ model = dict(
     ),
     block_size=7,
     num_draft_layers=3,
-    target_layer_ids=[0, 1, 2],
+    # Sample the end of the dense prefix plus middle/late sparse layers. This
+    # preserves progressive target depth instead of feeding the draft three
+    # nearly adjacent early representations. The full 45-layer target still
+    # runs so L1/confidence supervision uses its true final normalized state.
+    target_layer_ids=[40, 41, 42],
     # GLM-5.3 has no mask token. Use the final reserved vocabulary row.
     mask_token_id=154879,
     num_anchors=512,
@@ -55,10 +61,29 @@ train = dict(
     precision="bf16",
     local_batch_size=1,
     global_batch_size=max(runtime_world_size, 8),
-    # Requested optimizer-aligned target-cache partition count. The trainer
-    # caps it at the remaining optimizer steps so short runs and resumes keep
-    # every partition non-empty.
-    data_batch_size=256,
+    # Requested optimizer-aligned target-cache partition count. With model
+    # swap, partition the entire dataset and repeat its boundaries each epoch.
+    data_batch_size=8,
+    # Opt-in lifecycle that alternates the full GLM target with the complete
+    # draft training state. The launcher uses data_batch_size by default, or
+    # clears it when PARTITION_MAX_SAMPLES selects a per-partition sample cap.
+    partitioned_model_swap=dict(
+        enabled=False,
+        max_samples=512,
+        target_backend="native",
+        # Independent node-local TP4 vLLM processes exit before draft loading.
+        # Use TARGET_BACKEND=vllm with the FSDP launcher to enable this backend.
+        vllm=dict(
+            python_executable=sys.executable,
+            source_dir=None,
+            tensor_parallel_size=4,
+            max_num_batched_tokens=8192,
+            gpu_memory_utilization=0.8,
+            load_format="instanttensor",
+            timeout_seconds=86400,
+            raw_cache_dir=None,
+        ),
+    ),
     num_train_epochs=1,
     # Derive the full schedule from the usable dataset by default. Launchers
     # may set a positive max_train_steps for bounded diagnostics.
@@ -75,6 +100,7 @@ train = dict(
         use_fsdp=True,
         context_parallel_backend="model_native",
         expert_dispatch_backend="native",
+        expert_dispatch_max_tokens_per_rank=4096,
         reshard_after_forward=False,
         forward_prefetch=True,
         backward_prefetch=True,
@@ -82,20 +108,18 @@ train = dict(
         reduce_dtype="bf16",
         fsdp_wrap_granularity="block",
     ),
-    # target_layer_ids=[0, 1, 2] truncates GLM before its first MoE layer
-    # (index 3), so the retained target has no experts to partition. Keep EP=1;
-    # the draft's 288 routed experts use the independent EP=8 view above.
-    target_parallel=dict(ep=1),
+    target_parallel=dict(ep=runtime_draft_ep),
     # Both the reusable full-cache runner and bounded offline data batches use
     # a target mesh independent of draft training. TP remains fixed at four;
     # the DP-replicate/FSDP dimensions scale with the torchrun node layout.
-    # EP remains 1 because the truncated target is dense.
+    # EP overlays the target FSDP/TP rank domain so all 288 routed experts can
+    # be loaded rank-locally while dense state remains TP4 + FSDP2 per node.
     offline_target_parallel=dict(
         dp_replicate=runtime_target_dp_replicate,
         dp_shard=runtime_target_dp_shard,
         cp=1,
         tp=4,
-        ep=1,
+        ep=runtime_target_ep,
         expert_tp=1,
         use_fsdp=True,
     ),
@@ -112,6 +136,11 @@ profiling = dict(enabled=False)
 
 data = dict(
     online_target=False,
+    # Keep production text-only by default; visual debug runs opt in through
+    # MULTIMODAL=true and resolve relative media paths under media_root.
+    multimodal=False,
+    media_root=None,
+    media_uri_map=None,
     # Preserve target-first/offline semantics without materializing the full
     # dataset: generate one bounded cache partition, train it, then delete it.
     offline_target_data_batches=True,
@@ -142,6 +171,7 @@ def finalize_cfg(cfg):
         "runtime_target_is_node_local",
         "runtime_target_dp_replicate",
         "runtime_target_dp_shard",
+        "runtime_target_ep",
     ):
         cfg.pop(runtime_key, None)
     logging_cfg = dict(cfg["logging"])

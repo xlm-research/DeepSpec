@@ -515,11 +515,13 @@ def _parallelize_shared_mlp(mlp: nn.Module, *, topology) -> None:
     mlp.intermediate_size = int(mlp.gate_proj.out_features)
 
 
-def _parallelize_moe(moe: nn.Module, *, topology) -> None:
+def _parallelize_moe(moe: nn.Module, *, topology, expert_dispatcher=None) -> None:
     ep_size = int(topology.expert_parallel_size)
     ep_rank = int(topology.expert_parallel_rank)
     ep_group = topology.expert_parallel_group
     ep_over_cp = bool(getattr(topology, "pure_expert_parallel", False))
+    if expert_dispatcher is not None and not ep_over_cp:
+        raise ValueError("DeepEP requires the draft's pure expert-parallel token layout.")
     experts = moe.experts
     parameters_pre_sharded = bool(
         getattr(experts, "_deepspec_expert_parameters_distributed", False)
@@ -566,12 +568,18 @@ def _parallelize_moe(moe: nn.Module, *, topology) -> None:
         experts.num_experts = local_experts
 
     if ep_size > 1:
-        configured_chunk = int(
-            os.environ.get("DEEPSPEC_V4_EP_TOKEN_CHUNK", "4096")
+        configured_chunk = (
+            int(expert_dispatcher.max_tokens_per_rank)
+            if expert_dispatcher is not None
+            else int(os.environ.get("DEEPSPEC_V4_EP_TOKEN_CHUNK", "4096"))
         )
         if configured_chunk < 1:
             raise ValueError("DEEPSPEC_V4_EP_TOKEN_CHUNK must be positive.")
-        token_chunk_size = max(configured_chunk, ep_size)
+        token_chunk_size = (
+            configured_chunk
+            if expert_dispatcher is not None
+            else max(configured_chunk, ep_size)
+        )
 
         def all_to_all_experts_forward(
             self, hidden_states, top_k_index, top_k_weights
@@ -599,6 +607,10 @@ def _parallelize_moe(moe: nn.Module, *, topology) -> None:
                     group=ep_group,
                 )
                 collective_tokens = int(collective_tokens_tensor.item())
+                if expert_dispatcher is not None:
+                    # Keep a differentiable collective path even if all ranks
+                    # have an empty input. This dummy token has zero weight.
+                    collective_tokens = max(collective_tokens, 1)
                 # TorchTitan's EP dispatcher enters AllToAll with a common
                 # physical token count on every EP rank. Online distillation
                 # can produce different local sequence lengths, so pad the
@@ -620,15 +632,23 @@ def _parallelize_moe(moe: nn.Module, *, topology) -> None:
                     top_k_index = torch.cat(
                         [
                             top_k_index,
-                            torch.arange(
-                                padding_tokens
-                                * math.prod(top_k_index.shape[1:]),
-                                device=top_k_index.device,
-                                dtype=top_k_index.dtype,
-                            ).reshape(
-                                padding_tokens, *top_k_index.shape[1:]
-                            )
-                            % global_experts,
+                            (
+                                # DeepEP understands invalid routing slots.
+                                # Keep true zero-score routes differentiable,
+                                # but avoid dispatch/GEMM for padding tokens.
+                                top_k_index.new_full(
+                                    (padding_tokens, *top_k_index.shape[1:]), -1
+                                )
+                                if expert_dispatcher is not None
+                                else torch.arange(
+                                    padding_tokens
+                                    * math.prod(top_k_index.shape[1:]),
+                                    device=top_k_index.device,
+                                    dtype=top_k_index.dtype,
+                                ).reshape(
+                                    padding_tokens, *top_k_index.shape[1:]
+                                ) % global_experts
+                            ),
                         ],
                         dim=0,
                     )
@@ -660,6 +680,16 @@ def _parallelize_moe(moe: nn.Module, *, topology) -> None:
                 chunk_end = min(chunk_start + token_chunk_size, total_tokens)
                 full_chunk_length = chunk_end - chunk_start
                 full_hidden_chunk = hidden_states[chunk_start:chunk_end]
+                if expert_dispatcher is not None:
+                    output_chunks.append(
+                        expert_dispatcher(
+                            full_hidden_chunk,
+                            top_k_index[chunk_start:chunk_end],
+                            top_k_weights[chunk_start:chunk_end],
+                            original_experts_forward,
+                        )
+                    )
+                    continue
                 if ep_over_cp:
                     source_splits = None
                     source_length = full_chunk_length
@@ -781,7 +811,11 @@ def _parallelize_moe(moe: nn.Module, *, topology) -> None:
             return torch.cat(output_chunks, dim=0)[:original_total_tokens]
 
         experts.forward = MethodType(all_to_all_experts_forward, experts)
-        experts._deepspec_expert_dispatch = "all_to_all"
+        experts._deepspec_expert_dispatch = (
+            "deepep" if expert_dispatcher is not None else "all_to_all"
+        )
+        if expert_dispatcher is not None:
+            experts._deepspec_deepep_dispatcher = expert_dispatcher
 
     _parallelize_shared_mlp(moe.shared_experts, topology=topology)
     experts._deepspec_expert_parallel_size = ep_size

@@ -17,6 +17,7 @@ class ChatTemplate:
     assistant_loss_prefix: str | None = None
     tokenizer_chat_template: str | None = None
     include_end_of_turn_in_loss: bool = True
+    assistant_terminators: tuple[str, ...] | None = None
 
 
 class TemplateRegistry:
@@ -71,6 +72,12 @@ TEMPLATE_REGISTRY.register(
         end_of_turn_token="<|user|>",
         assistant_loss_prefix="<think></think>",
         include_end_of_turn_in_loss=False,
+        assistant_terminators=(
+            "<|system|>",
+            "<|user|>",
+            "<|assistant|>",
+            "<|observation|>",
+        ),
     ),
 )
 
@@ -210,7 +217,12 @@ class GeneralParser:
         self.system_prompt = chat_template.system_prompt
         self.assistant_loss_prefix = chat_template.assistant_loss_prefix or ""
         self.assistant_message_separator = chat_template.assistant_header or ""
-        end_of_turn = re.escape(chat_template.end_of_turn_token or "")
+        terminators = chat_template.assistant_terminators or (
+            chat_template.end_of_turn_token or "",
+        )
+        end_of_turn = "(?:" + "|".join(
+            re.escape(value) for value in terminators
+        ) + ")"
         if chat_template.include_end_of_turn_in_loss:
             content_pattern = r"([\s\S]*?(?:" + end_of_turn + "|$))"
         else:

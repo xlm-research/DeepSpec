@@ -1,0 +1,5 @@
+# Build/runtime dependencies for scripts/setup_deepep_env.sh.
+# DeepEP itself is built from the commit pinned in that script after these install.
+# The isolated venv inherits its base interpreter's PyTorch; this does not upgrade it.
+nvidia-nccl-cu13==2.30.4
+nvidia-nvshmem-cu13==3.4.5

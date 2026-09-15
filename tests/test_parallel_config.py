@@ -44,6 +44,28 @@ class ParallelConfigTest(unittest.TestCase):
         with self.assertRaisesRegex(NotImplementedError, "micro-batch scheduler"):
             ParallelConfig(dynamic_context_parallel=True).validate_world_size(1)
 
+    def test_deepep_requires_supported_training_layout(self):
+        ParallelConfig(dp_shard=2, ep=2, expert_dispatch_backend="deepep").validate_world_size(2)
+        for options in (
+            {"ep": 1},
+            {"tp": 2, "dp_shard": 1},
+            {"cp": 2, "dp_shard": 1},
+            {"use_compile": True},
+            {"use_activation_checkpoint": True},
+            {"expert_dispatch_max_tokens_per_rank": 0},
+        ):
+            with self.subTest(options=options):
+                values = dict(dp_shard=2, ep=2, expert_dispatch_backend="deepep")
+                values.update(options)
+                with self.assertRaises((ValueError, NotImplementedError)):
+                    ParallelConfig(**values).validate_world_size(2)
+
+    def test_deepep_rejects_models_without_the_training_adapter(self):
+        config = ParallelConfig(dp_shard=2, ep=2, expert_dispatch_backend="deepep")
+        config.validate_model(SimpleNamespace(model_type="glm5_next_text", n_routed_experts=8))
+        with self.assertRaisesRegex(NotImplementedError, "GLM-5.3"):
+            config.validate_model(SimpleNamespace(model_type="deepseek_v4", n_routed_experts=8))
+
     def test_legacy_config_maps_without_changing_world_layout(self):
         config = ParallelConfig.from_mapping(
             {

@@ -29,6 +29,8 @@ class ParallelConfig:
     use_compile: bool = False
 
     expert_dispatch_backend: str = "native"
+    # Maximum source tokens in one draft DeepEP dispatch; longer inputs are chunked.
+    expert_dispatch_max_tokens_per_rank: int = 4096
     context_parallel_backend: str = "pytorch"
     dynamic_context_parallel: bool = False
     reshard_after_forward: bool = True
@@ -204,6 +206,22 @@ class ParallelConfig:
                 f"{self.expert_dispatch_backend!r}."
             )
         if (
+            not isinstance(self.expert_dispatch_max_tokens_per_rank, int)
+            or isinstance(self.expert_dispatch_max_tokens_per_rank, bool)
+            or self.expert_dispatch_max_tokens_per_rank < 1
+        ):
+            raise ValueError("expert_dispatch_max_tokens_per_rank must be a positive integer.")
+        if self.expert_dispatch_backend == "deepep":
+            if self.ep == 1:
+                raise ValueError("DeepEP draft training requires ep > 1.")
+            if self.tp != 1 or self.cp != 1:
+                raise NotImplementedError("DeepEP draft training currently requires TP=CP=1.")
+            if self.use_compile or self.use_activation_checkpoint:
+                raise NotImplementedError(
+                    "DeepEP draft training currently requires eager execution without "
+                    "torch.compile or activation checkpointing."
+                )
+        if (
             not isinstance(self.prefetch_depth, int)
             or isinstance(self.prefetch_depth, bool)
             or self.prefetch_depth < 1
@@ -278,6 +296,11 @@ class ParallelConfig:
         if self.ep > 1 and num_experts and num_experts % self.ep:
             raise ValueError(
                 f"EP={self.ep} requires num_experts={num_experts} to be divisible by EP."
+            )
+        if self.expert_dispatch_backend == "deepep" and model_type != "glm5_next_text":
+            raise NotImplementedError(
+                "The DeepEP training adapter is currently implemented for the GLM-5.3 "
+                "DSpark draft (model_type='glm5_next_text') only."
             )
         model_name = type(model_or_config).__name__
         is_dspark = "DSpark" in model_name or "DFlash2" in model_name

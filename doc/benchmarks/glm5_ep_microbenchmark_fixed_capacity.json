@@ -1,0 +1,175 @@
+{
+  "benchmark": "glm5_draft_expert_ep_microbenchmark",
+  "microbenchmark": true,
+  "scope": "Production GLM grouped_mm experts and EP dispatch/combine forward+backward; fixed precomputed routing",
+  "excludes": "target, router projection, shared experts, attention, loss, FSDP/replica gradient sync, optimizer, initialization, warmup/JIT",
+  "memory_scope": "PyTorch allocator peaks; separately reported DeepEP communication-buffer capacity is not included in allocator peaks",
+  "dtype": "bfloat16",
+  "world_size": 2,
+  "gpu": "NVIDIA B300 SXM6 AC",
+  "torch": "2.11.0+cu130",
+  "config": {
+    "backend": "both",
+    "hidden": 4096,
+    "intermediate": 512,
+    "num_experts": 8,
+    "top_k": 2,
+    "tokens": 256,
+    "chunk": 4096,
+    "warmup": 5,
+    "steps": 20,
+    "seed": 20260908,
+    "output": "/mnt/afs-agentpro/lezewei/.venvs/deepspec-deepep-v2-artifacts/glm5_ep_microbenchmark_fixed_capacity.json"
+  },
+  "EP_DISABLE_GIN": "1",
+  "results": [
+    {
+      "backend": "native",
+      "effective_chunk": 4096,
+      "deepep_max_tokens_per_rank": null,
+      "max_rank_forward_backward_ms": {
+        "mean": 5.1556937280111015,
+        "median": 5.075223511084914,
+        "p95": 5.558500066399574,
+        "min": 4.8594430554658175,
+        "max": 6.522805197164416
+      },
+      "max_rank_peak_pytorch_allocated_bytes": 118335488,
+      "max_rank_peak_pytorch_reserved_bytes": 148897792,
+      "max_rank_deepep_buffer_bytes": 0,
+      "ranks": [
+        {
+          "rank": 0,
+          "forward_backward_ms": [
+            4.926889901980758,
+            5.098388995975256,
+            5.083172116428614,
+            4.956534830853343,
+            4.975045099854469,
+            5.043670069426298,
+            4.93335397914052,
+            5.558500066399574,
+            5.108124110847712,
+            5.091205006465316,
+            5.067274905741215,
+            4.8594430554658175,
+            4.979874938726425,
+            5.124315153807402,
+            5.093109793961048,
+            5.035693058744073,
+            5.297069903463125,
+            4.959308076649904,
+            4.874538164585829,
+            5.391934188082814
+          ],
+          "peak_pytorch_allocated_bytes": 118335488,
+          "peak_pytorch_reserved_bytes": 146800640,
+          "deepep_buffer_bytes": 0
+        },
+        {
+          "rank": 1,
+          "forward_backward_ms": [
+            4.426996922120452,
+            4.5145489275455475,
+            4.523763200268149,
+            4.476207075640559,
+            4.440758842974901,
+            4.478198010474443,
+            4.4967608992010355,
+            5.216753110289574,
+            4.564802162349224,
+            4.5265150256454945,
+            4.578900057822466,
+            4.746574210003018,
+            4.939829930663109,
+            5.14550507068634,
+            5.190521012991667,
+            5.053458968177438,
+            6.522805197164416,
+            5.132128018885851,
+            4.996045026928186,
+            5.3625949658453465
+          ],
+          "peak_pytorch_allocated_bytes": 116933632,
+          "peak_pytorch_reserved_bytes": 148897792,
+          "deepep_buffer_bytes": 0
+        }
+      ]
+    },
+    {
+      "backend": "deepep",
+      "effective_chunk": 4096,
+      "deepep_max_tokens_per_rank": 4096,
+      "max_rank_forward_backward_ms": {
+        "mean": 5.507078638765961,
+        "median": 5.480316118337214,
+        "p95": 5.7090697810053825,
+        "min": 5.254730815067887,
+        "max": 5.961877992376685
+      },
+      "max_rank_peak_pytorch_allocated_bytes": 122657280,
+      "max_rank_peak_pytorch_reserved_bytes": 148897792,
+      "max_rank_deepep_buffer_bytes": 69206016,
+      "ranks": [
+        {
+          "rank": 0,
+          "forward_backward_ms": [
+            5.0958129577338696,
+            5.6162679102271795,
+            5.254730815067887,
+            5.3843429777771235,
+            5.343785043805838,
+            5.380046786740422,
+            5.515905097126961,
+            5.594107089564204,
+            5.394347943365574,
+            5.961877992376685,
+            5.345636047422886,
+            5.645143799483776,
+            5.374767119064927,
+            5.244215950369835,
+            4.814147017896175,
+            4.934793803840876,
+            5.352778127416968,
+            5.623989040032029,
+            5.597274051979184,
+            5.481464089825749
+          ],
+          "peak_pytorch_allocated_bytes": 122657280,
+          "peak_pytorch_reserved_bytes": 146800640,
+          "deepep_buffer_bytes": 69206016
+        },
+        {
+          "rank": 1,
+          "forward_backward_ms": [
+            5.7090697810053825,
+            5.448071984574199,
+            5.185332149267197,
+            4.946904955431819,
+            5.019600037485361,
+            5.077708978205919,
+            5.3758458234369755,
+            5.484328139573336,
+            5.399835994467139,
+            5.535481963306665,
+            5.5848159827291965,
+            5.592545960098505,
+            5.42506598867476,
+            5.479168146848679,
+            5.3529259748756886,
+            5.438978085294366,
+            5.183092085644603,
+            5.067026941105723,
+            5.044142948463559,
+            4.963947925716639
+          ],
+          "peak_pytorch_allocated_bytes": 120918528,
+          "peak_pytorch_reserved_bytes": 148897792,
+          "deepep_buffer_bytes": 69206016
+        }
+      ]
+    }
+  ],
+  "deep_ep": "2.1.0+01dc3aa",
+  "native_over_deepep_mean_time_ratio": 0.9361939543987339
+}

@@ -1,0 +1,724 @@
+[2026-09-12T14:13:12.186724742Z] 正在拷贝：/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/envs/deepspec_vllm_torchtitan_envs.tar → /tmp/deepspec-env-tar-cache.apEoQz/deepspec_vllm_torchtitan_envs.tar
+[2026-09-12T14:13:36.188252432Z] 正在解包：/tmp/deepspec-env-tar-cache.apEoQz/deepspec_vllm_torchtitan_envs.tar → /tmp/deepspec-env-tar-cache.apEoQz
+[2026-09-12T14:13:42.188089574Z] 环境准备完成：/tmp/deepspec-env-tar-cache.apEoQz/deepspec_vllm_torchtitan_envs
+[2026-09-12T14:13:45.191195164Z] Using bounded offline Qwen3.8 target partitions; no full cache is required.
+[2026-09-12T14:13:45.191301432Z] Launching Qwen3.8-27B DSpark FSDP2 on 32 GPUs:
+[2026-09-12T14:13:45.191419051Z]   start=2026-09-12 22:13:44 +0800, host=pt-ea334f03da8d493a8bbcab49b905fd6f-master-0, pid=29
+[2026-09-12T14:13:45.191516376Z]   node=0/4, rendezvous=pt-ea334f03da8d493a8bbcab49b905fd6f-master-0.pt-ea334f03da8d493a8bbcab49b905fd6f:23456
+[2026-09-12T14:13:45.191630955Z]   visible GPUs per node=8, CUDA_VISIBLE_DEVICES=<unset>
+[2026-09-12T14:13:45.191728465Z]   homogeneous-node requirement=every node must detect 8 visible GPUs
+[2026-09-12T14:13:45.191837641Z]   topology=DP_REPLICATE=4, DP_SHARD=2, CP=1, TP=4, effective FSDP shard=2
+[2026-09-12T14:13:45.191938837Z]   data parallel size=8
+[2026-09-12T14:13:45.192053526Z]   local batch=1, global batch=512, gradient accumulation=64
+[2026-09-12T14:13:45.192153543Z]   schedule=dataset-derived, epochs=10
+[2026-09-12T14:13:45.192268100Z]   target model=/mnt/afs_rl/hongjiawei1/code/ms-swift-hjw/outputs/sensenova-flash-lite-v42-20260830/v2-20260904-112039/checkpoint-3800
+[2026-09-12T14:13:45.192374781Z]   target supervision=bounded offline, data partitions per epoch=1024
+[2026-09-12T14:13:45.192489762Z]   transient target cache=/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/target_data_batch_cache
+[2026-09-12T14:13:45.192630797Z]   JSONL index cache=/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/jsonl_index_cache
+[2026-09-12T14:13:45.192722058Z]   target FSDP shard includes draft TP ranks=4
+[2026-09-12T14:13:45.192838123Z]   source JSONL=/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/train_dataset/sensenova-flash-lite-v42-text-all.jsonl
+[2026-09-12T14:13:45.192949323Z]   min loss tokens=0
+[2026-09-12T14:13:45.193052416Z]   checkpoint dir=/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/checkpoints
+[2026-09-12T14:13:45.193169937Z]   tensorboard dir=/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/tensorboard
+[2026-09-12T14:13:45.193270276Z]   wandb=true, project=sensenova-flash-lite-dspark, name=dspark_qwen3_8_27b_vllm, dir=/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/wandb
+[2026-09-12T14:13:45.193390645Z]   torch.compile=false, save checkpoints=true
+[2026-09-12T14:13:45.193486282Z]   production safety=true, dry run=false
+[2026-09-12T14:13:45.193615778Z]   node log=/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/logs/node_rank_0.log
+[2026-09-12T14:13:45.193728645Z]   launcher=/tmp/deepspec-env-tar-cache.apEoQz/deepspec_vllm_torchtitan_envs/bin/python -m torch.distributed.run
+[2026-09-12T14:13:45.193853607Z] + /tmp/deepspec-env-tar-cache.apEoQz/deepspec_vllm_torchtitan_envs/bin/python -m torch.distributed.run --nproc_per_node 8 --nnodes 4 --node_rank 0 --master_addr pt-ea334f03da8d493a8bbcab49b905fd6f-master-0.pt-ea334f03da8d493a8bbcab49b905fd6f --master_port 23456 --log-dir /mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/logs/torchrun_node_rank_0 --redirects 3 --tee 3 train.py --config /mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/config/dspark/dspark_qwen3_8_27
+[2026-09-12T14:14:07.204430428Z] [default0]:[deepspec-process] host=pt-ea334f03da8d493a8bbcab49b905fd6f-master-0 pid=112 global_rank=0/32 local_rank=0 cuda_visible_devices=<unset>
+[2026-09-12T14:14:07.204548234Z] [default0]:{
+[2026-09-12T14:14:07.204665683Z] [default0]:    "Qwen3_8VllmDSparkTrainer": "<class 'Qwen3_8VllmDSparkTrainer'>",
+[2026-09-12T14:14:07.204797571Z] [default0]:    "data": {
+[2026-09-12T14:14:07.204900033Z] [default0]:        "online_target": false,
+[2026-09-12T14:14:07.205028059Z] [default0]:        "offline_target_data_batches": true,
+[2026-09-12T14:14:07.205125199Z] [default0]:        "train_data_path": "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/train_dataset/sensenova-flash-lite-v42-text-all.jsonl",
+[2026-09-12T14:14:07.205249295Z] [default0]:        "jsonl_index_cache_dir": "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/jsonl_index_cache",
+[2026-09-12T14:14:07.205344596Z] [default0]:        "data_batch_cache_dir": "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/target_data_batch_cache",
+[2026-09-12T14:14:07.205467030Z] [default0]:        "target_cache_path": null,
+[2026-09-12T14:14:07.205575866Z] [default0]:        "chat_template": "qwen",
+[2026-09-12T14:14:07.205689059Z] [default0]:        "max_length": 131072,
+[2026-09-12T14:14:07.205790741Z] [default0]:        "min_loss_tokens": 0,
+[2026-09-12T14:14:07.205913140Z] [default0]:        "num_workers": 1,
+[2026-09-12T14:14:07.206025815Z] [default0]:        "prefetch_factor": 1,
+[2026-09-12T14:14:07.206139464Z] [default0]:        "multimodal": false,
+[2026-09-12T14:14:07.206256657Z] [default0]:        "store_target_last_hidden_states": true,
+[2026-09-12T14:14:07.206350009Z] [default0]:        "source_jsonl_path": null
+[2026-09-12T14:14:07.206491612Z] [default0]:    },
+[2026-09-12T14:14:07.206603072Z] [default0]:    "exp_name": "dspark_block7_qwen3_8_27b_vllm",
+[2026-09-12T14:14:07.206698963Z] [default0]:    "finalize_cfg": "<function finalize_cfg>",
+[2026-09-12T14:14:07.206818056Z] [default0]:    "logging": {
+[2026-09-12T14:14:07.206920443Z] [default0]:        "logging_steps": 10,
+[2026-09-12T14:14:07.207037468Z] [default0]:        "checkpointing_steps": 100,
+[2026-09-12T14:14:07.207145373Z] [default0]:        "save_checkpoints": true,
+[2026-09-12T14:14:07.207254691Z] [default0]:        "checkpoint_dir": "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/checkpoints",
+[2026-09-12T14:14:07.207359247Z] [default0]:        "tensorboard_dir": "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/tensorboard"
+[2026-09-12T14:14:07.207471820Z] [default0]:    },
+[2026-09-12T14:14:07.207582962Z] [default0]:    "model": {
+[2026-09-12T14:14:07.207683001Z] [default0]:        "target_model_name_or_path": "/mnt/afs_rl/hongjiawei1/code/ms-swift-hjw/outputs/sensenova-flash-lite-v42-20260830/v2-20260904-112039/checkpoint-3800",
+[2026-09-12T14:14:07.207792978Z] [default0]:        "block_size": 5,
+[2026-09-12T14:14:07.207921342Z] [default0]:        "num_draft_layers": 3,
+[2026-09-12T14:14:07.208036616Z] [default0]:        "target_layer_ids": [
+[2026-09-12T14:14:07.208137324Z] [default0]:            1,
+[2026-09-12T14:14:07.208262828Z] [default0]:            31,
+[2026-09-12T14:14:07.208365496Z] [default0]:            61
+[2026-09-12T14:14:07.208489144Z] [default0]:        ],
+[2026-09-12T14:14:07.208583590Z] [default0]:        "mask_token_id": 248077,
+[2026-09-12T14:14:07.208701127Z] [default0]:        "num_anchors": 512,
+[2026-09-12T14:14:07.208802763Z] [default0]:        "markov_rank": 256,
+[2026-09-12T14:14:07.208925512Z] [default0]:        "markov_head_type": "vanilla",
+[2026-09-12T14:14:07.209020449Z] [default0]:        "confidence_head_alpha": 1.0,
+[2026-09-12T14:14:07.209129664Z] [default0]:        "confidence_head_with_markov": true,
+[2026-09-12T14:14:07.209262281Z] [default0]:        "loss_decay_gamma": 4.0,
+[2026-09-12T14:14:07.209353015Z] [default0]:        "ce_loss_alpha": 0.1,
+[2026-09-12T14:14:07.209489289Z] [default0]:        "l1_loss_alpha": 0.9
+[2026-09-12T14:14:07.209605809Z] [default0]:    },
+[2026-09-12T14:14:07.209725177Z] [default0]:    "project_name": "deepspec",
+[2026-09-12T14:14:07.209821502Z] [default0]:    "seed": 42,
+[2026-09-12T14:14:07.209936040Z] [default0]:    "train": {
+[2026-09-12T14:14:07.210037255Z] [default0]:        "trainer_cls": "<class 'Qwen3_8VllmDSparkTrainer'>",
+[2026-09-12T14:14:07.210150929Z] [default0]:        "lr": 0.0006,
+[2026-09-12T14:14:07.210257353Z] [default0]:        "warmup_ratio": 0.04,
+[2026-09-12T14:14:07.210395918Z] [default0]:        "weight_decay": 0.0,
+[2026-09-12T14:14:07.210526331Z] [default0]:        "precision": "bf16",
+[2026-09-12T14:14:07.210628866Z] [default0]:        "local_batch_size": 1,
+[2026-09-12T14:14:07.210742037Z] [default0]:        "global_batch_size": 512,
+[2026-09-12T14:14:07.210845249Z] [default0]:        "data_partitions": 1024,
+[2026-09-12T14:14:07.210960443Z] [default0]:        "num_train_epochs": 10,
+[2026-09-12T14:14:07.211056683Z] [default0]:        "max_train_steps": null,
+[2026-09-12T14:14:07.211174932Z] [default0]:        "max_grad_norm": 1.0,
+[2026-09-12T14:14:07.211274275Z] [default0]:        "sharding_strategy": "full_shard",
+[2026-09-12T14:14:07.211378601Z] [default0]:        "fsdp_size": 1,
+[2026-09-12T14:14:07.211476804Z] [default0]:        "fsdp_layerwise": false,
+[2026-09-12T14:14:07.211593677Z] [default0]:        "context_parallel_size": 1,
+[2026-09-12T14:14:07.211709496Z] [default0]:        "parallel": {
+[2026-09-12T14:14:07.211809053Z] [default0]:            "dp_replicate": 4,
+[2026-09-12T14:14:07.211928221Z] [default0]:            "dp_shard": 2,
+[2026-09-12T14:14:07.212025733Z] [default0]:            "cp": 1,
+[2026-09-12T14:14:07.212142556Z] [default0]:            "tp": 4,
+[2026-09-12T14:14:07.212258474Z] [default0]:            "ep": 1,
+[2026-09-12T14:14:07.212352595Z] [default0]:            "expert_tp": 1,
+[2026-09-12T14:14:07.212482884Z] [default0]:            "use_fsdp": true,
+[2026-09-12T14:14:07.212571582Z] [default0]:            "context_parallel_backend": "model_native",
+[2026-09-12T14:14:07.212685220Z] [default0]:            "use_compile": false
+[2026-09-12T14:14:07.212800461Z] [default0]:        },
+[2026-09-12T14:14:07.212925484Z] [default0]:        "offline_target_parallel": {
+[2026-09-12T14:14:07.213032542Z] [default0]:            "dp_replicate": 4,
+[2026-09-12T14:14:07.213140155Z] [default0]:            "dp_shard": 2,
+[2026-09-12T14:14:07.213244489Z] [default0]:            "cp": 1,
+[2026-09-12T14:14:07.213356679Z] [default0]:            "tp": 4,
+[2026-09-12T14:14:07.213460634Z] [default0]:            "ep": 1,
+[2026-09-12T14:14:07.213590161Z] [default0]:            "expert_tp": 1,
+[2026-09-12T14:14:07.213688299Z] [default0]:            "use_fsdp": true,
+[2026-09-12T14:14:07.213812724Z] [default0]:            "context_parallel_backend": "model_native"
+[2026-09-12T14:14:07.213909695Z] [default0]:        },
+[2026-09-12T14:14:07.214041829Z] [default0]:        "torch_compile": false,
+[2026-09-12T14:14:07.214161487Z] [default0]:        "qwen_vllm": {
+[2026-09-12T14:14:07.214259564Z] [default0]:            "python_executable": "/tmp/deepspec-env-tar-cache.apEoQz/deepspec_vllm_torchtitan_envs/bin/python",
+[2026-09-12T14:14:07.214370718Z] [default0]:            "source_dir": "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/vllm",
+[2026-09-12T14:14:07.214481611Z] [default0]:            "tensor_parallel_size": 4,
+[2026-09-12T14:14:07.214602092Z] [default0]:            "max_num_batched_tokens": 8192,
+[2026-09-12T14:14:07.214708009Z] [default0]:            "gpu_memory_utilization": 0.45,
+[2026-09-12T14:14:07.214818266Z] [default0]:            "load_format": "auto",
+[2026-09-12T14:14:07.214933223Z] [default0]:            "timeout_seconds": 86400,
+[2026-09-12T14:14:07.215043048Z] [default0]:            "verify_logits": false,
+[2026-09-12T14:14:07.215148184Z] [default0]:            "logprob_atol": 0.1
+[2026-09-12T14:14:07.215258721Z] [default0]:        }
+[2026-09-12T14:14:07.215360482Z] [default0]:    },
+[2026-09-12T14:14:07.215475371Z] [default0]:    "_origin_config_path": "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/config/dspark/dspark_qwen3_8_27b_vllm.py",
+[2026-09-12T14:14:07.215572134Z] [default0]:    "_origin_opts": [
+[2026-09-12T14:14:07.215683354Z] [default0]:        "model.target_model_name_or_path=/mnt/afs_rl/hongjiawei1/code/ms-swift-hjw/outputs/sensenova-flash-lite-v42-20260830/v2-20260904-112039/checkpoint-3800",
+[2026-09-12T14:14:07.215779173Z] [default0]:        "data.online_target=false",
+[2026-09-12T14:14:07.215907563Z] [default0]:        "data.offline_target_data_batches=true",
+[2026-09-12T14:14:07.216055418Z] [default0]:        "data.train_data_path=/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/train_dataset/sensenova-flash-lite-v42-text-all.jsonl",
+[2026-09-12T14:14:07.216171296Z] [default0]:        "data.jsonl_index_cache_dir=/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/jsonl_index_cache",
+[2026-09-12T14:14:07.216311084Z] [default0]:        "data.data_batch_cache_dir=/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/target_data_batch_cache",
+[2026-09-12T14:14:07.216417785Z] [default0]:        "data.target_cache_path=null",
+[2026-09-12T14:14:07.216549372Z] [default0]:        "train.data_partitions=1024",
+[2026-09-12T14:14:07.216654203Z] [default0]:        "train.offline_target_parallel.dp_replicate=4",
+[2026-09-12T14:14:07.216780602Z] [default0]:        "train.offline_target_parallel.dp_shard=2",
+[2026-09-12T14:14:07.216928981Z] [default0]:        "train.offline_target_parallel.cp=1",
+[2026-09-12T14:14:07.217023596Z] [default0]:        "train.offline_target_parallel.tp=4",
+[2026-09-12T14:14:07.217148693Z] [default0]:        "train.offline_target_parallel.ep=1",
+[2026-09-12T14:14:07.217276063Z] [default0]:        "train.offline_target_parallel.expert_tp=1",
+[2026-09-12T14:14:07.217378838Z] [default0]:        "train.offline_target_parallel.use_fsdp=true",
+[2026-09-12T14:14:07.217504751Z] [default0]:        "train.offline_target_parallel.context_parallel_backend=model_native",
+[2026-09-12T14:14:07.217626934Z] [default0]:        "data.max_length=131072",
+[2026-09-12T14:14:07.217725810Z] [default0]:        "data.min_loss_tokens=0",
+[2026-09-12T14:14:07.217860477Z] [default0]:        "data.store_target_last_hidden_states=true",
+[2026-09-12T14:14:07.217981098Z] [default0]:        "train.lr=0.0006",
+[2026-09-12T14:14:07.218080173Z] [default0]:        "train.local_batch_size=1",
+[2026-09-12T14:14:07.218194337Z] [default0]:        "train.global_batch_size=512",
+[2026-09-12T14:14:07.218363422Z] [default0]:        "train.parallel.dp_replicate=4",
+[2026-09-12T14:14:07.218481219Z] [default0]:        "train.parallel.dp_shard=2",
+[2026-09-12T14:14:07.218603350Z] [default0]:        "train.parallel.cp=1",
+[2026-09-12T14:14:07.218706959Z] [default0]:        "train.parallel.tp=4",
+[2026-09-12T14:14:07.218875786Z] [default0]:        "train.parallel.use_compile=false",
+[2026-09-12T14:14:07.218982885Z] [default0]:        "train.torch_compile=false",
+[2026-09-12T14:14:07.219099877Z] [default0]:        "train.num_train_epochs=10",
+[2026-09-12T14:14:07.219199905Z] [default0]:        "train.max_train_steps=null",
+[2026-09-12T14:14:07.219346713Z] [default0]:        "logging.logging_steps=10",
+[2026-09-12T14:14:07.219464462Z] [default0]:        "logging.checkpointing_steps=100",
+[2026-09-12T14:14:07.219564490Z] [default0]:        "logging.save_checkpoints=true",
+[2026-09-12T14:14:07.219685643Z] [default0]:        "logging.checkpoint_dir=/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/checkpoints",
+[2026-09-12T14:14:07.219789045Z] [default0]:        "logging.tensorboard_dir=/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/tensorboard"
+[2026-09-12T14:14:07.219922894Z] [default0]:    ]
+[2026-09-12T14:14:07.220038323Z] [default0]:}
+[2026-09-12T14:14:07.220151014Z] [default0]:NCCL version 2.29.7+cuda13.2
+[2026-09-12T14:14:07.220259116Z] [default4]:[deepspec-process] host=pt-ea334f03da8d493a8bbcab49b905fd6f-master-0 pid=116 global_rank=4/32 local_rank=4 cuda_visible_devices=<unset>
+[2026-09-12T14:14:07.220360975Z] [default1]:[deepspec-process] host=pt-ea334f03da8d493a8bbcab49b905fd6f-master-0 pid=113 global_rank=1/32 local_rank=1 cuda_visible_devices=<unset>
+[2026-09-12T14:14:07.220469251Z] [default3]:[deepspec-process] host=pt-ea334f03da8d493a8bbcab49b905fd6f-master-0 pid=115 global_rank=3/32 local_rank=3 cuda_visible_devices=<unset>
+[2026-09-12T14:14:07.220572913Z] [default2]:[deepspec-process] host=pt-ea334f03da8d493a8bbcab49b905fd6f-master-0 pid=114 global_rank=2/32 local_rank=2 cuda_visible_devices=<unset>
+[2026-09-12T14:14:07.220682347Z] [default5]:[deepspec-process] host=pt-ea334f03da8d493a8bbcab49b905fd6f-master-0 pid=117 global_rank=5/32 local_rank=5 cuda_visible_devices=<unset>
+[2026-09-12T14:14:11.190114337Z] [default2]:/tmp/deepspec-env-tar-cache.apEoQz/deepspec_vllm_torchtitan_envs/lib/python3.12/site-packages/torch/distributed/device_mesh.py:760: UserWarning: Slicing a flattened dim from root mesh will be deprecated in PT 2.11. Users need to bookkeep the flattened mesh directly. 
+[2026-09-12T14:14:11.190269345Z] [default2]:  sliced_mesh_layout = self._get_slice_mesh_layout(mesh_dim_names)
+[2026-09-12T14:14:11.190390550Z] [default4]:/tmp/deepspec-env-tar-cache.apEoQz/deepspec_vllm_torchtitan_envs/lib/python3.12/site-packages/torch/distributed/device_mesh.py:760: UserWarning: Slicing a flattened dim from root mesh will be deprecated in PT 2.11. Users need to bookkeep the flattened mesh directly. 
+[2026-09-12T14:14:11.190521859Z] [default4]:  sliced_mesh_layout = self._get_slice_mesh_layout(mesh_dim_names)
+[2026-09-12T14:14:11.190647553Z] [default0]:/tmp/deepspec-env-tar-cache.apEoQz/deepspec_vllm_torchtitan_envs/lib/python3.12/site-packages/torch/distributed/device_mesh.py:760: UserWarning: Slicing a flattened dim from root mesh will be deprecated in PT 2.11. Users need to bookkeep the flattened mesh directly. 
+[2026-09-12T14:14:11.190767750Z] [default0]:  sliced_mesh_layout = self._get_slice_mesh_layout(mesh_dim_names)
+[2026-09-12T14:14:11.190902371Z] [default6]:/tmp/deepspec-env-tar-cache.apEoQz/deepspec_vllm_torchtitan_envs/lib/python3.12/site-packages/torch/distributed/device_mesh.py:760: UserWarning: Slicing a flattened dim from root mesh will be deprecated in PT 2.11. Users need to bookkeep the flattened mesh directly. 
+[2026-09-12T14:14:11.191002906Z] [default6]:  sliced_mesh_layout = self._get_slice_mesh_layout(mesh_dim_names)
+[2026-09-12T14:14:11.191115312Z] [default3]:/tmp/deepspec-env-tar-cache.apEoQz/deepspec_vllm_torchtitan_envs/lib/python3.12/site-packages/torch/distributed/device_mesh.py:760: UserWarning: Slicing a flattened dim from root mesh will be deprecated in PT 2.11. Users need to bookkeep the flattened mesh directly. 
+[2026-09-12T14:14:11.191237130Z] [default3]:  sliced_mesh_layout = self._get_slice_mesh_layout(mesh_dim_names)
+[2026-09-12T14:14:11.191339509Z] [default5]:/tmp/deepspec-env-tar-cache.apEoQz/deepspec_vllm_torchtitan_envs/lib/python3.12/site-packages/torch/distributed/device_mesh.py:760: UserWarning: Slicing a flattened dim from root mesh will be deprecated in PT 2.11. Users need to bookkeep the flattened mesh directly. 
+[2026-09-12T14:14:11.191457239Z] [default5]:  sliced_mesh_layout = self._get_slice_mesh_layout(mesh_dim_names)
+[2026-09-12T14:14:11.191557515Z] [default7]:/tmp/deepspec-env-tar-cache.apEoQz/deepspec_vllm_torchtitan_envs/lib/python3.12/site-packages/torch/distributed/device_mesh.py:760: UserWarning: Slicing a flattened dim from root mesh will be deprecated in PT 2.11. Users need to bookkeep the flattened mesh directly. 
+[2026-09-12T14:14:11.191667417Z] [default7]:  sliced_mesh_layout = self._get_slice_mesh_layout(mesh_dim_names)
+[2026-09-12T14:14:11.191755075Z] [default1]:/tmp/deepspec-env-tar-cache.apEoQz/deepspec_vllm_torchtitan_envs/lib/python3.12/site-packages/torch/distributed/device_mesh.py:760: UserWarning: Slicing a flattened dim from root mesh will be deprecated in PT 2.11. Users need to bookkeep the flattened mesh directly. 
+[2026-09-12T14:14:11.191875424Z] [default1]:  sliced_mesh_layout = self._get_slice_mesh_layout(mesh_dim_names)
+[2026-09-12T14:15:06.189228339Z] [default0]:
+[2026-09-12T14:15:06.189349475Z] [default0]:  0%|          | 0/1 [00:00<?, ?it/s][default0]:
+[2026-09-12T14:15:06.189448035Z] [default0]:100%|██████████| 1/1 [00:00<00:00, 10.74it/s]
+[2026-09-12T14:15:06.189558508Z] [default4]:
+[2026-09-12T14:15:06.189666482Z] [default4]:  0%|          | 0/1 [00:00<?, ?it/s][default1]:
+[2026-09-12T14:15:06.189769881Z] [default7]:
+[2026-09-12T14:15:06.189877940Z] [default3]:
+[2026-09-12T14:15:06.189977962Z] [default1]:  0%|          | 0/1 [00:00<?, ?it/s][default6]:
+[2026-09-12T14:15:06.190094182Z] [default7]:  0%|          | 0/1 [00:00<?, ?it/s][default3]:  0%|          | 0/1 [00:00<?, ?it/s][default6]:  0%|          | 0/1 [00:00<?, ?it/s][default5]:
+[2026-09-12T14:15:06.190202230Z] [default5]:  0%|          | 0/1 [00:00<?, ?it/s][default2]:
+[2026-09-12T14:15:07.191962399Z] [default2]:  0%|          | 0/1 [00:00<?, ?it/s][default4]:
+[2026-09-12T14:15:07.192084904Z] [default4]:100%|██████████| 1/1 [00:00<00:00, 13.47it/s]
+[2026-09-12T14:15:07.192180521Z] [default7]:
+[2026-09-12T14:15:07.192304530Z] [default7]:100%|██████████| 1/1 [00:00<00:00, 13.56it/s]
+[2026-09-12T14:15:07.192428114Z] [default3]:
+[2026-09-12T14:15:07.192563251Z] [default3]:100%|██████████| 1/1 [00:00<00:00, 13.37it/s]
+[2026-09-12T14:15:07.192760477Z] [default6]:
+[2026-09-12T14:15:07.192900901Z] [default6]:100%|██████████| 1/1 [00:00<00:00, 13.62it/s]
+[2026-09-12T14:15:07.193007921Z] [default1]:
+[2026-09-12T14:15:07.193165274Z] [default1]:100%|██████████| 1/1 [00:00<00:00, 13.37it/s]
+[2026-09-12T14:15:07.193280801Z] [default5]:
+[2026-09-12T14:15:07.193394441Z] [default5]:100%|██████████| 1/1 [00:00<00:00, 13.41it/s]
+[2026-09-12T14:15:07.193536009Z] [default2]:
+[2026-09-12T14:15:07.193656086Z] [default2]:100%|██████████| 1/1 [00:00<00:00, 13.42it/s]
+[2026-09-12T14:15:07.193759666Z] [default4]:/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/deepspec/data/parser.py:385: UserWarning: System prompt from the sample overrides the registered template.
+[2026-09-12T14:15:07.193874819Z] [default4]:  return parser.parse(
+[2026-09-12T14:15:07.193986250Z] [default7]:/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/deepspec/data/parser.py:385: UserWarning: System prompt from the sample overrides the registered template.
+[2026-09-12T14:15:07.194107887Z] [default7]:  return parser.parse(
+[2026-09-12T14:15:07.194204344Z] [default6]:/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/deepspec/data/parser.py:385: UserWarning: System prompt from the sample overrides the registered template.
+[2026-09-12T14:15:07.194319767Z] [default6]:  return parser.parse(
+[2026-09-12T14:15:07.194439862Z] [default1]:/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/deepspec/data/parser.py:385: UserWarning: System prompt from the sample overrides the registered template.
+[2026-09-12T14:15:07.194560734Z] [default1]:  return parser.parse(
+[2026-09-12T14:15:07.194719297Z] [default5]:/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/deepspec/data/parser.py:385: UserWarning: System prompt from the sample overrides the registered template.
+[2026-09-12T14:15:07.194857209Z] [default5]:  return parser.parse(
+[2026-09-12T14:15:07.194972297Z] [default2]:/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/deepspec/data/parser.py:385: UserWarning: System prompt from the sample overrides the registered template.
+[2026-09-12T14:15:07.195090424Z] [default2]:  return parser.parse(
+[2026-09-12T14:15:07.195191198Z] [default3]:/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/deepspec/data/parser.py:385: UserWarning: System prompt from the sample overrides the registered template.
+[2026-09-12T14:15:07.195307756Z] [default0]:/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/deepspec/data/parser.py:385: UserWarning: System prompt from the sample overrides the registered template.
+[2026-09-12T14:15:07.195430279Z] [default0]:  return parser.parse(
+[2026-09-12T14:15:07.195564500Z] [default3]:  return parser.parse(
+[2026-09-12T14:22:51.200662144Z] [default4]:[deepspec-fatal] host=pt-ea334f03da8d493a8bbcab49b905fd6f-master-0 pid=116 global_rank=4 local_rank=4 exception=RuntimeError: Qwen vLLM partition failed: rank 0: RuntimeError: Qwen vLLM exited with status 1; see /mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/target_data_batch_cache/rank_00000/qwen38-job-l1fzc94f/job.json.log; rank 4: RuntimeError: Qwen vLLM exited with status 1; see /mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3
+[2026-09-12T14:22:51.200783520Z] [default4]:Traceback (most recent call last):
+[2026-09-12T14:22:51.200892508Z] [default4]:  File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/train.py", line 60, in main
+[2026-09-12T14:22:51.201012519Z] [default4]:    trainer.train()
+[2026-09-12T14:22:51.201122328Z] [default4]:  File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/deepspec/trainer/base_trainer.py", line 1742, in train
+[2026-09-12T14:22:51.201230802Z] [default4]:    for batch in self.iter_training_batches(prefetcher):
+[2026-09-12T14:22:51.201329686Z] [default4]:                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[2026-09-12T14:22:51.201439686Z] [default4]:  File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/deepspec/trainer/qwen3_8_vllm_trainer.py", line 252, in iter_training_batches
+[2026-09-12T14:22:51.201546067Z] [default4]:    self._collective_stage(generate)
+[2026-09-12T14:22:51.201644291Z] [default4]:  File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/deepspec/trainer/qwen3_8_vllm_trainer.py", line 148, in _collective_stage
+[2026-09-12T14:22:51.201750927Z] [default4]:    raise RuntimeError(
+[2026-09-12T14:22:51.201855363Z] [default4]:RuntimeError: Qwen vLLM partition failed: rank 0: RuntimeError: Qwen vLLM exited with status 1; see /mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/target_data_batch_cache/rank_00000/qwen38-job-l1fzc94f/job.json.log; rank 4: RuntimeError: Qwen vLLM exited with status 1; see /mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/target_data_batch_cache/rank_00004/qwen38-job-jh5iopc9/job.json.log; rank 8: RuntimeError: Qwen vLLM
+[2026-09-12T14:22:51.201969408Z] [default4]:[deepspec-cuda] device=4 allocated=5772803072 reserved=5876219904 max_allocated=8501418496 max_reserved=8835301376
+[2026-09-12T14:22:51.202071669Z] [default7]:[deepspec-fatal] host=pt-ea334f03da8d493a8bbcab49b905fd6f-master-0 pid=119 global_rank=7 local_rank=7 exception=RuntimeError: Qwen vLLM partition failed: rank 0: RuntimeError: Qwen vLLM exited with status 1; see /mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/target_data_batch_cache/rank_00000/qwen38-job-l1fzc94f/job.json.log; rank 4: RuntimeError: Qwen vLLM exited with status 1; see /mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3
+[2026-09-12T14:22:51.202190794Z] [default7]:Traceback (most recent call last):
+[2026-09-12T14:22:51.202292788Z] [default7]:  File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/train.py", line 60, in main
+[2026-09-12T14:22:51.202418874Z] [default7]:    trainer.train()
+[2026-09-12T14:22:51.202526501Z] [default7]:  File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/deepspec/trainer/base_trainer.py", line 1742, in train
+[2026-09-12T14:22:51.202645481Z] [default7]:    for batch in self.iter_training_batches(prefetcher):
+[2026-09-12T14:22:51.202739031Z] [default7]:                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[2026-09-12T14:22:51.202865069Z] [default7]:  File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/deepspec/trainer/qwen3_8_vllm_trainer.py", line 252, in iter_training_batches
+[2026-09-12T14:22:51.202961902Z] [default7]:    self._collective_stage(generate)
+[2026-09-12T14:22:51.203070186Z] [default7]:  File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/deepspec/trainer/qwen3_8_vllm_trainer.py", line 148, in _collective_stage
+[2026-09-12T14:22:51.203171365Z] [default7]:    raise RuntimeError(
+[2026-09-12T14:22:51.203285818Z] [default7]:RuntimeError: Qwen vLLM partition failed: rank 0: RuntimeError: Qwen vLLM exited with status 1; see /mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/target_data_batch_cache/rank_00000/qwen38-job-l1fzc94f/job.json.log; rank 4: RuntimeError: Qwen vLLM exited with status 1; see /mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/target_data_batch_cache/rank_00004/qwen38-job-jh5iopc9/job.json.log; rank 8: RuntimeError: Qwen vLLM
+[2026-09-12T14:22:51.203380079Z] [default7]:[deepspec-cuda] device=7 allocated=5772803072 reserved=5876219904 max_allocated=8501418496 max_reserved=8835301376
+[2026-09-12T14:22:51.203507052Z] [default6]:[deepspec-fatal] host=pt-ea334f03da8d493a8bbcab49b905fd6f-master-0 pid=118 global_rank=6 local_rank=6 exception=RuntimeError: Qwen vLLM partition failed: rank 0: RuntimeError: Qwen vLLM exited with status 1; see /mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/target_data_batch_cache/rank_00000/qwen38-job-l1fzc94f/job.json.log; rank 4: RuntimeError: Qwen vLLM exited with status 1; see /mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3
+[2026-09-12T14:22:51.203599792Z] [default6]:Traceback (most recent call last):
+[2026-09-12T14:22:51.203712575Z] [default6]:  File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/train.py", line 60, in main
+[2026-09-12T14:22:51.203811533Z] [default6]:    trainer.train()
+[2026-09-12T14:22:51.203948231Z] [default6]:  File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/deepspec/trainer/base_trainer.py", line 1742, in train
+[2026-09-12T14:22:51.204043007Z] [default6]:    for batch in self.iter_training_batches(prefetcher):
+[2026-09-12T14:22:51.204170556Z] [default6]:                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[2026-09-12T14:22:51.204271547Z] [default6]:  File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/deepspec/trainer/qwen3_8_vllm_trainer.py", line 252, in iter_training_batches
+[2026-09-12T14:22:51.204377921Z] [default6]:    self._collective_stage(generate)
+[2026-09-12T14:22:51.204497103Z] [default6]:  File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/deepspec/trainer/qwen3_8_vllm_trainer.py", line 148, in _collective_stage
+[2026-09-12T14:22:51.204604138Z] [default6]:    raise RuntimeError(
+[2026-09-12T14:22:51.204715102Z] [default6]:RuntimeError: Qwen vLLM partition failed: rank 0: RuntimeError: Qwen vLLM exited with status 1; see /mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/target_data_batch_cache/rank_00000/qwen38-job-l1fzc94f/job.json.log; rank 4: RuntimeError: Qwen vLLM exited with status 1; see /mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/target_data_batch_cache/rank_00004/qwen38-job-jh5iopc9/job.json.log; rank 8: RuntimeError: Qwen vLLM
+[2026-09-12T14:22:51.204823605Z] [default6]:[deepspec-cuda] device=6 allocated=5772803072 reserved=5876219904 max_allocated=8501418496 max_reserved=8835301376
+[2026-09-12T14:22:51.204926593Z] [default2]:[deepspec-fatal] host=pt-ea334f03da8d493a8bbcab49b905fd6f-master-0 pid=114 global_rank=2 local_rank=2 exception=RuntimeError: Qwen vLLM partition failed: rank 0: RuntimeError: Qwen vLLM exited with status 1; see /mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/target_data_batch_cache/rank_00000/qwen38-job-l1fzc94f/job.json.log; rank 4: RuntimeError: Qwen vLLM exited with status 1; see /mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3
+[2026-09-12T14:22:51.205033048Z] [default2]:Traceback (most recent call last):
+[2026-09-12T14:22:51.205139717Z] [default2]:  File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/train.py", line 60, in main
+[2026-09-12T14:22:51.205254796Z] [default2]:    trainer.train()
+[2026-09-12T14:22:51.205363483Z] [default2]:  File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/deepspec/trainer/base_trainer.py", line 1742, in train
+[2026-09-12T14:22:51.205484004Z] [default2]:    for batch in self.iter_training_batches(prefetcher):
+[2026-09-12T14:22:51.205582474Z] [default2]:                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[2026-09-12T14:22:51.205705710Z] [default2]:  File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/deepspec/trainer/qwen3_8_vllm_trainer.py", line 252, in iter_training_batches
+[2026-09-12T14:22:51.205808597Z] [default2]:    self._collective_stage(generate)
+[2026-09-12T14:22:51.205928302Z] [default2]:  File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/deepspec/trainer/qwen3_8_vllm_trainer.py", line 148, in _collective_stage
+[2026-09-12T14:22:51.206026430Z] [default2]:    raise RuntimeError(
+[2026-09-12T14:22:51.206144753Z] [default2]:RuntimeError: Qwen vLLM partition failed: rank 0: RuntimeError: Qwen vLLM exited with status 1; see /mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/target_data_batch_cache/rank_00000/qwen38-job-l1fzc94f/job.json.log; rank 4: RuntimeError: Qwen vLLM exited with status 1; see /mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/target_data_batch_cache/rank_00004/qwen38-job-jh5iopc9/job.json.log; rank 8: RuntimeError: Qwen vLLM
+[2026-09-12T14:22:51.206243685Z] [default2]:[deepspec-cuda] device=2 allocated=5773385216 reserved=5876219904 max_allocated=8501418496 max_reserved=8835301376
+[2026-09-12T14:22:51.206350372Z] [default1]:[deepspec-fatal] host=pt-ea334f03da8d493a8bbcab49b905fd6f-master-0 pid=113 global_rank=1 local_rank=1 exception=RuntimeError: Qwen vLLM partition failed: rank 0: RuntimeError: Qwen vLLM exited with status 1; see /mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/target_data_batch_cache/rank_00000/qwen38-job-l1fzc94f/job.json.log; rank 4: RuntimeError: Qwen vLLM exited with status 1; see /mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3
+[2026-09-12T14:22:51.206466553Z] [default1]:Traceback (most recent call last):
+[2026-09-12T14:22:51.206560877Z] [default1]:  File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/train.py", line 60, in main
+[2026-09-12T14:22:51.206666434Z] [default1]:    trainer.train()
+[2026-09-12T14:22:51.206763497Z] [default1]:  File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/deepspec/trainer/base_trainer.py", line 1742, in train
+[2026-09-12T14:22:51.206883388Z] [default1]:    for batch in self.iter_training_batches(prefetcher):
+[2026-09-12T14:22:51.206990434Z] [default1]:                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[2026-09-12T14:22:51.207106277Z] [default1]:  File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/deepspec/trainer/qwen3_8_vllm_trainer.py", line 252, in iter_training_batches
+[2026-09-12T14:22:51.207204554Z] [default1]:    self._collective_stage(generate)
+[2026-09-12T14:22:51.207314383Z] [default1]:  File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/deepspec/trainer/qwen3_8_vllm_trainer.py", line 148, in _collective_stage
+[2026-09-12T14:22:51.207411866Z] [default1]:    raise RuntimeError(
+[2026-09-12T14:22:51.207514855Z] [default1]:RuntimeError: Qwen vLLM partition failed: rank 0: RuntimeError: Qwen vLLM exited with status 1; see /mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/target_data_batch_cache/rank_00000/qwen38-job-l1fzc94f/job.json.log; rank 4: RuntimeError: Qwen vLLM exited with status 1; see /mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/target_data_batch_cache/rank_00004/qwen38-job-jh5iopc9/job.json.log; rank 8: RuntimeError: Qwen vLLM
+[2026-09-12T14:22:51.207609701Z] [default1]:[deepspec-cuda] device=1 allocated=5773385216 reserved=5876219904 max_allocated=8501418496 max_reserved=8835301376
+[2026-09-12T14:22:51.207720492Z] [default5]:[deepspec-fatal] host=pt-ea334f03da8d493a8bbcab49b905fd6f-master-0 pid=117 global_rank=5 local_rank=5 exception=RuntimeError: Qwen vLLM partition failed: rank 0: RuntimeError: Qwen vLLM exited with status 1; see /mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/target_data_batch_cache/rank_00000/qwen38-job-l1fzc94f/job.json.log; rank 4: RuntimeError: Qwen vLLM exited with status 1; see /mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3
+[2026-09-12T14:22:51.207813171Z] [default5]:Traceback (most recent call last):
+[2026-09-12T14:22:51.207926886Z] [default5]:  File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/train.py", line 60, in main
+[2026-09-12T14:22:51.208030337Z] [default5]:    trainer.train()
+[2026-09-12T14:22:51.208140329Z] [default5]:  File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/deepspec/trainer/base_trainer.py", line 1742, in train
+[2026-09-12T14:22:51.208258926Z] [default5]:    for batch in self.iter_training_batches(prefetcher):
+[2026-09-12T14:22:51.208364166Z] [default5]:                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[2026-09-12T14:22:51.208482304Z] [default5]:  File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/deepspec/trainer/qwen3_8_vllm_trainer.py", line 252, in iter_training_batches
+[2026-09-12T14:22:51.208608880Z] [default5]:    self._collective_stage(generate)
+[2026-09-12T14:22:51.208716382Z] [default5]:  File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/deepspec/trainer/qwen3_8_vllm_trainer.py", line 148, in _collective_stage
+[2026-09-12T14:22:51.208830497Z] [default5]:    raise RuntimeError(
+[2026-09-12T14:22:51.208938978Z] [default5]:RuntimeError: Qwen vLLM partition failed: rank 0: RuntimeError: Qwen vLLM exited with status 1; see /mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/target_data_batch_cache/rank_00000/qwen38-job-l1fzc94f/job.json.log; rank 4: RuntimeError: Qwen vLLM exited with status 1; see /mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/target_data_batch_cache/rank_00004/qwen38-job-jh5iopc9/job.json.log; rank 8: RuntimeError: Qwen vLLM
+[2026-09-12T14:22:51.209050238Z] [default5]:[deepspec-cuda] device=5 allocated=5772803072 reserved=5876219904 max_allocated=8501418496 max_reserved=8835301376
+[2026-09-12T14:22:51.209159920Z] [default3]:[deepspec-fatal] host=pt-ea334f03da8d493a8bbcab49b905fd6f-master-0 pid=115 global_rank=3 local_rank=3 exception=RuntimeError: Qwen vLLM partition failed: rank 0: RuntimeError: Qwen vLLM exited with status 1; see /mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/target_data_batch_cache/rank_00000/qwen38-job-l1fzc94f/job.json.log; rank 4: RuntimeError: Qwen vLLM exited with status 1; see /mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3
+[2026-09-12T14:22:51.209275415Z] [default3]:Traceback (most recent call last):
+[2026-09-12T14:22:51.209375487Z] [default3]:  File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/train.py", line 60, in main
+[2026-09-12T14:22:51.209484178Z] [default3]:    trainer.train()
+[2026-09-12T14:22:51.209579042Z] [default3]:  File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/deepspec/trainer/base_trainer.py", line 1742, in train
+[2026-09-12T14:22:51.209697906Z] [default3]:    for batch in self.iter_training_batches(prefetcher):
+[2026-09-12T14:22:51.209786982Z] [default3]:                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[2026-09-12T14:22:51.209902898Z] [default3]:  File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/deepspec/trainer/qwen3_8_vllm_trainer.py", line 252, in iter_training_batches
+[2026-09-12T14:22:51.210001538Z] [default3]:    self._collective_stage(generate)
+[2026-09-12T14:22:51.210100231Z] [default3]:  File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/deepspec/trainer/qwen3_8_vllm_trainer.py", line 148, in _collective_stage
+[2026-09-12T14:22:51.210207437Z] [default3]:    raise RuntimeError(
+[2026-09-12T14:22:51.210322411Z] [default3]:RuntimeError: Qwen vLLM partition failed: rank 0: RuntimeError: Qwen vLLM exited with status 1; see /mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/target_data_batch_cache/rank_00000/qwen38-job-l1fzc94f/job.json.log; rank 4: RuntimeError: Qwen vLLM exited with status 1; see /mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/target_data_batch_cache/rank_00004/qwen38-job-jh5iopc9/job.json.log; rank 8: RuntimeError: Qwen vLLM
+[2026-09-12T14:22:51.210430018Z] [default3]:[deepspec-cuda] device=3 allocated=5773385216 reserved=5876219904 max_allocated=8501418496 max_reserved=8835301376
+[2026-09-12T14:22:51.210546431Z] [default0]:[deepspec-fatal] host=pt-ea334f03da8d493a8bbcab49b905fd6f-master-0 pid=112 global_rank=0 local_rank=0 exception=RuntimeError: Qwen vLLM partition failed: rank 0: RuntimeError: Qwen vLLM exited with status 1; see /mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/target_data_batch_cache/rank_00000/qwen38-job-l1fzc94f/job.json.log; rank 4: RuntimeError: Qwen vLLM exited with status 1; see /mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3
+[2026-09-12T14:22:51.210640955Z] [default0]:Traceback (most recent call last):
+[2026-09-12T14:22:51.210748257Z] [default0]:  File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/train.py", line 60, in main
+[2026-09-12T14:22:51.210881991Z] [default0]:    trainer.train()
+[2026-09-12T14:22:51.211009247Z] [default0]:  File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/deepspec/trainer/base_trainer.py", line 1742, in train
+[2026-09-12T14:22:51.211111192Z] [default0]:    for batch in self.iter_training_batches(prefetcher):
+[2026-09-12T14:22:51.211210140Z] [default0]:                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[2026-09-12T14:22:51.211319388Z] [default0]:  File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/deepspec/trainer/qwen3_8_vllm_trainer.py", line 252, in iter_training_batches
+[2026-09-12T14:22:51.211420658Z] [default0]:    self._collective_stage(generate)
+[2026-09-12T14:22:51.211533962Z] [default0]:  File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/deepspec/trainer/qwen3_8_vllm_trainer.py", line 148, in _collective_stage
+[2026-09-12T14:22:51.211644796Z] [default0]:    raise RuntimeError(
+[2026-09-12T14:22:51.211753004Z] [default0]:RuntimeError: Qwen vLLM partition failed: rank 0: RuntimeError: Qwen vLLM exited with status 1; see /mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/target_data_batch_cache/rank_00000/qwen38-job-l1fzc94f/job.json.log; rank 4: RuntimeError: Qwen vLLM exited with status 1; see /mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/target_data_batch_cache/rank_00004/qwen38-job-jh5iopc9/job.json.log; rank 8: RuntimeError: Qwen vLLM
+[2026-09-12T14:22:51.211852423Z] [default0]:[deepspec-cuda] device=0 allocated=5773385216 reserved=5876219904 max_allocated=8501418496 max_reserved=8835301376
+[2026-09-12T14:22:52.194234175Z] [default6]:[deepspec-process] host=pt-ea334f03da8d493a8bbcab49b905fd6f-master-0 pid=118 global_rank=6/32 local_rank=6 cuda_visible_devices=<unset>
+[2026-09-12T14:22:52.194343144Z] [default7]:[deepspec-process] host=pt-ea334f03da8d493a8bbcab49b905fd6f-master-0 pid=119 global_rank=7/32 local_rank=7 cuda_visible_devices=<unset>
+[2026-09-12T14:22:52.194456793Z] [default3]:[deepspec-mesh] global_rank=3 draft={'dense_coordinate': (0, 0, 0, 3), 'dp_replicate': (3, 11, 19, 27), 'dp_shard': (3, 7), 'fsdp_shard': (3, 7), 'cp': (3,), 'tp': (0, 1, 2, 3), 'ep': (), 'expert_fsdp': ()} target={'dense_coordinate': (0, 0, 0, 3), 'dp_replicate': (3, 11, 19, 27), 'dp_shard': (3, 7), 'fsdp_shard': (3, 7), 'cp': (3,), 'tp': (0, 1, 2, 3), 'ep': (), 'expert_fsdp': ()}
+[2026-09-12T14:22:52.194554117Z] [default2]:[deepspec-mesh] global_rank=2 draft={'dense_coordinate': (0, 0, 0, 2), 'dp_replicate': (2, 10, 18, 26), 'dp_shard': (2, 6), 'fsdp_shard': (2, 6), 'cp': (2,), 'tp': (0, 1, 2, 3), 'ep': (), 'expert_fsdp': ()} target={'dense_coordinate': (0, 0, 0, 2), 'dp_replicate': (2, 10, 18, 26), 'dp_shard': (2, 6), 'fsdp_shard': (2, 6), 'cp': (2,), 'tp': (0, 1, 2, 3), 'ep': (), 'expert_fsdp': ()}
+[2026-09-12T14:22:52.194669545Z] [default0]:[deepspec-mesh] global_rank=0 draft={'dense_coordinate': (0, 0, 0, 0), 'dp_replicate': (0, 8, 16, 24), 'dp_shard': (0, 4), 'fsdp_shard': (0, 4), 'cp': (0,), 'tp': (0, 1, 2, 3), 'ep': (), 'expert_fsdp': ()} target={'dense_coordinate': (0, 0, 0, 0), 'dp_replicate': (0, 8, 16, 24), 'dp_shard': (0, 4), 'fsdp_shard': (0, 4), 'cp': (0,), 'tp': (0, 1, 2, 3), 'ep': (), 'expert_fsdp': ()}
+[2026-09-12T14:22:52.194772922Z] [default1]:[deepspec-mesh] global_rank=1 draft={'dense_coordinate': (0, 0, 0, 1), 'dp_replicate': (1, 9, 17, 25), 'dp_shard': (1, 5), 'fsdp_shard': (1, 5), 'cp': (1,), 'tp': (0, 1, 2, 3), 'ep': (), 'expert_fsdp': ()} target={'dense_coordinate': (0, 0, 0, 1), 'dp_replicate': (1, 9, 17, 25), 'dp_shard': (1, 5), 'fsdp_shard': (1, 5), 'cp': (1,), 'tp': (0, 1, 2, 3), 'ep': (), 'expert_fsdp': ()}
+[2026-09-12T14:22:52.194893275Z] [default4]:[deepspec-mesh] global_rank=4 draft={'dense_coordinate': (0, 1, 0, 0), 'dp_replicate': (4, 12, 20, 28), 'dp_shard': (0, 4), 'fsdp_shard': (0, 4), 'cp': (4,), 'tp': (4, 5, 6, 7), 'ep': (), 'expert_fsdp': ()} target={'dense_coordinate': (0, 1, 0, 0), 'dp_replicate': (4, 12, 20, 28), 'dp_shard': (0, 4), 'fsdp_shard': (0, 4), 'cp': (4,), 'tp': (4, 5, 6, 7), 'ep': (), 'expert_fsdp': ()}
+[2026-09-12T14:22:52.194999297Z] [default5]:[deepspec-mesh] global_rank=5 draft={'dense_coordinate': (0, 1, 0, 1), 'dp_replicate': (5, 13, 21, 29), 'dp_shard': (1, 5), 'fsdp_shard': (1, 5), 'cp': (5,), 'tp': (4, 5, 6, 7), 'ep': (), 'expert_fsdp': ()} target={'dense_coordinate': (0, 1, 0, 1), 'dp_replicate': (5, 13, 21, 29), 'dp_shard': (1, 5), 'fsdp_shard': (1, 5), 'cp': (5,), 'tp': (4, 5, 6, 7), 'ep': (), 'expert_fsdp': ()}
+[2026-09-12T14:22:52.195100799Z] [default6]:[deepspec-mesh] global_rank=6 draft={'dense_coordinate': (0, 1, 0, 2), 'dp_replicate': (6, 14, 22, 30), 'dp_shard': (2, 6), 'fsdp_shard': (2, 6), 'cp': (6,), 'tp': (4, 5, 6, 7), 'ep': (), 'expert_fsdp': ()} target={'dense_coordinate': (0, 1, 0, 2), 'dp_replicate': (6, 14, 22, 30), 'dp_shard': (2, 6), 'fsdp_shard': (2, 6), 'cp': (6,), 'tp': (4, 5, 6, 7), 'ep': (), 'expert_fsdp': ()}
+[2026-09-12T14:22:52.195219918Z] [default7]:[deepspec-mesh] global_rank=7 draft={'dense_coordinate': (0, 1, 0, 3), 'dp_replicate': (7, 15, 23, 31), 'dp_shard': (3, 7), 'fsdp_shard': (3, 7), 'cp': (7,), 'tp': (4, 5, 6, 7), 'ep': (), 'expert_fsdp': ()} target={'dense_coordinate': (0, 1, 0, 3), 'dp_replicate': (7, 15, 23, 31), 'dp_shard': (3, 7), 'fsdp_shard': (3, 7), 'cp': (7,), 'tp': (4, 5, 6, 7), 'ep': (), 'expert_fsdp': ()}
+[2026-09-12T14:22:52.195316606Z] [default0]:2026-09-12 22:14:15 W&B logging disabled after init failure: No module named 'wandb'
+[2026-09-12T14:22:52.195419133Z] [default0]:[deepspec-draft-load] initializing draft from /mnt/afs_rl/hongjiawei1/code/ms-swift-hjw/outputs/sensenova-flash-lite-v42-20260830/v2-20260904-112039/checkpoint-3800
+[2026-09-12T14:22:52.195522649Z] [default0]:[deepspec-draft-load] draft initialization complete in 48.7s (config_and_tokenizer=0.7s, construct_and_place=30.0s, embedding_and_head=18.0s)
+[2026-09-12T14:22:52.195625601Z] [default0]:2026-09-12 22:15:06 Training from scratch.
+[2026-09-12T14:22:52.195744914Z] [default0]:2026-09-12 22:15:06 ***** Running training *****
+[2026-09-12T14:22:52.195842538Z] [default0]:2026-09-12 22:15:06   Train dataset size = 2050980
+[2026-09-12T14:22:52.195964647Z] [default0]:2026-09-12 22:15:06   Parallel topology = CP 1 x FSDP 2 (effective data replicas 8), draft EP 1, target FSDP 2 x TP 4 x EP 1
+[2026-09-12T14:22:52.196052356Z] [default0]:2026-09-12 22:15:06   Num train epochs = 10
+[2026-09-12T14:22:52.196166732Z] [default0]:2026-09-12 22:15:06   Samples per epoch = 2050560
+[2026-09-12T14:22:52.196267150Z] [default0]:2026-09-12 22:15:06   Local batch size = 1
+[2026-09-12T14:22:52.196389867Z] [default0]:2026-09-12 22:15:06   Global batch size = 512
+[2026-09-12T14:22:52.196486283Z] [default0]:2026-09-12 22:15:06   Gradient accumulation steps = 64
+[2026-09-12T14:22:52.196599312Z] [default0]:2026-09-12 22:15:06   Target data-batch mode = bounded offline
+[2026-09-12T14:22:52.196700884Z] [default0]:2026-09-12 22:15:06   Data partitions per epoch = 1024
+[2026-09-12T14:22:52.196809153Z] [default0]:2026-09-12 22:15:06   Remaining transient partition cycles = 10240
+[2026-09-12T14:22:52.196906789Z] [default0]:2026-09-12 22:15:06   Data batch partition alignment = training micro-batch
+[2026-09-12T14:22:52.197017424Z] [default0]:2026-09-12 22:15:06   Optimizer steps per data batch = 10240 partitions, range=[3, 4]
+[2026-09-12T14:22:52.197115168Z] [default0]:2026-09-12 22:15:06   Global samples per data batch = 10240 partitions, range=[2000, 2008]
+[2026-09-12T14:22:52.197233219Z] [default0]:2026-09-12 22:15:06   Transient target cache = /mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/target_data_batch_cache
+[2026-09-12T14:22:52.197332270Z] [default0]:2026-09-12 22:15:06   Steps per epoch = 4005
+[2026-09-12T14:22:52.197437925Z] [default0]:2026-09-12 22:15:06   Max train steps = 40050
+[2026-09-12T14:22:52.197550136Z] [default1]:[qwen38-vllm] rank=1 owner=0 teacher_tp=4 draft_cp=1 draft_tp=4 teacher_layers=64 final_state=full_model_final_norm_output
+[2026-09-12T14:22:52.197646688Z] [default5]:[qwen38-vllm] rank=5 owner=4 teacher_tp=4 draft_cp=1 draft_tp=4 teacher_layers=64 final_state=full_model_final_norm_output
+[2026-09-12T14:22:52.197749725Z] [default7]:[qwen38-vllm] rank=7 owner=4 teacher_tp=4 draft_cp=1 draft_tp=4 teacher_layers=64 final_state=full_model_final_norm_output
+[2026-09-12T14:22:52.197853045Z] [default3]:[qwen38-vllm] rank=3 owner=0 teacher_tp=4 draft_cp=1 draft_tp=4 teacher_layers=64 final_state=full_model_final_norm_output
+[2026-09-12T14:22:52.197963010Z] [default0]:[qwen38-vllm] rank=0 owner=0 teacher_tp=4 draft_cp=1 draft_tp=4 teacher_layers=64 final_state=full_model_final_norm_output
+[2026-09-12T14:22:52.198054362Z] [default4]:[qwen38-vllm] rank=4 owner=4 teacher_tp=4 draft_cp=1 draft_tp=4 teacher_layers=64 final_state=full_model_final_norm_output
+[2026-09-12T14:22:52.198155705Z] [default6]:[qwen38-vllm] rank=6 owner=4 teacher_tp=4 draft_cp=1 draft_tp=4 teacher_layers=64 final_state=full_model_final_norm_output
+[2026-09-12T14:22:52.198252402Z] [default2]:[qwen38-vllm] rank=2 owner=0 teacher_tp=4 draft_cp=1 draft_tp=4 teacher_layers=64 final_state=full_model_final_norm_output
+[2026-09-12T14:22:52.198360876Z] [default4]:[qwen38-vllm] partition=1 samples=251 job=/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/target_data_batch_cache/rank_00004/qwen38-job-jh5iopc9/job.json
+[2026-09-12T14:22:52.198460781Z] [default0]:[qwen38-vllm] partition=1 samples=251 job=/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/target_data_batch_cache/rank_00000/qwen38-job-l1fzc94f/job.json
+[2026-09-12T14:22:52.198572277Z] [default6]:[deepspec-data-batch-cache] Retaining interrupted cache for rank 6: /mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/target_data_batch_cache/rank_00006
+[2026-09-12T14:22:52.198667165Z] [default5]:[deepspec-data-batch-cache] Retaining interrupted cache for rank 5: /mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/target_data_batch_cache/rank_00005
+[2026-09-12T14:22:52.198778222Z] [default7]:[deepspec-data-batch-cache] Retaining interrupted cache for rank 7: /mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/target_data_batch_cache/rank_00007
+[2026-09-12T14:22:52.198878363Z] [default4]:[deepspec-data-batch-cache] Retaining interrupted cache for rank 4: /mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/target_data_batch_cache/rank_00004
+[2026-09-12T14:22:52.198990487Z] [default2]:[deepspec-data-batch-cache] Retaining interrupted cache for rank 2: /mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/target_data_batch_cache/rank_00002
+[2026-09-12T14:22:52.199089161Z] [default0]:[deepspec-data-batch-cache] Retaining interrupted cache for rank 0: /mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/target_data_batch_cache/rank_00000
+[2026-09-12T14:22:52.199202460Z] [default3]:[deepspec-data-batch-cache] Retaining interrupted cache for rank 3: /mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/target_data_batch_cache/rank_00003
+[2026-09-12T14:22:52.199297709Z] [default1]:[deepspec-data-batch-cache] Retaining interrupted cache for rank 1: /mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/target_data_batch_cache/rank_00001
+[2026-09-12T14:23:01.195717839Z] [default5]:[rank5]: Traceback (most recent call last):
+[2026-09-12T14:23:01.195837127Z] [default5]:[rank5]:   File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/train.py", line 115, in <module>
+[2026-09-12T14:23:01.195968642Z] [default5]:[rank5]:     main(int(os.environ["LOCAL_RANK"]))
+[2026-09-12T14:23:01.196073511Z] [default5]:[rank5]:   File "/tmp/deepspec-env-tar-cache.apEoQz/deepspec_vllm_torchtitan_envs/lib/python3.12/site-packages/torch/distributed/elastic/multiprocessing/errors/__init__.py", line 367, in wrapper
+[2026-09-12T14:23:01.196198827Z] [default5]:[rank5]:     return f(*args, **kwargs)
+[2026-09-12T14:23:01.196329682Z] [default5]:[rank5]:            ^^^^^^^^^^^^^^^^^^
+[2026-09-12T14:23:01.196439539Z] [default5]:[rank5]:   File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/train.py", line 60, in main
+[2026-09-12T14:23:01.196567724Z] [default5]:[rank5]:     trainer.train()
+[2026-09-12T14:23:01.196675082Z] [default5]:[rank5]:   File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/deepspec/trainer/base_trainer.py", line 1742, in train
+[2026-09-12T14:23:01.196797852Z] [default5]:[rank5]:     for batch in self.iter_training_batches(prefetcher):
+[2026-09-12T14:23:01.196907921Z] [default5]:[rank5]:                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[2026-09-12T14:23:01.197030209Z] [default5]:[rank5]:   File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/deepspec/trainer/qwen3_8_vllm_trainer.py", line 252, in iter_training_batches
+[2026-09-12T14:23:01.197130914Z] [default5]:[rank5]:     self._collective_stage(generate)
+[2026-09-12T14:23:01.197257118Z] [default5]:[rank5]:   File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/deepspec/trainer/qwen3_8_vllm_trainer.py", line 148, in _collective_stage
+[2026-09-12T14:23:01.197363795Z] [default5]:[rank5]:     raise RuntimeError(
+[2026-09-12T14:23:01.197481256Z] [default5]:[rank5]: RuntimeError: Qwen vLLM partition failed: rank 0: RuntimeError: Qwen vLLM exited with status 1; see /mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/target_data_batch_cache/rank_00000/qwen38-job-l1fzc94f/job.json.log; rank 4: RuntimeError: Qwen vLLM exited with status 1; see /mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/target_data_batch_cache/rank_00004/qwen38-job-jh5iopc9/job.json.log; rank 8: RuntimeError: 
+[2026-09-12T14:23:01.197582338Z] [default7]:[rank7]: Traceback (most recent call last):
+[2026-09-12T14:23:01.197704191Z] [default7]:[rank7]:   File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/train.py", line 115, in <module>
+[2026-09-12T14:23:01.197816339Z] [default7]:[rank7]:     main(int(os.environ["LOCAL_RANK"]))
+[2026-09-12T14:23:01.197944612Z] [default7]:[rank7]:   File "/tmp/deepspec-env-tar-cache.apEoQz/deepspec_vllm_torchtitan_envs/lib/python3.12/site-packages/torch/distributed/elastic/multiprocessing/errors/__init__.py", line 367, in wrapper
+[2026-09-12T14:23:01.198045171Z] [default7]:[rank7]:     return f(*args, **kwargs)
+[2026-09-12T14:23:01.198161950Z] [default7]:[rank7]:            ^^^^^^^^^^^^^^^^^^
+[2026-09-12T14:23:01.198268478Z] [default7]:[rank7]:   File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/train.py", line 60, in main
+[2026-09-12T14:23:01.198403489Z] [default7]:[rank7]:     trainer.train()
+[2026-09-12T14:23:01.198503337Z] [default7]:[rank7]:   File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/deepspec/trainer/base_trainer.py", line 1742, in train
+[2026-09-12T14:23:01.198644379Z] [default7]:[rank7]:     for batch in self.iter_training_batches(prefetcher):
+[2026-09-12T14:23:01.198741832Z] [default7]:[rank7]:                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[2026-09-12T14:23:01.198897369Z] [default7]:[rank7]:   File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/deepspec/trainer/qwen3_8_vllm_trainer.py", line 252, in iter_training_batches
+[2026-09-12T14:23:01.199006050Z] [default7]:[rank7]:     self._collective_stage(generate)
+[2026-09-12T14:23:01.199125300Z] [default7]:[rank7]:   File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/deepspec/trainer/qwen3_8_vllm_trainer.py", line 148, in _collective_stage
+[2026-09-12T14:23:01.199230484Z] [default7]:[rank7]:     raise RuntimeError(
+[2026-09-12T14:23:01.199349957Z] [default7]:[rank7]: RuntimeError: Qwen vLLM partition failed: rank 0: RuntimeError: Qwen vLLM exited with status 1; see /mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/target_data_batch_cache/rank_00000/qwen38-job-l1fzc94f/job.json.log; rank 4: RuntimeError: Qwen vLLM exited with status 1; see /mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/target_data_batch_cache/rank_00004/qwen38-job-jh5iopc9/job.json.log; rank 8: RuntimeError: 
+[2026-09-12T14:23:01.199466709Z] [default6]:[rank6]: Traceback (most recent call last):
+[2026-09-12T14:23:01.199578406Z] [default6]:[rank6]:   File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/train.py", line 115, in <module>
+[2026-09-12T14:23:01.199699380Z] [default6]:[rank6]:     main(int(os.environ["LOCAL_RANK"]))
+[2026-09-12T14:23:01.199799891Z] [default6]:[rank6]:   File "/tmp/deepspec-env-tar-cache.apEoQz/deepspec_vllm_torchtitan_envs/lib/python3.12/site-packages/torch/distributed/elastic/multiprocessing/errors/__init__.py", line 367, in wrapper
+[2026-09-12T14:23:01.199921691Z] [default6]:[rank6]:     return f(*args, **kwargs)
+[2026-09-12T14:23:01.200027946Z] [default6]:[rank6]:            ^^^^^^^^^^^^^^^^^^
+[2026-09-12T14:23:01.200150851Z] [default6]:[rank6]:   File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/train.py", line 60, in main
+[2026-09-12T14:23:01.200252697Z] [default6]:[rank6]:     trainer.train()
+[2026-09-12T14:23:01.200378596Z] [default6]:[rank6]:   File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/deepspec/trainer/base_trainer.py", line 1742, in train
+[2026-09-12T14:23:01.200499182Z] [default6]:[rank6]:     for batch in self.iter_training_batches(prefetcher):
+[2026-09-12T14:23:01.200608860Z] [default6]:[rank6]:                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[2026-09-12T14:23:01.200719259Z] [default6]:[rank6]:   File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/deepspec/trainer/qwen3_8_vllm_trainer.py", line 252, in iter_training_batches
+[2026-09-12T14:23:01.200851333Z] [default6]:[rank6]:     self._collective_stage(generate)
+[2026-09-12T14:23:01.200950477Z] [default6]:[rank6]:   File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/deepspec/trainer/qwen3_8_vllm_trainer.py", line 148, in _collective_stage
+[2026-09-12T14:23:01.201066613Z] [default6]:[rank6]:     raise RuntimeError(
+[2026-09-12T14:23:01.201166108Z] [default6]:[rank6]: RuntimeError: Qwen vLLM partition failed: rank 0: RuntimeError: Qwen vLLM exited with status 1; see /mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/target_data_batch_cache/rank_00000/qwen38-job-l1fzc94f/job.json.log; rank 4: RuntimeError: Qwen vLLM exited with status 1; see /mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/target_data_batch_cache/rank_00004/qwen38-job-jh5iopc9/job.json.log; rank 8: RuntimeError: 
+[2026-09-12T14:23:01.201321889Z] [default4]:[rank4]: Traceback (most recent call last):
+[2026-09-12T14:23:01.201430664Z] [default4]:[rank4]:   File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/train.py", line 115, in <module>
+[2026-09-12T14:23:01.201535433Z] [default4]:[rank4]:     main(int(os.environ["LOCAL_RANK"]))
+[2026-09-12T14:23:01.201652602Z] [default4]:[rank4]:   File "/tmp/deepspec-env-tar-cache.apEoQz/deepspec_vllm_torchtitan_envs/lib/python3.12/site-packages/torch/distributed/elastic/multiprocessing/errors/__init__.py", line 367, in wrapper
+[2026-09-12T14:23:01.201750704Z] [default4]:[rank4]:     return f(*args, **kwargs)
+[2026-09-12T14:23:01.201877390Z] [default4]:[rank4]:            ^^^^^^^^^^^^^^^^^^
+[2026-09-12T14:23:01.201974648Z] [default4]:[rank4]:   File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/train.py", line 60, in main
+[2026-09-12T14:23:01.202091466Z] [default4]:[rank4]:     trainer.train()
+[2026-09-12T14:23:01.202187217Z] [default4]:[rank4]:   File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/deepspec/trainer/base_trainer.py", line 1742, in train
+[2026-09-12T14:23:01.202325082Z] [default4]:[rank4]:     for batch in self.iter_training_batches(prefetcher):
+[2026-09-12T14:23:01.202428923Z] [default4]:[rank4]:                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[2026-09-12T14:23:01.202539717Z] [default4]:[rank4]:   File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/deepspec/trainer/qwen3_8_vllm_trainer.py", line 252, in iter_training_batches
+[2026-09-12T14:23:01.202636125Z] [default4]:[rank4]:     self._collective_stage(generate)
+[2026-09-12T14:23:01.202745939Z] [default4]:[rank4]:   File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/deepspec/trainer/qwen3_8_vllm_trainer.py", line 148, in _collective_stage
+[2026-09-12T14:23:01.202848495Z] [default4]:[rank4]:     raise RuntimeError(
+[2026-09-12T14:23:01.202966911Z] [default4]:[rank4]: RuntimeError: Qwen vLLM partition failed: rank 0: RuntimeError: Qwen vLLM exited with status 1; see /mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/target_data_batch_cache/rank_00000/qwen38-job-l1fzc94f/job.json.log; rank 4: RuntimeError: Qwen vLLM exited with status 1; see /mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/target_data_batch_cache/rank_00004/qwen38-job-jh5iopc9/job.json.log; rank 8: RuntimeError: 
+[2026-09-12T14:23:02.196732235Z] [default1]:[rank1]: Traceback (most recent call last):
+[2026-09-12T14:23:02.196870150Z] [default1]:[rank1]:   File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/train.py", line 115, in <module>
+[2026-09-12T14:23:02.196983231Z] [default1]:[rank1]:     main(int(os.environ["LOCAL_RANK"]))
+[2026-09-12T14:23:02.197105904Z] [default1]:[rank1]:   File "/tmp/deepspec-env-tar-cache.apEoQz/deepspec_vllm_torchtitan_envs/lib/python3.12/site-packages/torch/distributed/elastic/multiprocessing/errors/__init__.py", line 367, in wrapper
+[2026-09-12T14:23:02.197204265Z] [default1]:[rank1]:     return f(*args, **kwargs)
+[2026-09-12T14:23:02.197321902Z] [default1]:[rank1]:            ^^^^^^^^^^^^^^^^^^
+[2026-09-12T14:23:02.197422473Z] [default1]:[rank1]:   File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/train.py", line 60, in main
+[2026-09-12T14:23:02.197540107Z] [default1]:[rank1]:     trainer.train()
+[2026-09-12T14:23:02.197644416Z] [default1]:[rank1]:   File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/deepspec/trainer/base_trainer.py", line 1742, in train
+[2026-09-12T14:23:02.197765801Z] [default1]:[rank1]:     for batch in self.iter_training_batches(prefetcher):
+[2026-09-12T14:23:02.197874797Z] [default1]:[rank1]:                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[2026-09-12T14:23:02.197987110Z] [default1]:[rank1]:   File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/deepspec/trainer/qwen3_8_vllm_trainer.py", line 252, in iter_training_batches
+[2026-09-12T14:23:02.198086459Z] [default1]:[rank1]:     self._collective_stage(generate)
+[2026-09-12T14:23:02.198201931Z] [default1]:[rank1]:   File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/deepspec/trainer/qwen3_8_vllm_trainer.py", line 148, in _collective_stage
+[2026-09-12T14:23:02.198301149Z] [default1]:[rank1]:     raise RuntimeError(
+[2026-09-12T14:23:02.198432471Z] [default1]:[rank1]: RuntimeError: Qwen vLLM partition failed: rank 0: RuntimeError: Qwen vLLM exited with status 1; see /mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/target_data_batch_cache/rank_00000/qwen38-job-l1fzc94f/job.json.log; rank 4: RuntimeError: Qwen vLLM exited with status 1; see /mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/target_data_batch_cache/rank_00004/qwen38-job-jh5iopc9/job.json.log; rank 8: RuntimeError: 
+[2026-09-12T14:23:02.198560009Z] [default3]:[rank3]: Traceback (most recent call last):
+[2026-09-12T14:23:02.198660233Z] [default3]:[rank3]:   File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/train.py", line 115, in <module>
+[2026-09-12T14:23:02.198778515Z] [default3]:[rank3]:     main(int(os.environ["LOCAL_RANK"]))
+[2026-09-12T14:23:02.198888116Z] [default3]:[rank3]:   File "/tmp/deepspec-env-tar-cache.apEoQz/deepspec_vllm_torchtitan_envs/lib/python3.12/site-packages/torch/distributed/elastic/multiprocessing/errors/__init__.py", line 367, in wrapper
+[2026-09-12T14:23:02.199020941Z] [default3]:[rank3]:     return f(*args, **kwargs)
+[2026-09-12T14:23:02.199126486Z] [default3]:[rank3]:            ^^^^^^^^^^^^^^^^^^
+[2026-09-12T14:23:02.199236838Z] [default3]:[rank3]:   File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/train.py", line 60, in main
+[2026-09-12T14:23:02.199339995Z] [default3]:[rank3]:     trainer.train()
+[2026-09-12T14:23:02.199452551Z] [default3]:[rank3]:   File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/deepspec/trainer/base_trainer.py", line 1742, in train
+[2026-09-12T14:23:02.199552370Z] [default3]:[rank3]:     for batch in self.iter_training_batches(prefetcher):
+[2026-09-12T14:23:02.199666942Z] [default3]:[rank3]:                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[2026-09-12T14:23:02.199770224Z] [default3]:[rank3]:   File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/deepspec/trainer/qwen3_8_vllm_trainer.py", line 252, in iter_training_batches
+[2026-09-12T14:23:02.199893492Z] [default3]:[rank3]:     self._collective_stage(generate)
+[2026-09-12T14:23:02.199996741Z] [default3]:[rank3]:   File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/deepspec/trainer/qwen3_8_vllm_trainer.py", line 148, in _collective_stage
+[2026-09-12T14:23:02.200109730Z] [default3]:[rank3]:     raise RuntimeError(
+[2026-09-12T14:23:02.200229364Z] [default3]:[rank3]: RuntimeError: Qwen vLLM partition failed: rank 0: RuntimeError: Qwen vLLM exited with status 1; see /mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/target_data_batch_cache/rank_00000/qwen38-job-l1fzc94f/job.json.log; rank 4: RuntimeError: Qwen vLLM exited with status 1; see /mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/target_data_batch_cache/rank_00004/qwen38-job-jh5iopc9/job.json.log; rank 8: RuntimeError: 
+[2026-09-12T14:23:02.200339667Z] [default0]:[rank0]: Traceback (most recent call last):
+[2026-09-12T14:23:02.200458295Z] [default0]:[rank0]:   File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/train.py", line 115, in <module>
+[2026-09-12T14:23:02.200552169Z] [default0]:[rank0]:     main(int(os.environ["LOCAL_RANK"]))
+[2026-09-12T14:23:02.200658948Z] [default0]:[rank0]:   File "/tmp/deepspec-env-tar-cache.apEoQz/deepspec_vllm_torchtitan_envs/lib/python3.12/site-packages/torch/distributed/elastic/multiprocessing/errors/__init__.py", line 367, in wrapper
+[2026-09-12T14:23:02.200760985Z] [default0]:[rank0]:     return f(*args, **kwargs)
+[2026-09-12T14:23:02.200870633Z] [default0]:[rank0]:            ^^^^^^^^^^^^^^^^^^
+[2026-09-12T14:23:02.200978006Z] [default0]:[rank0]:   File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/train.py", line 60, in main
+[2026-09-12T14:23:02.201106183Z] [default0]:[rank0]:     trainer.train()
+[2026-09-12T14:23:02.201202876Z] [default0]:[rank0]:   File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/deepspec/trainer/base_trainer.py", line 1742, in train
+[2026-09-12T14:23:02.201297601Z] [default0]:[rank0]:     for batch in self.iter_training_batches(prefetcher):
+[2026-09-12T14:23:02.201424290Z] [default0]:[rank0]:                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[2026-09-12T14:23:02.201541832Z] [default0]:[rank0]:   File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/deepspec/trainer/qwen3_8_vllm_trainer.py", line 252, in iter_training_batches
+[2026-09-12T14:23:02.201650480Z] [default0]:[rank0]:     self._collective_stage(generate)
+[2026-09-12T14:23:02.201753422Z] [default0]:[rank0]:   File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/deepspec/trainer/qwen3_8_vllm_trainer.py", line 148, in _collective_stage
+[2026-09-12T14:23:02.201880648Z] [default0]:[rank0]:     raise RuntimeError(
+[2026-09-12T14:23:02.201977196Z] [default0]:[rank0]: RuntimeError: Qwen vLLM partition failed: rank 0: RuntimeError: Qwen vLLM exited with status 1; see /mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/target_data_batch_cache/rank_00000/qwen38-job-l1fzc94f/job.json.log; rank 4: RuntimeError: Qwen vLLM exited with status 1; see /mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/target_data_batch_cache/rank_00004/qwen38-job-jh5iopc9/job.json.log; rank 8: RuntimeError: 
+[2026-09-12T14:23:02.202094769Z] [default2]:[rank2]: Traceback (most recent call last):
+[2026-09-12T14:23:02.202211612Z] [default2]:[rank2]:   File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/train.py", line 115, in <module>
+[2026-09-12T14:23:02.202317742Z] [default2]:[rank2]:     main(int(os.environ["LOCAL_RANK"]))
+[2026-09-12T14:23:02.202435561Z] [default2]:[rank2]:   File "/tmp/deepspec-env-tar-cache.apEoQz/deepspec_vllm_torchtitan_envs/lib/python3.12/site-packages/torch/distributed/elastic/multiprocessing/errors/__init__.py", line 367, in wrapper
+[2026-09-12T14:23:02.202532428Z] [default2]:[rank2]:     return f(*args, **kwargs)
+[2026-09-12T14:23:02.202637733Z] [default2]:[rank2]:            ^^^^^^^^^^^^^^^^^^
+[2026-09-12T14:23:02.202734377Z] [default2]:[rank2]:   File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/train.py", line 60, in main
+[2026-09-12T14:23:02.202860595Z] [default2]:[rank2]:     trainer.train()
+[2026-09-12T14:23:02.202959597Z] [default2]:[rank2]:   File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/deepspec/trainer/base_trainer.py", line 1742, in train
+[2026-09-12T14:23:02.203092058Z] [default2]:[rank2]:     for batch in self.iter_training_batches(prefetcher):
+[2026-09-12T14:23:02.203185646Z] [default2]:[rank2]:                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[2026-09-12T14:23:02.203293623Z] [default2]:[rank2]:   File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/deepspec/trainer/qwen3_8_vllm_trainer.py", line 252, in iter_training_batches
+[2026-09-12T14:23:02.203392900Z] [default2]:[rank2]:     self._collective_stage(generate)
+[2026-09-12T14:23:02.203510240Z] [default2]:[rank2]:   File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/deepspec/trainer/qwen3_8_vllm_trainer.py", line 148, in _collective_stage
+[2026-09-12T14:23:02.203612202Z] [default2]:[rank2]:     raise RuntimeError(
+[2026-09-12T14:23:02.203723796Z] [default2]:[rank2]: RuntimeError: Qwen vLLM partition failed: rank 0: RuntimeError: Qwen vLLM exited with status 1; see /mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/target_data_batch_cache/rank_00000/qwen38-job-l1fzc94f/job.json.log; rank 4: RuntimeError: Qwen vLLM exited with status 1; see /mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/target_data_batch_cache/rank_00004/qwen38-job-jh5iopc9/job.json.log; rank 8: RuntimeError: 
+[2026-09-12T14:23:02.203832789Z] W0912 22:23:01.843000 108 site-packages/torch/distributed/elastic/multiprocessing/api.py:1028] Sending process 112 closing signal SIGTERM
+[2026-09-12T14:23:02.203935817Z] W0912 22:23:01.845000 108 site-packages/torch/distributed/elastic/multiprocessing/api.py:1028] Sending process 113 closing signal SIGTERM
+[2026-09-12T14:23:02.204049352Z] W0912 22:23:01.847000 108 site-packages/torch/distributed/elastic/multiprocessing/api.py:1028] Sending process 114 closing signal SIGTERM
+[2026-09-12T14:23:02.204157938Z] W0912 22:23:01.848000 108 site-packages/torch/distributed/elastic/multiprocessing/api.py:1028] Sending process 115 closing signal SIGTERM
+[2026-09-12T14:23:02.204274289Z] W0912 22:23:01.849000 108 site-packages/torch/distributed/elastic/multiprocessing/api.py:1028] Sending process 116 closing signal SIGTERM
+[2026-09-12T14:23:02.204370539Z] W0912 22:23:01.851000 108 site-packages/torch/distributed/elastic/multiprocessing/api.py:1028] Sending process 118 closing signal SIGTERM
+[2026-09-12T14:23:02.204487500Z] W0912 22:23:01.851000 108 site-packages/torch/distributed/elastic/multiprocessing/api.py:1028] Sending process 119 closing signal SIGTERM
+[2026-09-12T14:23:04.219545677Z] E0912 22:23:03.460000 108 site-packages/torch/distributed/elastic/multiprocessing/api.py:1002] failed (exitcode: 1) local_rank: 5 (pid: 117) of binary: /tmp/deepspec-env-tar-cache.apEoQz/deepspec_vllm_torchtitan_envs/bin/python
+[2026-09-12T14:23:04.219658629Z] E0912 22:23:03.463000 108 site-packages/torch/distributed/elastic/multiprocessing/errors/error_handler.py:145] no error file defined for parent, to copy child error file (/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/logs/torchrun_node_rank_0/none_xjywgyew/attempt_0/5/error.json)
+[2026-09-12T14:23:04.219768694Z] Traceback (most recent call last):
+[2026-09-12T14:23:04.219880534Z]   File "<frozen runpy>", line 198, in _run_module_as_main
+[2026-09-12T14:23:04.219973312Z]   File "<frozen runpy>", line 88, in _run_code
+[2026-09-12T14:23:04.220063944Z]   File "/tmp/deepspec-env-tar-cache.apEoQz/deepspec_vllm_torchtitan_envs/lib/python3.12/site-packages/torch/distributed/run.py", line 1032, in <module>
+[2026-09-12T14:23:04.220151902Z]     main()
+[2026-09-12T14:23:04.220244512Z]   File "/tmp/deepspec-env-tar-cache.apEoQz/deepspec_vllm_torchtitan_envs/lib/python3.12/site-packages/torch/distributed/elastic/multiprocessing/errors/__init__.py", line 367, in wrapper
+[2026-09-12T14:23:04.220336841Z]     return f(*args, **kwargs)
+[2026-09-12T14:23:04.220424907Z]            ^^^^^^^^^^^^^^^^^^
+[2026-09-12T14:23:04.220514346Z]   File "/tmp/deepspec-env-tar-cache.apEoQz/deepspec_vllm_torchtitan_envs/lib/python3.12/site-packages/torch/distributed/run.py", line 1028, in main
+[2026-09-12T14:23:04.220607739Z]     run(args)
+[2026-09-12T14:23:04.220697504Z]   File "/tmp/deepspec-env-tar-cache.apEoQz/deepspec_vllm_torchtitan_envs/lib/python3.12/site-packages/torch/distributed/run.py", line 1019, in run
+[2026-09-12T14:23:04.220788703Z]     elastic_launch(
+[2026-09-12T14:23:04.220885201Z]   File "/tmp/deepspec-env-tar-cache.apEoQz/deepspec_vllm_torchtitan_envs/lib/python3.12/site-packages/torch/distributed/launcher/api.py", line 194, in __call__
+[2026-09-12T14:23:04.220976223Z]     return launch_agent(
+[2026-09-12T14:23:04.221065343Z]            ^^^^^^^^^^^^^
+[2026-09-12T14:23:04.221153381Z]   File "/tmp/deepspec-env-tar-cache.apEoQz/deepspec_vllm_torchtitan_envs/lib/python3.12/site-packages/torch/distributed/launcher/api.py", line 383, in launch_agent
+[2026-09-12T14:23:04.221237203Z]     raise ChildFailedError(
+[2026-09-12T14:23:04.221320497Z] torch.distributed.elastic.multiprocessing.errors.ChildFailedError: 
+[2026-09-12T14:23:04.221409435Z] ============================================================
+[2026-09-12T14:23:04.221494637Z] train.py FAILED
+[2026-09-12T14:23:04.221583115Z] ------------------------------------------------------------
+[2026-09-12T14:23:04.221669685Z] Failures:
+[2026-09-12T14:23:04.221753257Z] [1]:
+[2026-09-12T14:23:04.221841834Z]   time      : 2026-09-12_22:23:01
+[2026-09-12T14:23:04.221935654Z]   host      : pt-ea334f03da8d493a8bbcab49b905fd6f-master-0.pt-ea334f03da8d493a8bbcab49b905fd6f.ns-zuhu2026-c9929bca.svc.cluster.local
+[2026-09-12T14:23:04.222020867Z]   rank      : 0 (local_rank: 0)
+[2026-09-12T14:23:04.222107186Z]   exitcode  : -15 (pid: 112)  (SIGTERM)
+[2026-09-12T14:23:04.222192425Z]   error_file: /mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/logs/torchrun_node_rank_0/none_xjywgyew/attempt_0/0/error.json
+[2026-09-12T14:23:04.222279181Z]   traceback : Traceback (most recent call last):
+[2026-09-12T14:23:04.222365629Z]     File "/tmp/deepspec-env-tar-cache.apEoQz/deepspec_vllm_torchtitan_envs/lib/python3.12/site-packages/torch/distributed/elastic/multiprocessing/errors/__init__.py", line 367, in wrapper
+[2026-09-12T14:23:04.222450803Z]       return f(*args, **kwargs)
+[2026-09-12T14:23:04.222532995Z]              ^^^^^^^^^^^^^^^^^^
+[2026-09-12T14:23:04.222623403Z]     File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/train.py", line 60, in main
+[2026-09-12T14:23:04.222710999Z]       trainer.train()
+[2026-09-12T14:23:04.222801095Z]     File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/deepspec/trainer/base_trainer.py", line 1742, in train
+[2026-09-12T14:23:04.222890089Z]       for batch in self.iter_training_batches(prefetcher):
+[2026-09-12T14:23:04.222979421Z]                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[2026-09-12T14:23:04.223067969Z]     File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/deepspec/trainer/qwen3_8_vllm_trainer.py", line 252, in iter_training_batches
+[2026-09-12T14:23:04.223153830Z]       self._collective_stage(generate)
+[2026-09-12T14:23:04.223237992Z]     File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/deepspec/trainer/qwen3_8_vllm_trainer.py", line 148, in _collective_stage
+[2026-09-12T14:23:04.223323860Z]       raise RuntimeError(
+[2026-09-12T14:23:04.223408609Z]   RuntimeError: Qwen vLLM partition failed: rank 0: RuntimeError: Qwen vLLM exited with status 1; see /mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/target_data_batch_cache/rank_00000/qwen38-job-l1fzc94f/job.json.log; rank 4: RuntimeError: Qwen vLLM exited with status 1; see /mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/target_data_batch_cache/rank_00004/qwen38-job-jh5iopc9/job.json.log; rank 8: RuntimeError: Qwen vLLM exited w
+[2026-09-12T14:23:04.223497173Z]   
+[2026-09-12T14:23:04.223578487Z] [2]:
+[2026-09-12T14:23:04.223660755Z]   time      : 2026-09-12_22:23:01
+[2026-09-12T14:23:04.223746438Z]   host      : pt-ea334f03da8d493a8bbcab49b905fd6f-master-0.pt-ea334f03da8d493a8bbcab49b905fd6f.ns-zuhu2026-c9929bca.svc.cluster.local
+[2026-09-12T14:23:04.223829815Z]   rank      : 1 (local_rank: 1)
+[2026-09-12T14:23:04.223916069Z]   exitcode  : -15 (pid: 113)  (SIGTERM)
+[2026-09-12T14:23:04.224011107Z]   error_file: /mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/logs/torchrun_node_rank_0/none_xjywgyew/attempt_0/1/error.json
+[2026-09-12T14:23:04.224092710Z]   traceback : Traceback (most recent call last):
+[2026-09-12T14:23:04.224179938Z]     File "/tmp/deepspec-env-tar-cache.apEoQz/deepspec_vllm_torchtitan_envs/lib/python3.12/site-packages/torch/distributed/elastic/multiprocessing/errors/__init__.py", line 367, in wrapper
+[2026-09-12T14:23:04.224272909Z]       return f(*args, **kwargs)
+[2026-09-12T14:23:04.224361132Z]              ^^^^^^^^^^^^^^^^^^
+[2026-09-12T14:23:04.224455384Z]     File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/train.py", line 60, in main
+[2026-09-12T14:23:04.224543692Z]       trainer.train()
+[2026-09-12T14:23:04.224633626Z]     File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/deepspec/trainer/base_trainer.py", line 1742, in train
+[2026-09-12T14:23:04.224717520Z]       for batch in self.iter_training_batches(prefetcher):
+[2026-09-12T14:23:04.224811042Z]                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[2026-09-12T14:23:04.224903775Z]     File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/deepspec/trainer/qwen3_8_vllm_trainer.py", line 252, in iter_training_batches
+[2026-09-12T14:23:04.224984395Z]       self._collective_stage(generate)
+[2026-09-12T14:23:04.225068725Z]     File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/deepspec/trainer/qwen3_8_vllm_trainer.py", line 148, in _collective_stage
+[2026-09-12T14:23:04.225148839Z]       raise RuntimeError(
+[2026-09-12T14:23:04.225233357Z]   RuntimeError: Qwen vLLM partition failed: rank 0: RuntimeError: Qwen vLLM exited with status 1; see /mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/target_data_batch_cache/rank_00000/qwen38-job-l1fzc94f/job.json.log; rank 4: RuntimeError: Qwen vLLM exited with status 1; see /mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/target_data_batch_cache/rank_00004/qwen38-job-jh5iopc9/job.json.log; rank 8: RuntimeError: Qwen vLLM exited w
+[2026-09-12T14:23:04.225317155Z]   
+[2026-09-12T14:23:04.225397265Z] [3]:
+[2026-09-12T14:23:04.225483592Z]   time      : 2026-09-12_22:23:01
+[2026-09-12T14:23:04.225562991Z]   host      : pt-ea334f03da8d493a8bbcab49b905fd6f-master-0.pt-ea334f03da8d493a8bbcab49b905fd6f.ns-zuhu2026-c9929bca.svc.cluster.local
+[2026-09-12T14:23:04.225646527Z]   rank      : 2 (local_rank: 2)
+[2026-09-12T14:23:04.225732292Z]   exitcode  : -15 (pid: 114)  (SIGTERM)
+[2026-09-12T14:23:04.225815230Z]   error_file: /mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/logs/torchrun_node_rank_0/none_xjywgyew/attempt_0/2/error.json
+[2026-09-12T14:23:04.225905442Z]   traceback : Traceback (most recent call last):
+[2026-09-12T14:23:04.225994875Z]     File "/tmp/deepspec-env-tar-cache.apEoQz/deepspec_vllm_torchtitan_envs/lib/python3.12/site-packages/torch/distributed/elastic/multiprocessing/errors/__init__.py", line 367, in wrapper
+[2026-09-12T14:23:04.226077323Z]       return f(*args, **kwargs)
+[2026-09-12T14:23:04.226158638Z]              ^^^^^^^^^^^^^^^^^^
+[2026-09-12T14:23:04.226243654Z]     File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/train.py", line 60, in main
+[2026-09-12T14:23:04.226326137Z]       trainer.train()
+[2026-09-12T14:23:04.226408491Z]     File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/deepspec/trainer/base_trainer.py", line 1742, in train
+[2026-09-12T14:23:04.226487550Z]       for batch in self.iter_training_batches(prefetcher):
+[2026-09-12T14:23:04.226569629Z]                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[2026-09-12T14:23:04.226651600Z]     File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/deepspec/trainer/qwen3_8_vllm_trainer.py", line 252, in iter_training_batches
+[2026-09-12T14:23:04.226732581Z]       self._collective_stage(generate)
+[2026-09-12T14:23:04.226815284Z]     File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/deepspec/trainer/qwen3_8_vllm_trainer.py", line 148, in _collective_stage
+[2026-09-12T14:23:04.226901772Z]       raise RuntimeError(
+[2026-09-12T14:23:04.226987205Z]   RuntimeError: Qwen vLLM partition failed: rank 0: RuntimeError: Qwen vLLM exited with status 1; see /mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/target_data_batch_cache/rank_00000/qwen38-job-l1fzc94f/job.json.log; rank 4: RuntimeError: Qwen vLLM exited with status 1; see /mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/target_data_batch_cache/rank_00004/qwen38-job-jh5iopc9/job.json.log; rank 8: RuntimeError: Qwen vLLM exited w
+[2026-09-12T14:23:04.227071243Z]   
+[2026-09-12T14:23:04.227153660Z] [4]:
+[2026-09-12T14:23:04.227233295Z]   time      : 2026-09-12_22:23:01
+[2026-09-12T14:23:04.227311943Z]   host      : pt-ea334f03da8d493a8bbcab49b905fd6f-master-0.pt-ea334f03da8d493a8bbcab49b905fd6f.ns-zuhu2026-c9929bca.svc.cluster.local
+[2026-09-12T14:23:04.227397608Z]   rank      : 3 (local_rank: 3)
+[2026-09-12T14:23:04.227477503Z]   exitcode  : -15 (pid: 115)  (SIGTERM)
+[2026-09-12T14:23:04.227555892Z]   error_file: /mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/logs/torchrun_node_rank_0/none_xjywgyew/attempt_0/3/error.json
+[2026-09-12T14:23:04.227640881Z]   traceback : Traceback (most recent call last):
+[2026-09-12T14:23:04.227721430Z]     File "/tmp/deepspec-env-tar-cache.apEoQz/deepspec_vllm_torchtitan_envs/lib/python3.12/site-packages/torch/distributed/elastic/multiprocessing/errors/__init__.py", line 367, in wrapper
+[2026-09-12T14:23:04.227803605Z]       return f(*args, **kwargs)
+[2026-09-12T14:23:04.227896035Z]              ^^^^^^^^^^^^^^^^^^
+[2026-09-12T14:23:04.227981768Z]     File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/train.py", line 60, in main
+[2026-09-12T14:23:04.228061997Z]       trainer.train()
+[2026-09-12T14:23:04.228145623Z]     File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/deepspec/trainer/base_trainer.py", line 1742, in train
+[2026-09-12T14:23:04.228225917Z]       for batch in self.iter_training_batches(prefetcher):
+[2026-09-12T14:23:04.228309217Z]                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[2026-09-12T14:23:04.228400182Z]     File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/deepspec/trainer/qwen3_8_vllm_trainer.py", line 252, in iter_training_batches
+[2026-09-12T14:23:04.228481924Z]       self._collective_stage(generate)
+[2026-09-12T14:23:04.228565584Z]     File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/deepspec/trainer/qwen3_8_vllm_trainer.py", line 148, in _collective_stage
+[2026-09-12T14:23:04.228651991Z]       raise RuntimeError(
+[2026-09-12T14:23:04.228734154Z]   RuntimeError: Qwen vLLM partition failed: rank 0: RuntimeError: Qwen vLLM exited with status 1; see /mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/target_data_batch_cache/rank_00000/qwen38-job-l1fzc94f/job.json.log; rank 4: RuntimeError: Qwen vLLM exited with status 1; see /mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/target_data_batch_cache/rank_00004/qwen38-job-jh5iopc9/job.json.log; rank 8: RuntimeError: Qwen vLLM exited w
+[2026-09-12T14:23:04.228817494Z]   
+[2026-09-12T14:23:04.228907601Z] [5]:
+[2026-09-12T14:23:04.228988500Z]   time      : 2026-09-12_22:23:00
+[2026-09-12T14:23:04.229073542Z]   host      : pt-ea334f03da8d493a8bbcab49b905fd6f-master-0.pt-ea334f03da8d493a8bbcab49b905fd6f.ns-zuhu2026-c9929bca.svc.cluster.local
+[2026-09-12T14:23:04.229153745Z]   rank      : 4 (local_rank: 4)
+[2026-09-12T14:23:04.229236691Z]   exitcode  : -15 (pid: 116)  (SIGTERM)
+[2026-09-12T14:23:04.229317365Z]   error_file: /mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/logs/torchrun_node_rank_0/none_xjywgyew/attempt_0/4/error.json
+[2026-09-12T14:23:04.229402432Z]   traceback : Traceback (most recent call last):
+[2026-09-12T14:23:04.229483606Z]     File "/tmp/deepspec-env-tar-cache.apEoQz/deepspec_vllm_torchtitan_envs/lib/python3.12/site-packages/torch/distributed/elastic/multiprocessing/errors/__init__.py", line 367, in wrapper
+[2026-09-12T14:23:04.229572170Z]       return f(*args, **kwargs)
+[2026-09-12T14:23:04.229653445Z]              ^^^^^^^^^^^^^^^^^^
+[2026-09-12T14:23:04.229733106Z]     File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/train.py", line 60, in main
+[2026-09-12T14:23:04.229818079Z]       trainer.train()
+[2026-09-12T14:23:04.229899533Z]     File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/deepspec/trainer/base_trainer.py", line 1742, in train
+[2026-09-12T14:23:04.229983824Z]       for batch in self.iter_training_batches(prefetcher):
+[2026-09-12T14:23:04.230074794Z]                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[2026-09-12T14:23:04.230162154Z]     File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/deepspec/trainer/qwen3_8_vllm_trainer.py", line 252, in iter_training_batches
+[2026-09-12T14:23:04.230249400Z]       self._collective_stage(generate)
+[2026-09-12T14:23:04.230342102Z]     File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/deepspec/trainer/qwen3_8_vllm_trainer.py", line 148, in _collective_stage
+[2026-09-12T14:23:04.230423453Z]       raise RuntimeError(
+[2026-09-12T14:23:04.230508864Z]   RuntimeError: Qwen vLLM partition failed: rank 0: RuntimeError: Qwen vLLM exited with status 1; see /mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/target_data_batch_cache/rank_00000/qwen38-job-l1fzc94f/job.json.log; rank 4: RuntimeError: Qwen vLLM exited with status 1; see /mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/target_data_batch_cache/rank_00004/qwen38-job-jh5iopc9/job.json.log; rank 8: RuntimeError: Qwen vLLM exited w
+[2026-09-12T14:23:04.230589470Z]   
+[2026-09-12T14:23:04.230676715Z] [6]:
+[2026-09-12T14:23:04.230761675Z]   time      : 2026-09-12_22:23:00
+[2026-09-12T14:23:04.230849928Z]   host      : pt-ea334f03da8d493a8bbcab49b905fd6f-master-0.pt-ea334f03da8d493a8bbcab49b905fd6f.ns-zuhu2026-c9929bca.svc.cluster.local
+[2026-09-12T14:23:04.230929983Z]   rank      : 6 (local_rank: 6)
+[2026-09-12T14:23:04.231021836Z]   exitcode  : 1 (pid: 118) 
+[2026-09-12T14:23:04.231104731Z]   error_file: /mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/logs/torchrun_node_rank_0/none_xjywgyew/attempt_0/6/error.json
+[2026-09-12T14:23:04.231184935Z]   traceback : Traceback (most recent call last):
+[2026-09-12T14:23:04.231272812Z]     File "/tmp/deepspec-env-tar-cache.apEoQz/deepspec_vllm_torchtitan_envs/lib/python3.12/site-packages/torch/distributed/elastic/multiprocessing/errors/__init__.py", line 367, in wrapper
+[2026-09-12T14:23:04.231361651Z]       return f(*args, **kwargs)
+[2026-09-12T14:23:04.231442650Z]              ^^^^^^^^^^^^^^^^^^
+[2026-09-12T14:23:04.231530930Z]     File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/train.py", line 60, in main
+[2026-09-12T14:23:04.231613427Z]       trainer.train()
+[2026-09-12T14:23:04.231697510Z]     File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/deepspec/trainer/base_trainer.py", line 1742, in train
+[2026-09-12T14:23:04.231781031Z]       for batch in self.iter_training_batches(prefetcher):
+[2026-09-12T14:23:04.231870979Z]                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[2026-09-12T14:23:04.231953919Z]     File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/deepspec/trainer/qwen3_8_vllm_trainer.py", line 252, in iter_training_batches
+[2026-09-12T14:23:04.232040452Z]       self._collective_stage(generate)
+[2026-09-12T14:23:04.232125188Z]     File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/deepspec/trainer/qwen3_8_vllm_trainer.py", line 148, in _collective_stage
+[2026-09-12T14:23:04.232205216Z]       raise RuntimeError(
+[2026-09-12T14:23:04.232294579Z]   RuntimeError: Qwen vLLM partition failed: rank 0: RuntimeError: Qwen vLLM exited with status 1; see /mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/target_data_batch_cache/rank_00000/qwen38-job-l1fzc94f/job.json.log; rank 4: RuntimeError: Qwen vLLM exited with status 1; see /mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/target_data_batch_cache/rank_00004/qwen38-job-jh5iopc9/job.json.log; rank 8: RuntimeError: Qwen vLLM exited w
+[2026-09-12T14:23:04.232377098Z]   
+[2026-09-12T14:23:04.232462409Z] [7]:
+[2026-09-12T14:23:04.232544452Z]   time      : 2026-09-12_22:23:00
+[2026-09-12T14:23:04.232628403Z]   host      : pt-ea334f03da8d493a8bbcab49b905fd6f-master-0.pt-ea334f03da8d493a8bbcab49b905fd6f.ns-zuhu2026-c9929bca.svc.cluster.local
+[2026-09-12T14:23:04.232711212Z]   rank      : 7 (local_rank: 7)
+[2026-09-12T14:23:04.232793521Z]   exitcode  : 1 (pid: 119) 
+[2026-09-12T14:23:04.232878853Z]   error_file: /mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/logs/torchrun_node_rank_0/none_xjywgyew/attempt_0/7/error.json
+[2026-09-12T14:23:04.232963720Z]   traceback : Traceback (most recent call last):
+[2026-09-12T14:23:04.233047271Z]     File "/tmp/deepspec-env-tar-cache.apEoQz/deepspec_vllm_torchtitan_envs/lib/python3.12/site-packages/torch/distributed/elastic/multiprocessing/errors/__init__.py", line 367, in wrapper
+[2026-09-12T14:23:04.233129823Z]       return f(*args, **kwargs)
+[2026-09-12T14:23:04.233211009Z]              ^^^^^^^^^^^^^^^^^^
+[2026-09-12T14:23:04.233301760Z]     File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/train.py", line 60, in main
+[2026-09-12T14:23:04.233383200Z]       trainer.train()
+[2026-09-12T14:23:04.233467115Z]     File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/deepspec/trainer/base_trainer.py", line 1742, in train
+[2026-09-12T14:23:04.233552151Z]       for batch in self.iter_training_batches(prefetcher):
+[2026-09-12T14:23:04.233634689Z]                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[2026-09-12T14:23:04.233720082Z]     File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/deepspec/trainer/qwen3_8_vllm_trainer.py", line 252, in iter_training_batches
+[2026-09-12T14:23:04.233800972Z]       self._collective_stage(generate)
+[2026-09-12T14:23:04.233892967Z]     File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/deepspec/trainer/qwen3_8_vllm_trainer.py", line 148, in _collective_stage
+[2026-09-12T14:23:04.233976182Z]       raise RuntimeError(
+[2026-09-12T14:23:04.234065938Z]   RuntimeError: Qwen vLLM partition failed: rank 0: RuntimeError: Qwen vLLM exited with status 1; see /mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/target_data_batch_cache/rank_00000/qwen38-job-l1fzc94f/job.json.log; rank 4: RuntimeError: Qwen vLLM exited with status 1; see /mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/target_data_batch_cache/rank_00004/qwen38-job-jh5iopc9/job.json.log; rank 8: RuntimeError: Qwen vLLM exited w
+[2026-09-12T14:23:04.234148479Z]   
+[2026-09-12T14:23:04.234231739Z] ------------------------------------------------------------
+[2026-09-12T14:23:04.234317868Z] Root Cause (first observed failure):
+[2026-09-12T14:23:04.234403949Z] [0]:
+[2026-09-12T14:23:04.234487327Z]   time      : 2026-09-12_22:23:00
+[2026-09-12T14:23:04.234571597Z]   host      : pt-ea334f03da8d493a8bbcab49b905fd6f-master-0.pt-ea334f03da8d493a8bbcab49b905fd6f.ns-zuhu2026-c9929bca.svc.cluster.local
+[2026-09-12T14:23:04.234648683Z]   rank      : 5 (local_rank: 5)
+[2026-09-12T14:23:04.234730202Z]   exitcode  : 1 (pid: 117) 
+[2026-09-12T14:23:04.234811011Z]   error_file: /mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/logs/torchrun_node_rank_0/none_xjywgyew/attempt_0/5/error.json
+[2026-09-12T14:23:04.234901392Z]   traceback : Traceback (most recent call last):
+[2026-09-12T14:23:04.234986090Z]     File "/tmp/deepspec-env-tar-cache.apEoQz/deepspec_vllm_torchtitan_envs/lib/python3.12/site-packages/torch/distributed/elastic/multiprocessing/errors/__init__.py", line 367, in wrapper
+[2026-09-12T14:23:04.235070872Z]       return f(*args, **kwargs)
+[2026-09-12T14:23:04.235151479Z]              ^^^^^^^^^^^^^^^^^^
+[2026-09-12T14:23:04.235232646Z]     File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/train.py", line 60, in main
+[2026-09-12T14:23:04.235312523Z]       trainer.train()
+[2026-09-12T14:23:04.235397789Z]     File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/deepspec/trainer/base_trainer.py", line 1742, in train
+[2026-09-12T14:23:04.235478859Z]       for batch in self.iter_training_batches(prefetcher):
+[2026-09-12T14:23:04.235557811Z]                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[2026-09-12T14:23:04.235642261Z]     File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/deepspec/trainer/qwen3_8_vllm_trainer.py", line 252, in iter_training_batches
+[2026-09-12T14:23:04.235723317Z]       self._collective_stage(generate)
+[2026-09-12T14:23:04.235806534Z]     File "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/deepspec/trainer/qwen3_8_vllm_trainer.py", line 148, in _collective_stage
+[2026-09-12T14:23:04.235894049Z]       raise RuntimeError(
+[2026-09-12T14:23:04.235977336Z]   RuntimeError: Qwen vLLM partition failed: rank 0: RuntimeError: Qwen vLLM exited with status 1; see /mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/target_data_batch_cache/rank_00000/qwen38-job-l1fzc94f/job.json.log; rank 4: RuntimeError: Qwen vLLM exited with status 1; see /mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/target_data_batch_cache/rank_00004/qwen38-job-jh5iopc9/job.json.log; rank 8: RuntimeError: Qwen vLLM exited w
+[2026-09-12T14:23:04.239016158Z]   
+[2026-09-12T14:23:04.239135338Z] ============================================================
+[2026-09-12T14:23:04.239236179Z] + diagnose_exit
+[2026-09-12T14:23:04.239326973Z] + status=1
+[2026-09-12T14:23:04.239427635Z] + set +e
+[2026-09-12T14:23:04.239520718Z] ++ date '+%Y-%m-%d %H:%M:%S %z'
+[2026-09-12T14:23:04.239616103Z] ++ hostname
+[2026-09-12T14:23:04.239699410Z] + echo '[deepspec-launch-exit] time=2026-09-12 22:23:04 +0800 host=pt-ea334f03da8d493a8bbcab49b905fd6f-master-0 node_rank=0 exit_code=1'
+[2026-09-12T14:23:04.239798736Z] [deepspec-launch-exit] time=2026-09-12 22:23:04 +0800 host=pt-ea334f03da8d493a8bbcab49b905fd6f-master-0 node_rank=0 exit_code=1
+[2026-09-12T14:23:04.239890031Z] + (( status == 0 ))
+[2026-09-12T14:23:04.240072964Z] + (( status != 0 ))
+[2026-09-12T14:23:04.240161446Z] + echo '[deepspec-launch-diagnosis] inspect /mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/logs/node_rank_0.log and /mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/logs/torchrun_node_rank_0 for the first failing rank'
+[2026-09-12T14:23:04.240259138Z] [deepspec-launch-diagnosis] inspect /mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/logs/node_rank_0.log and /mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/output/dspark_qwen3_8_27b_vllm/logs/torchrun_node_rank_0 for the first failing rank
+[2026-09-12T14:23:04.240365225Z] + trap - EXIT
+[2026-09-12T14:23:04.240469910Z] + exit 1

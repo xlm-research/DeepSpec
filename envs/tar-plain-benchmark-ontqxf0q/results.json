@@ -1,0 +1,40 @@
+{
+  "format": "tar",
+  "shared_archive": "/mnt/afs-agentpro/lezewei/DeepSpec/envs/deepspec_vllm_torchtitan_envs.tar",
+  "local_archive": "/tmp/deepspec-plain-tar-benchmark-xyodbn1x/deepspec_vllm_torchtitan_envs.tar",
+  "extracted_environment": "/tmp/deepspec-plain-tar-benchmark-xyodbn1x/extracted/deepspec_vllm_torchtitan_envs",
+  "archive_bytes": 9784616960,
+  "regular_files": 91151,
+  "regular_bytes": 9634612359,
+  "copy_command": [
+    "cp",
+    "-a",
+    "--",
+    "/mnt/afs-agentpro/lezewei/DeepSpec/envs/deepspec_vllm_torchtitan_envs.tar",
+    "/tmp/deepspec-plain-tar-benchmark-xyodbn1x/deepspec_vllm_torchtitan_envs.tar"
+  ],
+  "extract_command": [
+    "tar",
+    "-xpf",
+    "/tmp/deepspec-plain-tar-benchmark-xyodbn1x/deepspec_vllm_torchtitan_envs.tar",
+    "-C",
+    "/tmp/deepspec-plain-tar-benchmark-xyodbn1x/extracted"
+  ],
+  "copy_seconds": 52.42149140080437,
+  "extract_seconds": 10.921760481083766,
+  "total_seconds": 63.343251881888136,
+  "archive_creation_included": false,
+  "validation_included": false,
+  "cache_state": "uncontrolled; shared archive was recently created",
+  "historical_cp_a_seconds": 521.257,
+  "historical_rsync_a_seconds": 508.492,
+  "validation": {
+    "matches_source_paths_types_sizes_and_symlink_targets": true,
+    "missing_count": 0,
+    "extra_count": 0,
+    "different_count": 0,
+    "missing_examples": [],
+    "extra_examples": [],
+    "different_examples": []
+  }
+}

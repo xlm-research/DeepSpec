@@ -107,6 +107,7 @@ class Qwen38MultiNodeLauncherTest(unittest.TestCase):
         self.assertIn("train.parallel.tp=4", result.stdout)
         self.assertIn("data.offline_target_data_batches=true", result.stdout)
         self.assertIn("train.data_partitions=512", result.stdout)
+        self.assertIn("logging.checkpointing_steps=10", result.stdout)
         self.assertRegex(
             result.stdout,
             r"transient target cache=.*/output/"

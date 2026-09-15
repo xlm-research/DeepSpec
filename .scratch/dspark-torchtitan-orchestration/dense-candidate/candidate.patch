@@ -1,0 +1,103 @@
+--- a/torchtitan/torchtitan/models/dspark_draft/tensor_parallel.py
++++ b/torchtitan/torchtitan/models/dspark_draft/tensor_parallel.py
+@@ -181,7 +181,7 @@
+         return weight_D * hidden_XD.to(input_dtype)
+ 
+ 
+-def apply_tensor_parallel(model, parallel_dims):
++def apply_dense_parallelism(model, parallel_dims):
+     size = parallel_dims.tp
+     config = model.config
+     if any(
+@@ -196,7 +196,7 @@
+         raise ValueError(
+             "TP must divide query heads, KV heads, hidden and feed-forward widths"
+         )
+-    group = parallel_dims.get_mesh("tp").get_group()
++    group = parallel_dims.get_mesh("tp").get_group() if size > 1 else None
+     layouts = {}
+     for name, module in list(model.named_modules()):
+         if not name:
+@@ -205,7 +205,7 @@
+         parent = model.get_submodule(parent_name)
+         if isinstance(module, nn.Linear):
+             kind = "replicated"
+-            if name.startswith("layers."):
++            if size > 1 and name.startswith("layers."):
+                 if attribute in ("q_proj", "k_proj", "v_proj", "gate_proj", "up_proj"):
+                     kind = "column"
+                 elif attribute in ("o_proj", "down_proj"):
+@@ -235,13 +235,17 @@
+                 parent,
+                 attribute,
+                 DraftNorm(
+-                    module, group=group, partial=attribute in ("q_norm", "k_norm")
++                    module,
++                    group=group,
++                    partial=size > 1 and attribute in ("q_norm", "k_norm"),
+                 ),
+             )
+             layouts[f"{name}.weight"] = dense_param_placement(tp=spmd.I)
+     parameters = dict(model.named_parameters())
+     if parameters.keys() != layouts.keys():
+-        raise ValueError("Every draft parameter requires an explicit TP storage layout")
++        raise ValueError(
++            "Every draft parameter requires an explicit dense storage layout"
++        )
+     mesh = parallel_dims.spmd_dense_mesh()
+     shards = {
+         name: spmd_distribute_tensor(parameter.detach(), mesh, layouts[name])
+--- a/torchtitan/torchtitan/models/dspark_draft/parallelize.py
++++ b/torchtitan/torchtitan/models/dspark_draft/parallelize.py
+@@ -25,25 +25,27 @@
+     if any(
+         degree != 1
+         for degree in (
+-            parallel_dims.dp_replicate,
+             parallel_dims.cp,
+             parallel_dims.pp,
+             parallel_dims.ep,
+         )
+     ):
+-        raise ValueError("This DSpark recipe currently supports FSDP2 with optional TP")
++        raise ValueError(
++            "This DSpark recipe supports DP replication, FSDP2 and optional TP"
++        )
+     if parallel_dims.spmd_backend != "spmd_types":
+         raise ValueError("DSpark requires the spmd_types backend")
+     if compile_config.enable:
+         raise ValueError("This DSpark recipe currently requires model compile disabled")
+-    if parallel_dims.tp_enabled:
+-        if parallelism.enable_sequence_parallel:
++    dense_storage = parallel_dims.tp_enabled or parallel_dims.dp_replicate_enabled
++    if dense_storage:
++        if parallel_dims.tp_enabled and parallelism.enable_sequence_parallel:
+             raise ValueError(
+                 "Draft TP currently requires sequence parallelism disabled"
+             )
+-        from .tensor_parallel import apply_tensor_parallel
++        from .tensor_parallel import apply_dense_parallelism
+ 
+-        apply_tensor_parallel(model, parallel_dims)
++        apply_dense_parallelism(model, parallel_dims)
+     if ac_config is not None:
+         if (
+             not isinstance(ac_config, SelectiveAC.Config)
+@@ -53,7 +55,7 @@
+                 "DSpark currently supports SelectiveAC with RNG preservation"
+             )
+         ac_config.build(dump_folder=dump_folder).apply(model)
+-    if not parallel_dims.tp_enabled:
++    if not dense_storage:
+         annotate_replicated_parameters(model, parallel_dims)
+     # Pure FSDP has one storage axis. The pinned PyTorch build accepts ordinary
+     # parameters on this mesh; its n-D dp_mesh_dims API requires DTensors.
+@@ -66,7 +68,7 @@
+         output_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
+     )
+     kwargs = {"mesh": mesh, "mp_policy": policy}
+-    if parallel_dims.tp_enabled:
++    if dense_storage:
+         mesh, axes = resolve_fsdp_mesh(parallel_dims)
+         kwargs.update(mesh=mesh, dp_mesh_dims=axes)
+     reshard = get_fsdp_reshard_after_forward_policy(

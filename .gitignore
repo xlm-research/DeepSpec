@@ -10,3 +10,7 @@ build/
 dist/
 .DS_Store
 deepspec/utils/constant/internal.py
+
+# Local environment archives
+/envs/deepspec_vllm_torchtitan_envs.tar
+/envs/deepspec_vllm_torchtitan_envs.tar.gz

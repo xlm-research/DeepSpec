@@ -1,0 +1,1 @@
+sudo find /tmp -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +

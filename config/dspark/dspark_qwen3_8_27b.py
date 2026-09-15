@@ -76,7 +76,7 @@ train = dict(
 
 logging = dict(
     logging_steps=10,
-    checkpointing_steps=3000,
+    checkpointing_steps=10,
     save_checkpoints=True,
     checkpoint_dir=None,
     tensorboard_dir=None,

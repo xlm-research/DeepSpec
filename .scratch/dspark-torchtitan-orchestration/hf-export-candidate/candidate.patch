@@ -1,0 +1,99 @@
+--- a/torchtitan/torchtitan/models/dspark_draft/export.py
++++ b/torchtitan/torchtitan/models/dspark_draft/export.py
+@@ -34,6 +34,7 @@
+     started = time.monotonic()
+     commit = read_commit(checkpoint)
+     recipe = commit["resolved_recipe"]
++    export_dtype = recipe["checkpoint"]["export_dtype"]
+     output = Path(output_dir).resolve()
+     marker = output / "export.json"
+     if marker.is_file():
+@@ -41,12 +42,13 @@
+             previous = json.loads(marker.read_text())
+         except ValueError:
+             previous = None
++        if previous and previous["checkpoint"] != commit:
++            raise ValueError("Existing HF export belongs to a different checkpoint")
+         if (
+             previous
+-            and previous["checkpoint"]["metadata_sha256"] != commit["metadata_sha256"]
++            and previous.get("export_dtype") == export_dtype
++            and weights_complete(output)
+         ):
+-            raise ValueError("Existing HF export belongs to a different checkpoint")
+-        if previous and weights_complete(output):
+             return previous
+         marker.unlink()
+     output.mkdir(parents=True, exist_ok=True)
+@@ -64,6 +66,8 @@
+     state = model.state_dict()
+     dcp.load(state, checkpoint_id=checkpoint)
+     model.load_state_dict(state, strict=True)
++    model.to(dtype=TORCH_DTYPE_MAP[export_dtype])
++    model.config.dtype = export_dtype
+     model.save_pretrained(output, max_shard_size="5GB")
+     model.config.architectures = ["Qwen3DSparkModel"]
+     model.config.save_pretrained(output)
+@@ -71,6 +75,7 @@
+         raise RuntimeError("CPU export unexpectedly initialized CUDA")
+     result = {
+         "checkpoint": commit,
++        "export_dtype": export_dtype,
+         "elapsed_seconds": time.monotonic() - started,
+         "cuda_initialized": False,
+     }
+--- a/torchtitan/torchtitan/models/dspark_draft/checkpoint.py
++++ b/torchtitan/torchtitan/models/dspark_draft/checkpoint.py
+@@ -139,8 +139,14 @@
+     def _export_hf(self, step):
+         started = time.monotonic()
+         path = filesystem.join(filesystem.join(self.folder, "hf"), f"step-{step}")
++        states = {
++            name: value.to(self.export_dtype)
++            if torch.is_tensor(value) and value.is_floating_point()
++            else value
++            for name, value in self.states[MODEL].state_dict().items()
++        }
+         self.dcp_save(
+-            self.states[MODEL].state_dict(),
++            states,
+             checkpoint_id=path,
+             async_mode=AsyncMode.DISABLED,
+             enable_garbage_collection=True,
+@@ -155,12 +161,14 @@
+                 **self.states["train_state"].config.model_spec.model.hf_config
+             )
+             config.architectures = ["Qwen3DSparkModel"]
++            config.dtype = self.phase_config.export_dtype
+             write_marker(path, "config.json", config.to_dict())
+             write_marker(
+                 path,
+                 "export.json",
+                 {
+                     "checkpoint": self.last_commit,
++                    "export_dtype": self.phase_config.export_dtype,
+                     "elapsed_seconds": time.monotonic() - started,
+                 },
+             )
+--- a/deepspec/orchestration/journal.py
++++ b/deepspec/orchestration/journal.py
+@@ -87,7 +87,8 @@
+         complete = False
+         if marker.is_file():
+             try:
+-                saved = json.loads(marker.read_text())["checkpoint"]
++                export = json.loads(marker.read_text())
++                saved = export["checkpoint"]
+                 index = output / "model.safetensors.index.json"
+                 names = (
+                     set(json.loads(index.read_text())["weight_map"].values())
+@@ -95,7 +96,8 @@
+                     else {"model.safetensors"}
+                 )
+                 complete = (
+-                    saved["run_id"] == commit["run_id"]
++                    export.get("export_dtype") == config["export_dtype"]
++                    and saved["run_id"] == commit["run_id"]
+                     and saved["completed_updates"] == step
+                     and (output / "config.json").is_file()
+                     and all(
