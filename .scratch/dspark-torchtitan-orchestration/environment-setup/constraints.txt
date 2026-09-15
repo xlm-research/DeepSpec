@@ -1,0 +1,8 @@
+torch==2.13.0
+triton==3.7.1
+transformers==5.16.1
+numpy==2.3.5
+tokenizers==0.23.1
+safetensors==0.8.0
+protobuf==6.33.6
+apache-tvm-ffi==0.1.11

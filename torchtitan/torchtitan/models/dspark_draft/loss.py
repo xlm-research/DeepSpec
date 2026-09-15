@@ -52,12 +52,12 @@ def _compute_accept_rate_3d(
     *,
     outputs: DSparkForwardOutput,
     aligned_target_logits: Optional[torch.Tensor],
+    vocab_group=None,
 ) -> Optional[torch.Tensor]:
     if aligned_target_logits is None:
         return None
-    draft_probs = torch.softmax(outputs.draft_logits.float(), dim=-1)
-    target_probs = torch.softmax(aligned_target_logits.float(), dim=-1)
-    accept_rate_3d = 1.0 - 0.5 * (draft_probs - target_probs).abs().sum(dim=-1)
+    distance = _l1_distance(outputs.draft_logits, aligned_target_logits, vocab_group)
+    accept_rate_3d = 1.0 - 0.5 * distance
     return accept_rate_3d.clamp_(0.0, 1.0)
 
 
@@ -66,16 +66,30 @@ def _compute_local_l1_term(
     outputs: DSparkForwardOutput,
     aligned_target_logits: Optional[torch.Tensor],
     loss_weight_mask: torch.Tensor,
+    vocab_group=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     zero = outputs.draft_logits.new_zeros((), dtype=torch.float32)
     if aligned_target_logits is None:
         return zero, zero
-    draft_probs = torch.softmax(outputs.draft_logits.float(), dim=-1)
-    target_probs = torch.softmax(aligned_target_logits.float(), dim=-1)
-    l1_dist_per_token = (draft_probs - target_probs).abs().sum(dim=-1)
+    l1_dist_per_token = _l1_distance(
+        outputs.draft_logits, aligned_target_logits, vocab_group
+    )
     l1_loss_num = (l1_dist_per_token * loss_weight_mask).sum()
     l1_loss_den = loss_weight_mask.sum()
     return l1_loss_num, l1_loss_den
+
+
+def _l1_distance(draft_logits, target_logits, group):
+    if group is None:
+        return (
+            (draft_logits.float().softmax(-1) - target_logits.float().softmax(-1))
+            .abs()
+            .sum(-1)
+        )
+    from .vocabulary_parallel import softmax, vocab_sum
+
+    local = (softmax(draft_logits, group) - softmax(target_logits, group)).abs().sum(-1)
+    return vocab_sum(local, group)
 
 
 def _collect_local_terms(
@@ -83,6 +97,7 @@ def _collect_local_terms(
     outputs: DSparkForwardOutput,
     loss_decay_gamma: Optional[float],
     l1_loss_alpha: float,
+    vocab_group=None,
 ) -> tuple[dict[str, torch.Tensor], bool]:
     draft_logits = outputs.draft_logits
     target_ids = outputs.target_ids
@@ -100,13 +115,19 @@ def _collect_local_terms(
     flat_logits = draft_logits.reshape(-1, vocab_size)
     flat_targets = target_ids.reshape(-1)
     flat_weights = loss_weight_mask.reshape(-1)
-    loss_per_token = F.cross_entropy(flat_logits, flat_targets, reduction="none")
+    if vocab_group is None:
+        loss_per_token = F.cross_entropy(flat_logits, flat_targets, reduction="none")
+    else:
+        from .vocabulary_parallel import cross_entropy
+
+        loss_per_token = cross_entropy(flat_logits, flat_targets, vocab_group)
     ce_loss_num = (loss_per_token * flat_weights).sum()
     ce_loss_den = flat_weights.sum()
     aligned_target_logits = outputs.aligned_target_logits
     accept_rate_3d = _compute_accept_rate_3d(
         outputs=outputs,
         aligned_target_logits=aligned_target_logits,
+        vocab_group=vocab_group,
     )
     zero = ce_loss_num.new_zeros(())
     assert l1_loss_alpha <= 0 or aligned_target_logits is not None, (
@@ -117,6 +138,7 @@ def _collect_local_terms(
             outputs=outputs,
             aligned_target_logits=aligned_target_logits,
             loss_weight_mask=loss_weight_mask,
+            vocab_group=vocab_group,
         )
     else:
         l1_loss_num = zero
@@ -243,6 +265,7 @@ def _build_loss(
 class DSparkLoss(BaseLoss):
     @dataclass(kw_only=True, slots=True)
     class Config(BaseLoss.Config):
+        enable_vocab_parallel: bool = False
         ce_loss_alpha: float = 0.1
         l1_loss_alpha: float = 0.9
         confidence_head_alpha: float = 1.0
@@ -253,12 +276,14 @@ class DSparkLoss(BaseLoss):
         self.group = None
         self.gas = 1
         self.gradient_scale = 1
+        self.vocab_group = None
 
     def __call__(self, pred, labels, global_valid_tokens=None, **kwargs):
         terms, has_confidence = _collect_local_terms(
             outputs=pred,
             loss_decay_gamma=self.config.loss_decay_gamma,
             l1_loss_alpha=self.config.l1_loss_alpha,
+            vocab_group=self.vocab_group,
         )
         keys = ("ce_loss_den", "l1_loss_den", "confidence_loss_den")
         denominators = torch.stack([terms[key].detach() for key in keys])

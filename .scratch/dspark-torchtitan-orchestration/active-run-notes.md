@@ -1,3 +1,7 @@
+# Current continuation on H800 (2026-09-15)
+
+For current machine, active run, and authorized automatic continuation, read [continuation.md](continuation.md) first. The notes below describe the previous B300 run and are retained as historical evidence.
+
 # CURRENT STATE at2026-09-14 23:10 Asia/Shanghai (supersedes older active-run notes)
 
 - NO ACTIVE GPU EXECUTION. Session34118wasstoppedbySIGTERMtoourknownorchestrationPID1277597only,exit143. Firstactualtargetphasecompletedall20real131072-tokenfeatures (161103279860bytes), twoTP4replicasfullyexited. No128Knativeupdateeverstarted; initializationdirectorydoesnotexist, progress0/checkpointnull.

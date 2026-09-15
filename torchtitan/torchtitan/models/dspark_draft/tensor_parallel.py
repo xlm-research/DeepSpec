@@ -16,6 +16,12 @@ from torchtitan.distributed.spmd_types import (
 from torchtitan.models.common.decoder_sharding import dense_param_placement
 
 from .model import Qwen3RMSNorm
+from .sequence_parallel import (
+    gather_sequence,
+    scatter_sequence,
+    SequenceLinear,
+    SequenceScale,
+)
 
 
 def local_parameter(parameter):
@@ -124,7 +130,7 @@ class _HeadScale(torch.autograd.Function):
 
 
 class DraftLinear(nn.Linear):
-    def __init__(self, source, *, group, kind):
+    def __init__(self, source, *, group, kind, sequence_parallel=False):
         super().__init__(
             source.in_features,
             source.out_features,
@@ -136,14 +142,28 @@ class DraftLinear(nn.Linear):
         self.bias = source.bias
         self.group = group
         self.kind = kind
+        self.sequence_parallel = sequence_parallel
 
     def forward(self, input_XD):
         weight_ED = local_parameter(self.weight)
         bias_E = local_parameter(self.bias) if self.bias is not None else None
+        if self.sequence_parallel and self.kind == "column":
+            input_XD = gather_sequence(input_XD, self.group)
         if self.kind == "column":
             return _ColumnLinear.apply(input_XD, weight_ED, bias_E, self.group)
+        if self.kind == "vocab":
+            from .vocabulary_parallel import VocabLinear
+
+            return VocabLinear.apply(input_XD, weight_ED, bias_E, self.group)
         if self.kind == "row":
-            return _RowLinear.apply(input_XD, weight_ED, self.group)
+            result = _RowLinear.apply(input_XD, weight_ED, self.group)
+            return (
+                scatter_sequence(result, self.group)
+                if self.sequence_parallel
+                else result
+            )
+        if self.sequence_parallel:
+            return SequenceLinear.apply(input_XD, weight_ED, bias_E, self.group)
         return F.linear(input_XD, weight_ED, bias_E)
 
 
@@ -163,12 +183,13 @@ class DraftEmbedding(nn.Embedding):
 
 
 class DraftNorm(Qwen3RMSNorm):
-    def __init__(self, source, *, group, partial):
+    def __init__(self, source, *, group, partial, sequence_parallel=False):
         nn.Module.__init__(self)
         self.weight = source.weight
         self.variance_epsilon = source.variance_epsilon
         self.group = group
         self.partial = partial
+        self.sequence_parallel = sequence_parallel
 
     def forward(self, input_XD):
         input_dtype = input_XD.dtype
@@ -178,10 +199,12 @@ class DraftNorm(Qwen3RMSNorm):
         weight_D = local_parameter(self.weight)
         if self.partial:
             return _HeadScale.apply(hidden_XD.to(input_dtype), weight_D, self.group)
+        if self.sequence_parallel:
+            return SequenceScale.apply(hidden_XD.to(input_dtype), weight_D, self.group)
         return weight_D * hidden_XD.to(input_dtype)
 
 
-def apply_tensor_parallel(model, parallel_dims):
+def apply_dense_parallelism(model, parallel_dims, *, sequence_parallel=False):
     size = parallel_dims.tp
     config = model.config
     if any(
@@ -196,7 +219,12 @@ def apply_tensor_parallel(model, parallel_dims):
         raise ValueError(
             "TP must divide query heads, KV heads, hidden and feed-forward widths"
         )
-    group = parallel_dims.get_mesh("tp").get_group()
+    group = parallel_dims.get_mesh("tp").get_group() if size > 1 else None
+    vocab_parallel = bool(getattr(config, "vocab_parallel", False))
+    if vocab_parallel and (size == 1 or config.vocab_size % size):
+        raise ValueError(
+            "Vocabulary parallelism requires TP > 1 dividing the vocabulary"
+        )
     layouts = {}
     for name, module in list(model.named_modules()):
         if not name:
@@ -205,7 +233,9 @@ def apply_tensor_parallel(model, parallel_dims):
         parent = model.get_submodule(parent_name)
         if isinstance(module, nn.Linear):
             kind = "replicated"
-            if name.startswith("layers."):
+            if vocab_parallel and name in ("lm_head", "markov_head.markov_w2"):
+                kind = "vocab"
+            if size > 1 and name.startswith("layers."):
                 if attribute in ("q_proj", "k_proj", "v_proj", "gate_proj", "up_proj"):
                     kind = "column"
                 elif attribute in ("o_proj", "down_proj"):
@@ -214,10 +244,20 @@ def apply_tensor_parallel(model, parallel_dims):
                 raise ValueError(
                     "The draft TP row projection requires bias-free weights"
                 )
-            setattr(parent, attribute, DraftLinear(module, group=group, kind=kind))
+            setattr(
+                parent,
+                attribute,
+                DraftLinear(
+                    module,
+                    group=group,
+                    kind=kind,
+                    sequence_parallel=sequence_parallel
+                    and (name.startswith("layers.") or name == "fc"),
+                ),
+            )
             placement = (
                 spmd.S(0)
-                if kind == "column"
+                if kind in ("column", "vocab")
                 else spmd.S(1)
                 if kind == "row"
                 else spmd.I
@@ -225,7 +265,7 @@ def apply_tensor_parallel(model, parallel_dims):
             layouts[f"{name}.weight"] = dense_param_placement(tp=placement)
             if module.bias is not None:
                 layouts[f"{name}.bias"] = dense_param_placement(
-                    tp=spmd.S(0) if kind == "column" else spmd.I
+                    tp=spmd.S(0) if kind in ("column", "vocab") else spmd.I
                 )
         elif isinstance(module, nn.Embedding):
             setattr(parent, attribute, DraftEmbedding(module))
@@ -235,13 +275,19 @@ def apply_tensor_parallel(model, parallel_dims):
                 parent,
                 attribute,
                 DraftNorm(
-                    module, group=group, partial=attribute in ("q_norm", "k_norm")
+                    module,
+                    group=group,
+                    partial=size > 1 and attribute in ("q_norm", "k_norm"),
+                    sequence_parallel=sequence_parallel
+                    and attribute not in ("q_norm", "k_norm"),
                 ),
             )
             layouts[f"{name}.weight"] = dense_param_placement(tp=spmd.I)
     parameters = dict(model.named_parameters())
     if parameters.keys() != layouts.keys():
-        raise ValueError("Every draft parameter requires an explicit TP storage layout")
+        raise ValueError(
+            "Every draft parameter requires an explicit dense storage layout"
+        )
     mesh = parallel_dims.spmd_dense_mesh()
     shards = {
         name: spmd_distribute_tensor(parameter.detach(), mesh, layouts[name])
@@ -259,6 +305,9 @@ def apply_tensor_parallel(model, parallel_dims):
             nn.Parameter(storage[name], requires_grad=parameter.requires_grad),
         )
     for layer in model.layers:
+        if layer is None:
+            continue
         layer.self_attn.tensor_parallel_size = size
         layer.self_attn.num_attention_heads //= size
         layer.self_attn.num_key_value_heads //= size
+    model.sequence_parallel_group = group if sequence_parallel else None

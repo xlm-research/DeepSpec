@@ -4,7 +4,7 @@
 
 **Blocked by:** 16：支持 DSpark 专用 CP 阶段训练。
 
-**Status:** ready-for-agent
+**Status:** in-progress
 
 验收依据：母规格《DeepSpec 编排下的 TorchTitan DSpark draft 训练与阶段恢复》与 ADR-0001、ADR-0003、ADR-0004。DeepSpec 编排两端；TorchTitan 拥有 draft 训练及配置。保留 DSpark 数学、精度与完整 update 语义，只优化 draft，沿用现有环境和源码编译 vLLM。
 

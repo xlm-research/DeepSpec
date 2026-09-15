@@ -79,12 +79,15 @@ def qwen38_debug() -> DSparkTrainer.Config:
 def qwen38_27b() -> DSparkTrainer.Config:
     """Released Qwen teacher geometry with the retained five-layer DSpark recipe."""
     import json
+    import os
     from pathlib import Path
 
     from .checkpoint import PhaseCheckpointer
     from .preparation import PreparationConfig
 
-    assets = "/mnt/afs-agentpro/share/models/Qwen/Qwen3.8-27B"
+    assets = os.environ.get(
+        "TARGET_MODEL_PATH", "/mnt/afs-agentpro/share/models/Qwen/Qwen3.8-27B"
+    )
     text = json.loads((Path(assets) / "config.json").read_text())["text_config"]
     expected = {
         "hidden_size": 5120,
@@ -159,4 +162,78 @@ def qwen38_27b_tp4() -> DSparkTrainer.Config:
     config.parallelism.tensor_parallel_degree = 4
     config.parallelism.enable_sequence_parallel = False
     config.activation_checkpoint = SelectiveAC.Config()
+    return config
+
+
+def qwen38_27b_replicate8() -> DSparkTrainer.Config:
+    """Eight data replicas with the full draft stored on each GPU."""
+    config = qwen38_27b_tp4()
+    config.parallelism.data_parallel_replicate_degree = 8
+    config.parallelism.data_parallel_shard_degree = 1
+    config.parallelism.tensor_parallel_degree = 1
+    return config
+
+
+def qwen38_27b_shard8() -> DSparkTrainer.Config:
+    """Eight-way FSDP2 with tensor parallelism disabled."""
+    config = qwen38_27b_tp4()
+    config.parallelism.data_parallel_shard_degree = 8
+    config.parallelism.tensor_parallel_degree = 1
+    return config
+
+
+def qwen38_27b_hsdp() -> DSparkTrainer.Config:
+    """Two replicas of four-way FSDP2 on eight GPUs."""
+    config = qwen38_27b_shard8()
+    config.parallelism.data_parallel_replicate_degree = 2
+    config.parallelism.data_parallel_shard_degree = 4
+    return config
+
+
+def qwen38_27b_sp() -> DSparkTrainer.Config:
+    config = qwen38_27b_tp4()
+    config.parallelism.enable_sequence_parallel = True
+    return config
+
+
+def qwen38_27b_vocab_parallel() -> DSparkTrainer.Config:
+    config = qwen38_27b_tp4()
+    config.loss.enable_vocab_parallel = True
+    return config
+
+
+def qwen38_27b_sp_vocab_parallel() -> DSparkTrainer.Config:
+    config = qwen38_27b_sp()
+    config.loss.enable_vocab_parallel = True
+    return config
+
+
+def qwen38_27b_cp() -> DSparkTrainer.Config:
+    config = qwen38_27b_shard8()
+    config.parallelism.data_parallel_shard_degree = 4
+    config.parallelism.context_parallel_degree = 2
+    return config
+
+
+def qwen38_27b_tp_cp() -> DSparkTrainer.Config:
+    config = qwen38_27b_tp4()
+    config.parallelism.data_parallel_shard_degree = 1
+    config.parallelism.context_parallel_degree = 2
+    return config
+
+
+def qwen38_27b_pp() -> DSparkTrainer.Config:
+    config = qwen38_27b_shard8()
+    config.parallelism.data_parallel_shard_degree = 4
+    config.parallelism.pipeline_parallel_degree = 2
+    config.parallelism.pipeline_parallel_schedule = "1F1B"
+    config.parallelism.num_pp_microbatches = 2
+    return config
+
+
+def qwen38_27b_tp_cp_pp() -> DSparkTrainer.Config:
+    config = qwen38_27b_pp()
+    config.parallelism.data_parallel_shard_degree = 1
+    config.parallelism.tensor_parallel_degree = 2
+    config.parallelism.context_parallel_degree = 2
     return config

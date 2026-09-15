@@ -8,6 +8,7 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 import torch.distributed as dist
+from torch.distributed.tensor import DTensor
 from torch.distributed.checkpoint.state_dict import (
     set_model_state_dict,
     StateDictOptions,
@@ -79,24 +80,33 @@ class DSparkTrainer(Trainer):
         ).hexdigest()
         loss_mesh = self.parallel_dims.get_optional_mesh("loss")
         self.loss_fn.group = loss_mesh.get_group() if loss_mesh is not None else None
-        self.loss_fn.gas = self.gradient_accumulation_steps
-        if len(self.dataloader.entries) % self.gradient_accumulation_steps:
+        if config.loss.enable_vocab_parallel:
+            self.loss_fn.vocab_group = self.parallel_dims.get_mesh("tp").get_group()
+        self.logical_microbatches_per_update = (
+            self.gradient_accumulation_steps * self.num_pp_microbatches
+        )
+        self.loss_fn.gas = self.logical_microbatches_per_update
+        if len(self.dataloader.entries) % self.logical_microbatches_per_update:
             raise ValueError("Feature partition ends inside an optimizer update")
         start = self.dataloader.global_microbatch_start
-        if start < 0 or start % self.gradient_accumulation_steps:
+        if start < 0 or start % self.logical_microbatches_per_update:
             raise ValueError("Feature partition must start on an update boundary")
-        required = self.phase_stop_update * self.gradient_accumulation_steps - start
+        required = self.phase_stop_update * self.logical_microbatches_per_update - start
         if not 0 < required <= len(self.dataloader.entries):
             raise ValueError("Feature partition is shorter than the requested training")
         if config.initial_weights and not config.checkpoint.initial_load_path:
             weights = torch.load(
                 config.initial_weights, map_location="cpu", weights_only=True
             )
-            set_model_state_dict(
-                self.model_parts[0],
-                weights,
-                options=StateDictOptions(full_state_dict=True, strict=True),
-            )
+            for part in self.model_parts:
+                owned = set(part.state_dict())
+                set_model_state_dict(
+                    part,
+                    {name: value for name, value in weights.items() if name in owned}
+                    if self.parallel_dims.pp_enabled
+                    else weights,
+                    options=StateDictOptions(full_state_dict=True, strict=True),
+                )
             # The native Trainer builds optimizers before loading initialization.
             # Master state must follow the loaded model, not random initialization.
             for optimizer in self.optimizers:
@@ -116,6 +126,8 @@ class DSparkTrainer(Trainer):
                 ("embed_tokens.weight", "model.language_model.embed_tokens.weight"),
                 ("lm_head.weight", "lm_head.weight"),
             ):
+                if destination not in self.model_parts[0].state_dict():
+                    continue
                 with safe_open(
                     root / index["weight_map"][source], framework="pt"
                 ) as file:
@@ -126,7 +138,29 @@ class DSparkTrainer(Trainer):
                     options=StateDictOptions(full_state_dict=True, strict=False),
                 )
                 del tensor
+        self._initialize_parameter_collectives()
         self.phase_timing.record("initialize", self.phase_timing.started)
+
+    def _initialize_parameter_collectives(self):
+        # DTensor gradient norms can initialize NCCL connections on their first
+        # reduction. Do this before activations fill the CUDA caching allocator,
+        # including after a process restart with a full optimizer checkpoint.
+        groups = {}
+        for part in self.model_parts:
+            for parameter in part.parameters():
+                if not parameter.requires_grad or not isinstance(parameter, DTensor):
+                    continue
+                mesh = parameter.device_mesh
+                for axis in range(mesh.ndim):
+                    if mesh.size(axis) > 1:
+                        group = mesh.get_group(axis)
+                        groups[id(group)] = group
+        if groups:
+            # A separate zero scalar leaves parameters, gradients and RNG intact.
+            probe = torch.zeros((), device=self.device)
+            for group in groups.values():
+                dist.all_reduce(probe, group=group)
+            torch.cuda.synchronize(self.device)
 
     def should_continue_training(self):
         return self.step < self.phase_stop_update
@@ -168,7 +202,7 @@ class DSparkTrainer(Trainer):
             raise ValueError("Full checkpoint did not restore this rank's state")
         if (
             self.dataloader.next_global_microbatch
-            != self.step * self.gradient_accumulation_steps
+            != self.step * self.logical_microbatches_per_update
         ):
             raise ValueError("Checkpoint data progress differs from completed updates")
         with torch.no_grad():
@@ -189,7 +223,7 @@ class DSparkTrainer(Trainer):
     def _train_dspark_step(self, data_iterator):
         if (
             self.dataloader.next_global_microbatch
-            != (self.step - 1) * self.gradient_accumulation_steps
+            != (self.step - 1) * self.logical_microbatches_per_update
         ):
             raise ValueError("Feature position requires a matching full checkpoint")
         self._accumulation_index = 0

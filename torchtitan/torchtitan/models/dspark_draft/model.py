@@ -476,16 +476,14 @@ class Qwen3DSparkAttention(nn.Module):
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-        bsz, q_len = hidden_states.shape[:-1]
-        ctx_len = target_hidden_states.shape[1]
-        q = self.q_proj(hidden_states).view(
-            bsz, q_len, self.num_attention_heads, self.head_dim
-        )
+        query = self.q_proj(hidden_states)
+        context_key = self.k_proj(target_hidden_states)
+        bsz, q_len = query.shape[:-1]
+        ctx_len = context_key.shape[1]
+        q = query.view(bsz, q_len, self.num_attention_heads, self.head_dim)
         q = self.q_norm(q).transpose(1, 2)
         k_ctx = self.k_norm(
-            self.k_proj(target_hidden_states).view(
-                bsz, ctx_len, self.num_key_value_heads, self.head_dim
-            )
+            context_key.view(bsz, ctx_len, self.num_key_value_heads, self.head_dim)
         ).transpose(1, 2)
         v_ctx = (
             self.v_proj(target_hidden_states)
@@ -691,6 +689,7 @@ class Qwen3DSparkModel(Qwen3PreTrainedModel):
         self.context_parallel_group = None
         self.model_parallel_group = None
         self.model_parallel_src_rank = 0
+        self.sequence_parallel_group = None
 
         self.embed_tokens = nn.Embedding(
             config.vocab_size,
@@ -902,10 +901,24 @@ class Qwen3DSparkModel(Qwen3PreTrainedModel):
         target_hidden_states: Optional[torch.Tensor] = None,
         past_key_values: Optional[Cache] = None,
         use_cache: bool = False,
+        projected_context: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
         hidden_states = noise_embedding
-        target_hidden_states = self.hidden_norm(self.fc(target_hidden_states))
+        if self.sequence_parallel_group is not None and projected_context is None:
+            from .sequence_parallel import scatter_sequence
+
+            hidden_states = scatter_sequence(
+                hidden_states, self.sequence_parallel_group
+            )
+            target_hidden_states = scatter_sequence(
+                target_hidden_states, self.sequence_parallel_group
+            )
+        target_hidden_states = (
+            self.hidden_norm(self.fc(target_hidden_states))
+            if projected_context is None
+            else projected_context
+        )
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
         context_position_embeddings = None
         if context_position_ids is not None:
@@ -914,6 +927,8 @@ class Qwen3DSparkModel(Qwen3PreTrainedModel):
                 context_position_ids,
             )
         for layer in self.layers:
+            if layer is None:
+                continue
             hidden_states = layer(
                 hidden_states=hidden_states,
                 target_hidden_states=target_hidden_states,
@@ -930,7 +945,14 @@ class Qwen3DSparkModel(Qwen3PreTrainedModel):
                 ),
                 **kwargs,
             )
-        return self.norm(hidden_states)
+        if getattr(self, "pipeline_stage", None) == 0:
+            return hidden_states, target_hidden_states
+        hidden_states = self.norm(hidden_states)
+        if self.sequence_parallel_group is not None:
+            from .sequence_parallel import gather_sequence
+
+            hidden_states = gather_sequence(hidden_states, self.sequence_parallel_group)
+        return hidden_states
 
     def forward(
         self,
@@ -940,6 +962,7 @@ class Qwen3DSparkModel(Qwen3PreTrainedModel):
         target_last_hidden_states: Optional[torch.Tensor] = None,
         context_chunk_len: Optional[torch.Tensor] = None,
         seq_len: Optional[torch.Tensor] = None,
+        pipeline_inputs=None,
     ) -> DSparkForwardOutput:
         bsz, padded_input_len = input_ids.shape
         device = input_ids.device
@@ -974,7 +997,9 @@ class Qwen3DSparkModel(Qwen3PreTrainedModel):
             sequence_length = padded_input_len
             local_context_len = target_hidden_states.shape[1]
 
-        if (
+        if pipeline_inputs is not None:
+            _, _, anchor_positions, block_keep_mask = pipeline_inputs
+        elif (
             self.context_parallel_size == 1
             or dist.get_rank() == self.model_parallel_src_rank
         ):
@@ -991,7 +1016,7 @@ class Qwen3DSparkModel(Qwen3PreTrainedModel):
             block_keep_mask = torch.empty(
                 (bsz, self.num_anchors), dtype=torch.bool, device=device
             )
-        if self.context_parallel_size > 1:
+        if self.context_parallel_size > 1 and pipeline_inputs is None:
             dist.broadcast(
                 anchor_positions,
                 src=self.model_parallel_src_rank,
@@ -1007,13 +1032,21 @@ class Qwen3DSparkModel(Qwen3PreTrainedModel):
             anchor_end = anchor_start + anchors_per_rank
             anchor_positions = anchor_positions[:, anchor_start:anchor_end]
             block_keep_mask = block_keep_mask[:, anchor_start:anchor_end]
-        noise_embedding = create_noise_embed(
-            self.embed_tokens,
-            input_ids,
-            anchor_positions,
-            block_keep_mask,
-            mask_token_id=self.mask_token_id,
-            block_size=self.verification_block_size,
+        if self.context_parallel_size > 1:
+            anchors_per_rank = self.num_anchors // self.context_parallel_size
+            anchor_start = self.context_parallel_rank * anchors_per_rank
+            anchor_end = anchor_start + anchors_per_rank
+        noise_embedding = (
+            pipeline_inputs[0]
+            if pipeline_inputs is not None
+            else create_noise_embed(
+                self.embed_tokens,
+                input_ids,
+                anchor_positions,
+                block_keep_mask,
+                mask_token_id=self.mask_token_id,
+                block_size=self.verification_block_size,
+            )
         )
         draft_position_ids = create_position_ids(
             anchor_positions,
@@ -1075,7 +1108,19 @@ class Qwen3DSparkModel(Qwen3PreTrainedModel):
             noise_embedding=noise_embedding,
             target_hidden_states=target_hidden_states,
             attention_mask=dspark_attn_mask,
+            projected_context=pipeline_inputs[1]
+            if pipeline_inputs is not None
+            else None,
         )
+
+        if getattr(self, "pipeline_stage", None) == 0:
+            hidden, context = output_hidden
+            # Canonical strides also cover singleton CP anchor slices. Static
+            # pipeline metadata validates strides as well as sizes and dtypes.
+            return tuple(
+                value.reshape(-1).view(value.shape)
+                for value in (hidden, context, anchor_positions, block_keep_mask)
+            )
 
         num_blocks = anchor_positions.size(1)
         verification_hidden_4d = output_hidden.reshape(

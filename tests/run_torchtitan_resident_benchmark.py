@@ -15,6 +15,10 @@ def run(source, output):
     original = json.loads((source / "run.json").read_text())
     summary = json.loads((source / "complete.json").read_text())
     plan_path = source / "inputs/input-plan.json"
+    plan = json.loads(plan_path.read_text())
+    initialization = Path(plan["resolved_recipe"]["capture_initialization"])
+    if not (initialization / "initial-weights.pt").is_file():
+        raise ValueError("The original workload must capture its initialization")
     if summary["completed_updates"] != 10 or summary["plan_identity"] != digest(
         plan_path
     ):
@@ -24,7 +28,7 @@ def run(source, output):
     )
     request = {
         "plan_path": str(plan_path),
-        "initialization": str(source.parent / "scale-initialization"),
+        "initialization": str(initialization),
         "output_dir": str(output),
         "partitions": [
             {

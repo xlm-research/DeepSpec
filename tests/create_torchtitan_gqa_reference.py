@@ -23,6 +23,7 @@ from tests.test_dspark_training_baseline import (
 
 def main():
     workers = int(os.environ.get("DEEPSPEC_GQA_REFERENCE_WORKERS", "2"))
+    layers = int(os.environ.get("DEEPSPEC_GQA_REFERENCE_LAYERS", "2"))
     runtime = require_torchrun(unittest.TestCase(), world_size=workers)
     root = Path(os.environ["DEEPSPEC_GQA_REFERENCE_OUTPUT"]).resolve()
     if runtime.global_rank == 0:
@@ -38,12 +39,12 @@ def main():
             vocab_size=128,
             hidden_size=64,
             intermediate_size=128,
-            num_hidden_layers=2,
+            num_hidden_layers=layers,
             num_attention_heads=24,
             num_key_value_heads=4,
             head_dim=16,
             max_position_embeddings=128,
-            layer_types=["full_attention"] * 2,
+            layer_types=["full_attention"] * layers,
         )
         trainer = FixedFeatureTrainer(runtime, topology, dtype, model_config=config)
         torch.manual_seed(1000 + runtime.global_rank)
@@ -76,6 +77,7 @@ def main():
                     "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
                     "query_heads": 24,
                     "kv_heads": 4,
+                    "draft_layers": layers,
                     "dtype": str(dtype),
                     "updates": 2,
                     "gas": 2,

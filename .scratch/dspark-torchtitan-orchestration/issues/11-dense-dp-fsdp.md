@@ -4,7 +4,7 @@
 
 **Blocked by:** 10：完成八卡真实 Qwen 128K 首验。
 
-**Status:** ready-for-agent
+**Status:** in-progress
 
 验收依据：母规格《DeepSpec 编排下的 TorchTitan DSpark draft 训练与阶段恢复》与 ADR-0001、ADR-0003、ADR-0004。DeepSpec 编排两端；TorchTitan 拥有 draft 训练及配置。保留 DSpark 数学、精度与完整 update 语义，只优化 draft，沿用现有环境和源码编译 vLLM。
 
@@ -17,4 +17,3 @@
 - [ ] 记录实际八卡配置、运行与数值证据、分项性能和限制；本票不自动宣称两行均支持 128K。
 
 覆盖母规格 User Stories：31、40。
-

@@ -16,6 +16,11 @@ def run(source, output, partition_updates):
     request = json.loads((source / "run.json").read_text())
     plan_path = source / "inputs/input-plan.json"
     plan = json.loads(plan_path.read_text())
+    initialization = Path(plan["resolved_recipe"]["capture_initialization"])
+    if not (initialization / "initial-weights.pt").is_file():
+        raise ValueError(
+            "The real validation run must first capture its initialization"
+        )
     if sum(partition_updates) != plan["training_steps"] or any(
         count < 1 for count in partition_updates
     ):
@@ -51,11 +56,6 @@ def run(source, output, partition_updates):
         raise ValueError("The source features do not cover the exact whole-run plan")
     producer_path = output / "producer.json"
     atomic_json(producer_path, {**producer, "samples": samples, "sources": sources})
-    initialization = source.parent / "scale-initialization"
-    if not (initialization / "initial-weights.pt").is_file():
-        raise ValueError(
-            "The real validation run must first capture its initialization"
-        )
     os.environ["DEEPSPEC_SCALE_CAPTURE"] = ""
     os.environ["DEEPSPEC_SCALE_REFERENCE"] = str(initialization)
     os.environ["DEEPSPEC_SCALE_OUTPUT"] = str(output)
@@ -89,6 +89,9 @@ def run(source, output, partition_updates):
                 key: request[key]
                 for key in ("draft_python", "draft_source", "workers", "recipe_args")
             },
+            # Preserve the native metrics peaks before each update resets them.
+            # Metrics settings are outside the training-state identity.
+            "recipe_args": [*request["recipe_args"], "--metrics.save-for-all-ranks"],
             "devices": request["draft_devices"],
             "result_path": str(root / "draft-result.json"),
             "phase": {

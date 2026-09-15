@@ -29,6 +29,15 @@ class DSparkDraftModel(Qwen3DSparkModel):
             return DSparkDraftModel(config).to(dtype=torch.get_default_dtype())
 
         def update_from_config(self, *, config, **kwargs):
+            if config.loss.enable_vocab_parallel:
+                self.hf_config["vocab_parallel"] = True
+            else:
+                self.hf_config.pop("vocab_parallel", None)
+            if (
+                config.loss.enable_vocab_parallel
+                and config.parallelism.tensor_parallel_degree <= 1
+            ):
+                raise ValueError("Vocabulary parallel loss requires tensor parallelism")
             if (
                 config.training.max_context_length
                 > self.hf_config["max_position_embeddings"]
@@ -63,7 +72,58 @@ class DSparkDraftModel(Qwen3DSparkModel):
         inputs = dict(input_dict)
         labels = inputs.pop("labels")
         tokens = inputs.pop("input_ids")
+        if parallel_dims.cp_enabled:
+            from .features import context_positions
+
+            length = tokens.shape[1]
+            positions = context_positions(
+                length, parallel_dims.cp, parallel_dims.get_mesh("cp").get_local_rank()
+            ).to(tokens.device)
+            for key in ("target_hidden_states", "target_last_hidden_states"):
+                if key not in inputs or inputs[key] is None:
+                    continue
+                features = inputs[key]
+                if features.shape[1] != length:
+                    raise ValueError(
+                        "CP preprocessing requires reconstructed full producer features"
+                    )
+                inputs[key] = (
+                    features[:, positions.clamp_max(length - 1)]
+                    * (positions < length)[None, :, None]
+                )
+            inputs["context_chunk_len"] = tokens.new_tensor([positions.numel()])
+            inputs["seq_len"] = tokens.new_tensor([length])
+            # Labels are unused by DSparkLoss; the native Trainer uses their
+            # size to count consumed tokens. Count each original token once.
+            labels = labels[:, positions[positions < length]]
+        if parallel_dims.pp_enabled:
+            if tokens.shape[1] != self.config.pipeline_sequence_length:
+                raise ValueError(
+                    "DSpark 1F1B requires fixed-length, padded feature batches"
+                )
+            if self.pipeline_stage == 1:
+                inputs["input_ids"] = tokens
         return tokens, labels, inputs
+
+    def forward(self, *args, **kwargs):
+        if getattr(self, "pipeline_stage", None) != 1:
+            return super().forward(*args, **kwargs)
+        output = super().forward(
+            kwargs.pop("input_ids"), **kwargs, pipeline_inputs=args
+        )
+        # PipelineStage sends and tracks tensor tuples. Supervision tensors are
+        # returned alongside predictions so the loss retains its DSpark contract.
+        empty = output.draft_logits.new_empty(0)
+        return (
+            output.draft_logits,
+            output.target_ids,
+            output.eval_mask,
+            output.block_keep_mask,
+            output.confidence_pred if output.confidence_pred is not None else empty,
+            output.aligned_target_logits
+            if output.aligned_target_logits is not None
+            else empty,
+        )
 
 
 class DSparkStateDictAdapter(StateDictAdapter):
@@ -86,6 +146,7 @@ def build_draft_config(hf_config):
 
 def model_spec(hf_config):
     from .parallelize import parallelize_draft
+    from .pipeline import pipeline_draft
 
     return ModelSpec(
         name="dspark_draft",
@@ -93,7 +154,7 @@ def model_spec(hf_config):
         model=build_draft_config(hf_config),
         max_context_length=hf_config["max_position_embeddings"],
         parallelize_fn=parallelize_draft,
-        pipelining_fn=None,
+        pipelining_fn=pipeline_draft,
         post_optimizer_build_fn=None,
         state_dict_adapter=DSparkStateDictAdapter,
     )

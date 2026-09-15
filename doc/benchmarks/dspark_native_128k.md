@@ -1,11 +1,41 @@
 # Native Qwen 128K phase acceptance
 
-Ticket 10 is in progress. Input preparation and the combined short-sequence
-SelectiveAC/TP4/FSDP2 numerical and restart tests are complete. The full 128K
-run completed its first target partition, then encountered external GPU contention
-before draft launch. Native 128K training and the performance comparisons have not
-yet passed. Short numerical tests
-use the real DSpark classes and cannot establish full-scale support.
+Current-machine progress is recorded in
+[Qwen 128K acceptance on H800](dspark_native_128k_h800.md). The sections below
+retain the workload contract and September 14 B300 prerequisite evidence.
+
+Ticket 10 passed on H800 on 2026-09-15. The run completed real 128K training in two
+five-update phases and an uninterrupted ten-update replay. Their final DCP states,
+supervision and RNG records compare exactly; both runs released all workers.
+See the [H800 comparison report](dspark_native_128k_h800_comparison.md) for measured
+phase costs and evidence. The [resident comparison](dspark_native_128k_h800_resident.md)
+and export/retention/failure checks below complete the acceptance. Historical B300
+prerequisites remain separate from the H800 full-scale results.
+
+## H800 closing evidence
+
+All artifacts below are under `outputs/dspark_torchtitan_orchestration_20260914`.
+The following tests finished without skips:
+
+- `h800-retention-float32.log` and `h800-retention-bfloat16.log`: real two-GPU
+  training, exports in the requested precision, rolling retention plus a retained
+  milestone, and exact trajectory comparison after restoring either recovery
+  point. Durations were 83.091 and 86.431 seconds. These use short numerical
+  fixtures; full-size training and restart evidence comes from the 128K runs.
+- `h800-retention-failure-green.log`: a real fourth checkpoint payload is written,
+  then its commit rename fails. All three existing committed recovery points
+  remain unchanged, no phase success is published, and workers release the GPUs
+  (17.497 seconds).
+- `h800-full-hf-export.log`: the full-size native checkpoint exports on CPU and
+  the existing Qwen consumer reloads all 64 parameters with the requested
+  precision; source state is unchanged and CUDA stays uninitialized (328.275
+  seconds). The resulting artifact is `h800-full-hf-export/hf/`.
+
+The resident reference completed the same ten-update, 128K workload. Its complete
+cost was 1517.764 seconds, versus 3561.700 seconds for native two-phase execution;
+this is a baseline, not a speedup. The report explicitly records physical GPU
+count and allocator differences. Each configuration has one successful timing
+run, so these measurements do not establish repeat-run variability.
 
 ## Fixed workload
 
@@ -50,6 +80,13 @@ initialization, restore, training including feature I/O, save and close separate
 Concurrent rank times are never added. Compiler records describe nested work
 inside training, including actual local-cache hits/misses and compiler thread
 count; these durations are not added again to phase totals.
+
+Native metrics reset CUDA peak counters after logging each update. Therefore,
+the phase-end timing counters do not represent whole-phase memory peaks. The
+summary separately reads per-update TensorBoard active/reserved peaks, verifies
+the worker PID and complete update coverage, and states the recorded ranks.
+Fixed-feature replays enable native all-rank metric recording. This metrics-only
+configuration difference from the initial run must remain visible in reports.
 
 The complete draft cost additionally includes orchestration-side feature
 validation and consumption-manifest preparation, plus the post-exit GPU release

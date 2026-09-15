@@ -149,8 +149,12 @@ class NativePhaseTrainingTest(unittest.TestCase):
                             (root / f"{name}.log").read_text()[-12000:],
                         )
                     assert_observed_phase(root, fixtures, workers, tp=tp)
+                    phase_result = json.loads((root / "phase-result.json").read_text())
+                    if os.environ.get("DEEPSPEC_PHASE_MEASURE"):
+                        self.assertIn("timing", phase_result)
+                        phase_result.pop("timing")
                     self.assertEqual(
-                        json.loads((root / "phase-result.json").read_text()),
+                        phase_result,
                         {"completed_updates": 2, "consumed_microbatches": 4},
                     )
 

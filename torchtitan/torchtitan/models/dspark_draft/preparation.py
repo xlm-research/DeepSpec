@@ -37,9 +37,9 @@ def prepare_inputs(request):
     topology = ParallelDims.from_config(config.parallelism, int(request["workers"]))
     context = config.training.max_context_length
     micro_tokens = config.training.num_tokens_per_microbatch_per_dp_rank
-    if micro_tokens != context or topology.pp != 1:
+    if micro_tokens != context:
         raise ValueError(
-            "The initial producer integration requires one sample per DP rank and PP1"
+            "Producer integration requires one sample per logical DP microbatch"
         )
     dp_size = topology.dp_shard * topology.dp_replicate
     step_tokens = config.training.num_tokens_per_train_step
@@ -48,6 +48,8 @@ def prepare_inputs(request):
     if step_tokens % (micro_tokens * dp_size):
         raise ValueError("Training tokens do not define complete optimizer updates")
     gas = step_tokens // (micro_tokens * dp_size)
+    if topology.pp > 1 and gas % config.parallelism.num_pp_microbatches:
+        raise ValueError("Logical GAS must contain complete pipeline schedules")
     global_batch = dp_size * gas
     output = Path(request["output_dir"]).resolve()
     output.mkdir(parents=True, exist_ok=False)
@@ -94,6 +96,10 @@ def prepare_inputs(request):
                     key: torch.cat([piece[key] for piece in pieces]).unsqueeze(0)
                     for key in ("input_ids", "loss_mask")
                 }
+                if topology.pp > 1 and batch["input_ids"].shape[1] != context:
+                    raise ValueError(
+                        "The DSpark PP recipe requires fixed-length packed inputs"
+                    )
                 if batch["loss_mask"].count_nonzero() < preparation.min_loss_tokens:
                     raise ValueError(
                         f"Scheduled sample {sample_index} has insufficient supervision after truncation"

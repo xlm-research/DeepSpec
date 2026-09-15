@@ -11,7 +11,10 @@ from safetensors.torch import load_file
 import torch
 
 from deepspec.modeling.dspark.qwen3_8 import Qwen3_8DSparkModel
+from torchtitan.models.dspark_draft import DSparkDraftModel
+from torchtitan.models.dspark_draft.checkpoint import read_commit
 from torchtitan.models.dspark_draft.export import export_checkpoint
+from tests.compare_torchtitan_checkpoints import load_checkpoint
 
 
 def assert_hf_weights(test, output, expected, dtype):
@@ -31,13 +34,31 @@ def assert_hf_weights(test, output, expected, dtype):
 
 class NativeHFExportTest(unittest.TestCase):
     def test_cpu_export_preserves_weights_and_requested_precision(self):
-        reference = Path(os.environ["DEEPSPEC_PHASE_CHECKPOINT_REFERENCE"])
-        phase = json.loads((reference / "phase-result.json").read_text())
-        checkpoint = Path(phase["commit"]["checkpoint"])
-        dtype_name = phase["commit"]["resolved_recipe"]["checkpoint"]["export_dtype"]
-        expected = torch.load(reference / "native-rank0.pt", weights_only=True)[
-            "updates"
-        ][-1]["parameters"]
+        if checkpoint_path := os.environ.get("DEEPSPEC_HF_EXPORT_CHECKPOINT"):
+            checkpoint = Path(checkpoint_path).resolve()
+            commit = read_commit(str(checkpoint))
+            # Full-scale phases record small supervision observations, not a
+            # second copy of every model update. Reconstruct the committed
+            # model tensors directly, independently of the HF export loader.
+            with torch.device("meta"):
+                model = DSparkDraftModel.Config(
+                    hf_config=commit["resolved_recipe"]["model_spec"]["model"][
+                        "hf_config"
+                    ]
+                ).build()
+            keys = set(model.state_dict())
+            del model
+            expected = load_checkpoint(checkpoint, keys=keys)
+            self.assertEqual(expected.keys(), keys)
+        else:
+            reference = Path(os.environ["DEEPSPEC_PHASE_CHECKPOINT_REFERENCE"])
+            phase = json.loads((reference / "phase-result.json").read_text())
+            commit = phase["commit"]
+            checkpoint = Path(commit["checkpoint"])
+            expected = torch.load(reference / "native-rank0.pt", weights_only=True)[
+                "updates"
+            ][-1]["parameters"]
+        dtype_name = commit["resolved_recipe"]["checkpoint"]["export_dtype"]
         before = {
             path.name: hashlib.sha256(path.read_bytes()).hexdigest()
             for path in checkpoint.iterdir()
