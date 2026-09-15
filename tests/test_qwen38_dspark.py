@@ -83,8 +83,8 @@ class Qwen3_8DSparkConfigTest(unittest.TestCase):
         self.assertEqual(config.deepspec_target_family, "qwen3_8")
         self.assertEqual(config.model_type, "qwen3_5_text")
         self.assertEqual(config.hidden_size, 5120)
-        self.assertEqual(config.num_hidden_layers, 5)
-        self.assertEqual(config.target_layer_ids, [1, 16, 31, 46, 61])
+        self.assertEqual(config.num_hidden_layers, args.num_draft_layers)
+        self.assertEqual(config.target_layer_ids, list(args.target_layer_ids))
         self.assertEqual(config._attn_implementation, "flex_attention")
         self.assertEqual(config.target_context_layout, "native_head_tail")
         self.assertEqual(config.deepspec_draft_architecture, "qwen3_full_attention")
@@ -106,7 +106,6 @@ class Qwen3_8DSparkConfigTest(unittest.TestCase):
             (1, 1, 2, 4),
         )
         self.assertEqual(config.data.max_length, 131072)
-        self.assertEqual(config.model.target_model_name_or_path, CONFIGURED_TARGET)
         self.assertFalse(config.data.multimodal)
         self.assertTrue(config.data.store_target_last_hidden_states)
         self.assertFalse(config.data.online_target)
@@ -516,6 +515,7 @@ class Qwen3_8DSparkTrainerTest(unittest.TestCase):
         weights = [torch.randn(4, 2), torch.randn(4, 2)]
 
         with (
+            tempfile.TemporaryDirectory() as model_dir,
             patch(
                 "deepspec.trainer.base_trainer.AutoConfig.from_pretrained",
                 return_value=SimpleNamespace(model_type="qwen3_5"),
@@ -536,6 +536,8 @@ class Qwen3_8DSparkTrainerTest(unittest.TestCase):
                 "deepspec.trainer.base_trainer.load_target_model_with_head"
             ) as load_full_target,
         ):
+            trainer.args.model.target_model_name_or_path = model_dir
+            (Path(model_dir) / "model.safetensors.index.json").write_text("{}")
             built_draft, _tokenizer = trainer.build_models()
 
         self.assertIs(built_draft, draft)

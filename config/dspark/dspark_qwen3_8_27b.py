@@ -14,7 +14,7 @@ model = dict(
     ),
     block_size=5,
     num_draft_layers=3,
-    target_layer_ids=[61,62,63],
+    target_layer_ids=[1,31,61],
     # The tokenizer ends at 248076 while the embedding table has 248320 rows.
     mask_token_id=248077,
     num_anchors=512,

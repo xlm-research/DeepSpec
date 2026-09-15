@@ -10,9 +10,9 @@ the GLM-5.3-Flash trainer retain their existing behavior.
 
 ## Teacher features
 
-`model.target_layer_ids=[1,16,31,46,61]` selects zero-based decoder outputs.
-The vLLM auxiliary slots are `[2,17,32,47,62,64]`. All 64 teacher layers run.
-The five intermediate states are concatenated into `[1,T,25600]`. With
+`model.target_layer_ids=[1,31,61]` selects zero-based decoder outputs.
+The vLLM auxiliary slots are `[2,32,62,64]`. All 64 teacher layers run.
+The three intermediate states are concatenated into `[1,T,15360]`. With
 `extract_final_hidden_state=true`, the extractor replaces the last slot with
 the actual normalized state sent to the LM head, producing `[1,T,5120]` final
 supervision. Qwen's offset RMSNorm, `(1 + weight)`, executes inside the teacher.
@@ -52,7 +52,7 @@ after all extraction workers have exited. Successful partitions are deleted
 after their draft updates; failed partition inputs and worker logs are retained.
 Checkpoint/resume and gradient accumulation use the original Qwen training loop.
 
-At 131072 tokens, six BF16 states of width 5120 occupy about 7.5 GiB per sample
+At 131072 tokens, four BF16 states of width 5120 occupy about 5 GiB per sample
 before storage overhead. The worker handles one sample at a time. Its default
 GPU budget is 0.45 because the draft is still resident; adjust it against actual
 free memory, teacher TP and sequence length.
@@ -60,7 +60,7 @@ free memory, teacher TP and sequence length.
 This entry point enables `separate_hidden_state_pages` in the bundled vLLM
 checkout. The hidden-state cache keeps its own page size; attention and Mamba
 retain their original contiguous storage. Without this option, Qwen TP4's hybrid
-allocator shrinks the six-state hidden page to one token, making 128K extraction
+allocator can shrink the hidden page to one token, making 128K extraction
 require over 1 TiB of cache per GPU. The option is disabled by default, and GLM's
 specialized cache allocation takes precedence. Both this option and
 `extract_final_hidden_state` require the vLLM changes included with this entry.
@@ -73,8 +73,10 @@ Run once on each node with the usual shared rendezvous configuration:
 bash scripts/fsdp/qwen3.8-27b_dspark.sh
 ```
 
-This wrapper reads `envs/deepspec_vllm_torchtitan_envs.tar`, fixes draft CP=1,
-and retains the underlying launcher's default draft TP=4 and teacher TP=4.
+This wrapper locates the repository relative to its own path and reads
+`envs/deepspec_vllm_torchtitan_env.tar`. Set `DEEPSPEC_ENV_TAR` to use another
+archive, or `DEEPSPEC_ENV_DIR` to reuse an existing environment without copying
+the archive. It defaults to draft CP=1, draft TP=4 and teacher TP=4.
 Its default output directory is `output/dspark_qwen3_8_27b_vllm`; set
 `OUTPUT_ROOT` to override it. It uses the unpacked environment directly without
 creating a venv. Each node prepares its own local environment.
@@ -93,7 +95,7 @@ For diagnostics using an already prepared environment, the lower-level
 `VLLM_PYTHON_BIN` directly.
 
 The launcher retains the original Qwen production defaults: 128K context,
-512 partitions per epoch, and the configured full training dataset. It also
+1024 partitions per epoch, and the configured full training dataset. It also
 retains existing controls for topology, learning rate, global batch size,
 checkpoint frequency and resume. `BOUNDED_OFFLINE=false` is rejected by this
 entry point. Set `PRODUCTION_RUN=false` when using diagnostic overrides such
@@ -116,6 +118,55 @@ Additional teacher controls:
 using the exported final state and the original LM head (absolute tolerance 0.1).
 This adds an LM-head copy to the driver's GPU. Per-partition verification results
 are stored as `vllm_rank*_partition*.json` in the checkpoint directory.
+
+## Cache publication and failure handling
+
+The teacher saves each feature file to `.pt.tmp`, flushes and synchronizes the
+file, then renames it to `.pt`. Publication checks that the final file is readable,
+has the saved size, and that the temporary path is gone. Transient filesystem
+failures receive at most three attempts; persistent failures retain the temporary
+file and stop extraction.
+
+After extraction, every rank checks the metadata of every expected cache file
+through a CPU memory mapping. This catches missing files, incomplete archives,
+and invalid tensor shapes without loading all activations into RAM twice. It does
+not perform a full payload CRC scan. All ranks agree on the validation result via
+Gloo before any training batch is yielded. Each subsequent sample load also uses
+that error exchange, so a consumer that loses access after validation causes all
+ranks to fail before entering that sample's model collectives.
+
+Job inputs and worker logs remain available until the partition finishes training.
+They are retained on failure. A recovered feature file alone cannot restore lost
+model/optimizer state; resume requires a matching training checkpoint.
+
+Qwen launchers generate a cache directory containing the model, topology and
+timestamp when `DATA_BATCH_CACHE_DIR` is unset. For a multi-node run, set the same
+`DATA_BATCH_CACHE_TIMESTAMP=YYYYMMDD_HHMMSS` on every node. An explicitly supplied
+`DATA_BATCH_CACHE_DIR` should belong to only one job. Use separate output roots
+for diagnostic and production runs.
+
+### Local debugging environment
+
+The validated local interpreter is `.envs/qwen38-debug/bin/python`. It uses
+Python 3.12.14 and PyTorch 2.13.0+cu130 from the extracted environment at
+`/tmp/deepspec_vllm_torchtitan_envs`, with pytest 8.4.2 installed in the local venv.
+The base environment must remain available. To recreate the venv:
+
+```bash
+/tmp/deepspec_vllm_torchtitan_envs/bin/python -m venv --system-site-packages .envs/qwen38-debug
+.envs/qwen38-debug/bin/python -m pip install pytest==8.4.2
+```
+
+To use it with the current checkout's production wrapper:
+
+```bash
+DEEPSPEC_ENV_DIR="$PWD/.envs/qwen38-debug" \
+  bash scripts/fsdp/qwen3.8-27b_dspark.sh
+```
+
+Model/data paths and distributed topology still come from the normal launcher
+settings. Supply W&B credentials through the calling environment. The vLLM
+launcher enables unbuffered Python output.
 
 ## Validation
 
@@ -176,3 +227,21 @@ same engine's last-token top-20 log probabilities exactly on both prompts and on
 a 131072-token prompt. This verifies extraction against the serving teacher;
 it does not establish equivalent training quality between teacher backends.
 Keep teacher TP and prefill settings fixed when comparing training runs.
+
+### Cache failure regression checks
+
+```bash
+.envs/qwen38-debug/bin/python -m pytest -q \
+  tests/test_qwen38_vllm.py tests/test_qwen38_multinode_launcher.py \
+  tests/test_qwen38_dspark.py
+
+# Two free GPUs: real CUDA backward/NCCL followed by a rank-local read failure.
+.envs/qwen38-debug/bin/python -m torch.distributed.run \
+  --standalone --nproc-per-node=2 --module tests.qwen38_cache_distributed_worker \
+  /tmp/qwen38-cache-failure-check --device cuda
+```
+
+The regression cases include a success record with a missing `.pt` file, an
+unpublished `.pt.tmp`, a corrupt archive, transient and persistent publication
+failures, and a consumer-local read error after a successful first batch. They
+also retain the cross-partition gradient-accumulation check.

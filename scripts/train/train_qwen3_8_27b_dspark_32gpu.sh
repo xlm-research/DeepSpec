@@ -3,9 +3,9 @@ set -euo pipefail
 
 # Production launcher for Qwen3.8-27B DSpark on homogeneous multi-GPU nodes.
 # Run this script once on every node with the same rendezvous address and a
-# shared filesystem. This launcher uses offline target supervision by default:
-# bounded offline target partitions unless BOUNDED_OFFLINE=false is explicitly set
-# to reuse the legacy full offline target-cache workflow.
+# shared filesystem. Bounded offline mode generates, trains, and deletes one
+# transient target-feature partition at a time. Set BOUNDED_OFFLINE=false only
+# to reuse the legacy full-cache workflow.
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ROOT_DIR=${ROOT_DIR:-/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain}
@@ -134,7 +134,6 @@ if ((NNODES > 1)) && [[ "${MASTER_ADDR}" == "localhost" || "${MASTER_ADDR}" == "
     exit 1
 fi
 
-# MAX_LENGTH=${MAX_LENGTH:-131072}
 MAX_LENGTH=${MAX_LENGTH:-131072}
 CONTEXT_PARALLEL_SIZE=${CONTEXT_PARALLEL_SIZE:-${CP:-1}}
 TENSOR_PARALLEL_SIZE=${TENSOR_PARALLEL_SIZE:-${TP:-4}}
@@ -159,13 +158,13 @@ LOCAL_BATCH_SIZE=${LOCAL_BATCH_SIZE:-1}
 GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-512}
 NUM_TRAIN_EPOCHS=${NUM_TRAIN_EPOCHS:-10}
 MAX_TRAIN_STEPS=${MAX_TRAIN_STEPS:-}
-ONLINE_TARGET=${ONLINE_TARGET:-false}
+ONLINE_TARGET=${ONLINE_TARGET:-true}
 DATA_BATCH_SIZE=${DATA_BATCH_SIZE:-800}
 JSONL_INDEX_CACHE_DIR=${JSONL_INDEX_CACHE_DIR:-${OUTPUT_ROOT}/jsonl_index_cache}
 # The online target path runs with LOCAL_BATCH_SIZE=1. Some very long source
 # records are truncated before the assistant span, producing zero loss tokens.
 # Keep those as zero-weight batches instead of letting the collator return None.
-MIN_LOSS_TOKENS=${MIN_LOSS_TOKENS:-14}
+MIN_LOSS_TOKENS=${MIN_LOSS_TOKENS:-0}
 WANDB_ENABLE=${WANDB_ENABLE:-true}
 WANDB_PROJECT=${WANDB_PROJECT:-sensenova-flash-lite-dspark}
 WANDB_NAME=${WANDB_NAME:-$(basename "${OUTPUT_ROOT}")}
@@ -173,7 +172,6 @@ WANDB_GROUP=${WANDB_GROUP:-qwen3_8_27b_v42_128k_32p}
 WANDB_DIR=${WANDB_DIR:-${OUTPUT_ROOT}/wandb}
 WANDB_JOB_TYPE=${WANDB_JOB_TYPE:-train}
 WANDB_RESUME=${WANDB_RESUME:-allow}
-
 if ((NPROC_PER_NODE % CONTEXT_PARALLEL_SIZE != 0)); then
     echo "Visible GPUs per node ${NPROC_PER_NODE} must be divisible by CONTEXT_PARALLEL_SIZE=${CONTEXT_PARALLEL_SIZE}." >&2
     exit 1
@@ -224,17 +222,13 @@ if [[ -n "${MAX_TRAIN_STEPS}" ]] && [[ ! "${MAX_TRAIN_STEPS}" =~ ^[1-9][0-9]*$ ]
     echo "MAX_TRAIN_STEPS must be empty or a positive integer; got ${MAX_TRAIN_STEPS}." >&2
     exit 1
 fi
-for boolean_var in ONLINE_TARGET BOUNDED_OFFLINE SAVE_CHECKPOINTS TORCH_COMPILE TORCHRUN_PER_RANK_LOGS AUTO_PREPARE_CACHE TARGET_CACHE_FSDP DRY_RUN PRODUCTION_RUN; do
+for boolean_var in BOUNDED_OFFLINE SAVE_CHECKPOINTS TORCH_COMPILE TORCHRUN_PER_RANK_LOGS AUTO_PREPARE_CACHE TARGET_CACHE_FSDP DRY_RUN PRODUCTION_RUN; do
     boolean_value=${!boolean_var}
     if [[ "${boolean_value}" != "true" && "${boolean_value}" != "false" ]]; then
         echo "${boolean_var} must be true or false; got ${boolean_value}." >&2
         exit 1
     fi
 done
-if [[ "${ONLINE_TARGET}" != "false" ]]; then
-    echo "This launcher is configured for offline target supervision; set ONLINE_TARGET=false or use an online-target launcher." >&2
-    exit 1
-fi
 if ((CONTEXT_PARALLEL_SIZE > 1)); then
     if ((LOCAL_BATCH_SIZE != 1)); then
         echo "CONTEXT_PARALLEL_SIZE > 1 requires LOCAL_BATCH_SIZE=1." >&2
@@ -252,10 +246,6 @@ if ((CONTEXT_PARALLEL_SIZE > 1)); then
         echo "Full-cache CONTEXT_PARALLEL_SIZE > 1 requires TARGET_CACHE_FSDP=true." >&2
         exit 1
     fi
-fi
-if [[ "${ONLINE_TARGET}" == "true" ]] && ((LOCAL_BATCH_SIZE != 1)); then
-    echo "ONLINE_TARGET=true requires LOCAL_BATCH_SIZE=1." >&2
-    exit 1
 fi
 if [[ "${PRODUCTION_RUN}" == "true" ]]; then
     if [[ "${DRY_RUN}" != "false" ]]; then
@@ -508,7 +498,7 @@ set -x
     --master_port "${MASTER_PORT}" \
     "${TORCHRUN_LOG_ARGS[@]}" \
     train.py \
-    --config config/dspark/dspark_qwen3_8_27b.py \
+    --config "${CONFIG_PATH:-config/dspark/dspark_qwen3_8_27b.py}" \
     --opts "model.target_model_name_or_path=${TARGET_MODEL_PATH}" \
     "${TARGET_DATA_ARGS[@]}" \
     --opts "data.max_length=${MAX_LENGTH}" \

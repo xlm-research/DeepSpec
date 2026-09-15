@@ -138,6 +138,55 @@ def convert_hidden_states(
     }
 
 
+def publish_feature_cache(features, output_path):
+    """Publish only after the final path is readable and the rename is visible."""
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = Path(str(output_path) + ".tmp")
+    with temporary.open("wb") as handle:
+        torch.save(features, handle)
+        handle.flush()
+        os.fsync(handle.fileno())
+        expected_size = os.fstat(handle.fileno()).st_size
+    for attempt in range(3):
+        try:
+            if temporary.exists():
+                os.replace(temporary, output_path)
+            with output_path.open("rb") as handle:
+                if os.fstat(handle.fileno()).st_size != expected_size:
+                    raise OSError("Published cache size differs from the saved file.")
+            if temporary.exists():
+                raise OSError("Temporary cache still exists after publication.")
+            return
+        except OSError as exc:
+            if attempt == 2:
+                raise OSError(
+                    f"Could not publish Qwen feature cache {output_path}"
+                ) from exc
+            time.sleep(0.1 * (attempt + 1))
+
+
+def validate_feature_cache(path):
+    """Check the saved tensor metadata without reading GBs of activations twice."""
+    try:
+        data = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
+        ids = data["input_ids"]
+        length = data["seq_len"].item()
+        chunk = data["context_chunk_len"].item()
+        if ids.shape != (1, length) or data["loss_mask"].shape != ids.shape:
+            raise ValueError("Invalid input_ids/loss_mask/seq_len shapes.")
+        for name in ("target_hidden_states", "target_last_hidden_states"):
+            tensor = data[name]
+            if (
+                tensor.ndim != 3
+                or tensor.shape[:2] != (1, chunk)
+                or tensor.dtype != torch.bfloat16
+            ):
+                raise ValueError(f"Invalid {name} shape or dtype.")
+    except Exception as exc:
+        raise RuntimeError(f"Invalid Qwen feature cache {path}: {exc}") from exc
+
+
 def run_worker_process(job_path, config, devices):
     """Run a fresh interpreter and release every worker before draft training."""
     entrypoint = (
@@ -298,10 +347,7 @@ def worker_main(job_path):
                             raise ValueError(
                                 f"Qwen final-state logprob error {error} exceeds {config.logprob_atol}."
                             )
-                    output_path = Path(output_path)
-                    output_path.parent.mkdir(parents=True, exist_ok=True)
-                    torch.save(features, str(output_path) + ".tmp")
-                    os.replace(str(output_path) + ".tmp", output_path)
+                    publish_feature_cache(features, output_path)
                     del features
                 results.append(
                     {"tokens": batch["input_ids"].numel(), "logprob_max_abs": error}

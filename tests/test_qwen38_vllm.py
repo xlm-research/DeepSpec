@@ -1,4 +1,5 @@
 from pathlib import Path
+import os
 import subprocess
 import sys
 from types import SimpleNamespace
@@ -12,6 +13,7 @@ from deepspec.trainer.qwen3_8_vllm import (
     QwenVllmConfig,
     convert_hidden_states,
     live_process_group,
+    publish_feature_cache,
     run_worker_process,
 )
 from deepspec.trainer.qwen3_8_vllm_trainer import (
@@ -115,16 +117,15 @@ def test_tp4_cp2_model_group_has_one_teacher_and_one_cache_owner_per_cp_rank():
         )
 
 
-def test_two_feature_partitions_preserve_inflight_gradients(tmp_path):
-    # Exercise the real partition iterator, using a CPU extractor in place of
-    # the external teacher. The optimizer window deliberately spans partitions.
+def partition_trainer(tmp_path, counts=(1, 1), rank=0, world_size=1):
     trainer = Qwen3_8VllmDSparkTrainer.__new__(Qwen3_8VllmDSparkTrainer)
-    trainer.global_rank = trainer._vllm_owner = 0
-    trainer.world_size = 1
+    trainer.global_rank = rank
+    trainer._vllm_owner = 0
+    trainer.world_size = world_size
     trainer._cp_cache_owners = [0]
     trainer._vllm_devices = ["0"]
     trainer._vllm_control_group = None
-    trainer.data_batch_micro_batches = (1, 1)
+    trainer.data_batch_micro_batches = counts
     trainer.parallel = SimpleNamespace(context_parallel_rank=0)
     trainer.device = torch.device("cpu")
     trainer.qwen_vllm_config = QwenVllmConfig(tensor_parallel_size=1)
@@ -135,8 +136,15 @@ def test_two_feature_partitions_preserve_inflight_gradients(tmp_path):
     )
     trainer.checkpoint_dir_root = str(tmp_path / "checkpoints")
     trainer.data_batch_cache_root = str(tmp_path / "cache")
-    trainer.data_batch_rank_cache_dir = str(tmp_path / "cache/rank_00000")
+    trainer.data_batch_rank_cache_dir = str(tmp_path / f"cache/rank_{rank:05d}")
     trainer._initialize_data_batch_cache()
+    return trainer
+
+
+def test_two_feature_partitions_preserve_inflight_gradients(tmp_path):
+    # Exercise the real partition iterator, using a CPU extractor in place of
+    # the external teacher. The optimizer window deliberately spans partitions.
+    trainer = partition_trainer(tmp_path)
     tensors, batch = teacher_sample()
     batches = [
         dict(batch, attention_mask=torch.ones_like(batch["input_ids"]))
@@ -184,6 +192,129 @@ def test_two_feature_partitions_preserve_inflight_gradients(tmp_path):
     assert not list(Path(trainer.data_batch_rank_cache_dir).glob("data_batch_*"))
 
 
+@pytest.mark.parametrize("failure", ["missing", "temporary", "corrupt"])
+def test_bad_partition_fails_before_yielding_any_training_batch(tmp_path, failure):
+    trainer = partition_trainer(tmp_path, counts=(2,))
+    tensors, batch = teacher_sample()
+    batches = [
+        dict(batch, attention_mask=torch.ones_like(batch["input_ids"]))
+        for _ in range(2)
+    ]
+
+    def fake_worker(job_path, config, devices):
+        job = load_json(job_path)
+        for index, request in enumerate(job["requests"]):
+            path = Path(request["output_paths"][0])
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if index == 0:
+                torch.save(convert(tensors, batch), path)
+            elif failure == "temporary":
+                torch.save(convert(tensors, batch), str(path) + ".tmp")
+            elif failure == "corrupt":
+                path.write_bytes(b"incomplete feature cache")
+        atomic_write_json(
+            str(job_path) + ".complete",
+            {"teacher": trainer._teacher_identity, "samples": [{}, {}]},
+        )
+
+    with (
+        patch(
+            "deepspec.trainer.qwen3_8_vllm_trainer.run_worker_process",
+            side_effect=fake_worker,
+        ),
+        patch("torch.cuda.synchronize"),
+        patch("torch.cuda.empty_cache"),
+        patch(
+            "torch.distributed.all_gather_object",
+            side_effect=lambda out, obj, **kw: out.__setitem__(0, obj),
+        ),
+    ):
+        iterator = trainer.iter_training_batches(batches)
+        try:
+            with pytest.raises(RuntimeError, match="sample_00000001.pt"):
+                next(iterator)
+        finally:
+            iterator.close()
+
+    # Keep the generating job and its inputs available for diagnosis/recovery.
+    jobs = list(Path(trainer.data_batch_rank_cache_dir).glob("qwen38-job-*"))
+    assert len(jobs) == 1
+    assert (jobs[0] / "job.json").exists()
+    assert (jobs[0] / "input_00000001.pt").exists()
+
+
+@pytest.mark.parametrize("failure", ["rename_error", "rename_noop", "read_error"])
+def test_cache_publication_retries_transient_filesystem_failures(tmp_path, failure):
+    tensors, batch = teacher_sample()
+    features = convert(tensors, batch)
+    path = tmp_path / "sample.pt"
+    real_replace, real_open = os.replace, Path.open
+    attempts = 0
+
+    def replace(source, target):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            if failure == "rename_error":
+                raise OSError("temporary rename failure")
+            if failure == "rename_noop":
+                return
+        return real_replace(source, target)
+
+    def open_path(self, *args, **kwargs):
+        nonlocal attempts
+        if self == path and failure == "read_error":
+            attempts += 1
+            if attempts == 1:
+                raise FileNotFoundError("final path not yet visible")
+        return real_open(self, *args, **kwargs)
+
+    with (
+        patch(
+            "deepspec.trainer.qwen3_8_vllm.os.replace",
+            side_effect=real_replace if failure == "read_error" else replace,
+        ),
+        patch.object(Path, "open", open_path),
+        patch("deepspec.trainer.qwen3_8_vllm.time.sleep"),
+    ):
+        publish_feature_cache(features, path)
+    assert attempts == 2
+    assert not Path(str(path) + ".tmp").exists()
+    actual = torch.load(path, weights_only=True)
+    for name in features:
+        torch.testing.assert_close(actual[name], features[name])
+
+
+def test_cache_publication_rejects_persistent_noop_and_retains_temporary(tmp_path):
+    tensors, batch = teacher_sample()
+    path = tmp_path / "sample.pt"
+    with (
+        patch("deepspec.trainer.qwen3_8_vllm.os.replace") as replace,
+        patch("deepspec.trainer.qwen3_8_vllm.time.sleep"),
+        pytest.raises(OSError, match="Could not publish.*sample.pt"),
+    ):
+        publish_feature_cache(convert(tensors, batch), path)
+    assert replace.call_count == 3
+    assert not path.exists()
+    assert Path(str(path) + ".tmp").exists()
+
+
+def test_late_cache_failure_reaches_every_rank(tmp_path):
+    result = subprocess.run(
+        [
+            sys.executable, "-m", "torch.distributed.run", "--standalone",
+            "--nproc-per-node=2", "--module", "tests.qwen38_cache_distributed_worker",
+            str(tmp_path),
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=90,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.count("CACHE_FAILURE_PROPAGATED") == 2
+
+
 def test_new_launcher_uses_separate_config_and_leaves_native_default():
     helper = launcher_tests.Qwen38MultiNodeLauncherTest()
     result = helper._run_launcher(
@@ -192,10 +323,27 @@ def test_new_launcher_uses_separate_config_and_leaves_native_default():
     assert result.returncode == 0, result.stderr
     assert "config/dspark/dspark_qwen3_8_27b_vllm.py" in result.stdout
     assert "train.parallel.tp=4" in result.stdout
-    assert "train.data_partitions=512" in result.stdout
+    assert "train.data_partitions=1024" in result.stdout
     result = helper._run_launcher()
     assert result.returncode == 0, result.stderr
     assert "--config config/dspark/dspark_qwen3_8_27b.py" in result.stdout
+
+
+def test_packaged_launcher_reuses_environment_in_current_repository(tmp_path):
+    executable = tmp_path / "bin/python"
+    executable.parent.mkdir()
+    executable.write_text("#!/usr/bin/env bash\nprintf '8\\n'\n")
+    executable.chmod(0o755)
+    helper = launcher_tests.Qwen38MultiNodeLauncherTest()
+    result = helper._run_launcher(
+        launcher=REPO_ROOT / "scripts/fsdp/qwen3.8-27b_dspark.sh",
+        DEEPSPEC_ENV_DIR=tmp_path,
+    )
+    assert result.returncode == 0, result.stderr
+    assert str(executable) in result.stdout
+    assert str(REPO_ROOT / "config/dspark/dspark_qwen3_8_27b_vllm.py") in result.stdout
+    assert "train.parallel.cp=1" in result.stdout
+    assert "train.data_partitions=1024" in result.stdout
 
 
 def test_worker_entrypoint_is_inert_under_multiprocessing_spawn():

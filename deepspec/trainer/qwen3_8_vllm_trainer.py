@@ -17,6 +17,7 @@ from deepspec.trainer.qwen3_8_vllm import (
     QwenVllmConfig,
     run_worker_process,
     teacher_identity,
+    validate_feature_cache,
 )
 
 
@@ -247,14 +248,25 @@ class Qwen3_8VllmDSparkTrainer(Qwen3_8DSparkTrainer):
                     / f"vllm_rank{self._vllm_owner}_partition{partition_index}.json",
                     complete,
                 )
-                shutil.rmtree(job_dir)
 
             self._collective_stage(generate)
+
+            def validate():
+                # Check every consumer's view of the shared filesystem before
+                # any rank starts a forward pass or its NCCL collectives.
+                for path in paths:
+                    validate_feature_cache(path)
+
+            self._collective_stage(validate)
             self._data_batch_phase = "draft_training"
             for index, path in enumerate(paths):
-                cpu_batch = torch.load(path, map_location="cpu", weights_only=True)
-                gpu_batch = move_batch_to_device(cpu_batch, self.device)
-                del cpu_batch
+                def load():
+                    cpu_batch = torch.load(path, map_location="cpu", weights_only=True)
+                    return move_batch_to_device(cpu_batch, self.device)
+
+                # A file may disappear after preflight. All ranks must agree
+                # that this sample is ready before entering model collectives.
+                gpu_batch = self._collective_stage(load)
                 self._data_batch_end_after_current = index + 1 == len(paths)
                 yield gpu_batch
                 self._data_batch_end_after_current = False
@@ -262,12 +274,13 @@ class Qwen3_8VllmDSparkTrainer(Qwen3_8DSparkTrainer):
 
             torch.cuda.synchronize(self.device)
             dist.barrier(group=self._vllm_control_group)
-            self._collective_stage(
-                lambda: (
+
+            def cleanup():
+                if self.global_rank == cache_owner:
                     self._delete_data_batch_cache(paths)
-                    if self.global_rank == cache_owner
-                    else None
-                )
-            )
+                if job_dir is not None:
+                    shutil.rmtree(job_dir)
+
+            self._collective_stage(cleanup)
             self._active_data_batch_cache = None
             self._data_batch_phase = None

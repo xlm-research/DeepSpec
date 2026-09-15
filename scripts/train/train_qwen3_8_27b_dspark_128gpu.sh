@@ -160,7 +160,6 @@ NUM_TRAIN_EPOCHS=${NUM_TRAIN_EPOCHS:-10}
 MAX_TRAIN_STEPS=${MAX_TRAIN_STEPS:-}
 ONLINE_TARGET=${ONLINE_TARGET:-true}
 DATA_BATCH_SIZE=${DATA_BATCH_SIZE:-400}
-DATA_BATCH_CACHE_DIR=${DATA_BATCH_CACHE_DIR:-${OUTPUT_ROOT}/target_data_batch_cache}
 JSONL_INDEX_CACHE_DIR=${JSONL_INDEX_CACHE_DIR:-${OUTPUT_ROOT}/jsonl_index_cache}
 # The online target path runs with LOCAL_BATCH_SIZE=1. Some very long source
 # records are truncated before the assistant span, producing zero loss tokens.
@@ -175,6 +174,8 @@ WANDB_JOB_TYPE=${WANDB_JOB_TYPE:-train}
 WANDB_RESUME=${WANDB_RESUME:-allow}
 if ((NPROC_PER_NODE % CONTEXT_PARALLEL_SIZE != 0)); then
     echo "Visible GPUs per node ${NPROC_PER_NODE} must be divisible by CONTEXT_PARALLEL_SIZE=${CONTEXT_PARALLEL_SIZE}." >&2
+    exit 1
+fi
 BOUNDED_OFFLINE=${BOUNDED_OFFLINE:-true}
 DATA_PARTITIONS=${DATA_PARTITIONS:-512}
 JSONL_INDEX_CACHE_DIR=${JSONL_INDEX_CACHE_DIR:-${OUTPUT_ROOT}/jsonl_index_cache}
