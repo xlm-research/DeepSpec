@@ -68,6 +68,10 @@ def export_checkpoint(checkpoint, output_dir):
     model.load_state_dict(state, strict=True)
     model.to(dtype=TORCH_DTYPE_MAP[export_dtype])
     model.config.dtype = export_dtype
+    # A distributed export can use an index even for one shard. CPU repair
+    # may switch to an unindexed file, so discard the previous naming metadata.
+    for name in ("model.safetensors", "model.safetensors.index.json"):
+        (output / name).unlink(missing_ok=True)
     model.save_pretrained(output, max_shard_size="5GB")
     model.config.architectures = ["Qwen3DSparkModel"]
     model.config.save_pretrained(output)

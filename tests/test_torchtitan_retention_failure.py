@@ -37,6 +37,7 @@ class RetentionFailureTest(unittest.TestCase):
         request = json.loads((reference / "request.json").read_text())
         request["result_path"] = str(root / "phase-result.json")
         request["phase"].update(
+            stop_update=4,
             feature_manifest=str(root / "features.json"),
             microbatch_start=6,
             plan_path=str(plan),
