@@ -3,6 +3,7 @@
 from dataclasses import dataclass, field
 
 import torch
+from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm
 from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
 
 from torchtitan.protocols.model import BaseModel
@@ -67,6 +68,12 @@ class DSparkDraftModel(Qwen3DSparkModel):
         for tensor in (*self.parameters(), *self.buffers()):
             tensor._is_hf_initialized = False
         self.apply(self._init_weights)
+        # HF's generic initializer recognizes custom norms by class name.
+        # Dense parallelism wraps Qwen3RMSNorm in DraftNorm, so explicitly
+        # preserve its unit-scale initialization after meta materialization.
+        for module in self.modules():
+            if isinstance(module, Qwen3RMSNorm):
+                torch.nn.init.ones_(module.weight)
 
     def preprocess_inputs(self, input_dict, *, parallel_dims, parallelism):
         inputs = dict(input_dict)

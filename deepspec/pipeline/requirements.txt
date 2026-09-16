@@ -1,0 +1,3 @@
+# Install with /tmp/deepspec_vllm_torchtitan_envs/bin/python -m pip.
+ray==2.58.0
+mooncake-transfer-engine==0.3.13.post1

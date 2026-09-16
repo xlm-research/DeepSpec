@@ -858,6 +858,13 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             return torch.sum(torch.stack(detached_losses)).to(self.device)
         return self._pp_loss_sentinel_on_non_last_stage
 
+    def materialize_batch(self, input_dict, labels):
+        """Move one microbatch to the training device before its forward pass."""
+        for key, value in input_dict.items():
+            if isinstance(value, torch.Tensor):
+                input_dict[key] = value.to(self.device, non_blocking=True)
+        return input_dict, labels.to(self.device, non_blocking=True)
+
     def train_step(self, data_iterator: Iterator[TrainerBatch]):
         self.optimizers.zero_grad(set_to_none=self.config.training.disable_cuda_graphs)
         # Save per-optimizer-group learning rates for logging
@@ -904,11 +911,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             input_dict_mbs = []
             label_mbs = []
             for input_dict, labels in microbatches:
-                for key, value in input_dict.items():
-                    if isinstance(value, torch.Tensor):
-                        input_dict[key] = value.to(self.device, non_blocking=True)
+                input_dict, labels = self.materialize_batch(input_dict, labels)
                 input_dict_mbs.append(input_dict)
-                label_mbs.append(labels.to(self.device, non_blocking=True))
+                label_mbs.append(labels)
 
             if parallel_dims.pp_enabled:
                 fwd_bwd_input_dict = input_dict_mbs

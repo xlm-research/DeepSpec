@@ -122,17 +122,7 @@ class FeatureLoader(BaseDataLoader):
     def __iter__(self):
         while self.cursor < len(self.entries):
             entry = self.entries[self.cursor]
-            if self.producer is not None:
-                expected = self.expected_samples[entry["id"]]
-                batch = self.producer.read(
-                    expected["sample_id"], expected["input_identity"]
-                )
-            else:
-                batch = torch.load(
-                    self.manifest_path.parent / entry["path"],
-                    map_location="cpu",
-                    weights_only=True,
-                )
+            batch = self.read_entry(entry)
             tokens = batch["input_ids"]
             if (
                 self.expected_inputs
@@ -156,6 +146,18 @@ class FeatureLoader(BaseDataLoader):
             batch["num_valid_tokens"] = int(batch["loss_mask"].count_nonzero())
             self.cursor += 1
             yield batch, tokens
+
+    def read_entry(self, entry):
+        if self.producer is not None:
+            expected = self.expected_samples[entry["id"]]
+            return self.producer.read(
+                expected["sample_id"], expected["input_identity"]
+            )
+        return torch.load(
+            self.manifest_path.parent / entry["path"],
+            map_location="cpu",
+            weights_only=True,
+        )
 
     def state_dict(self):
         return {
