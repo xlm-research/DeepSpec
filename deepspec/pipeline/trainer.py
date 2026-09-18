@@ -1,5 +1,6 @@
 """Materialize DSpark features at Titan's existing microbatch boundary."""
 
+import socket
 import time
 from dataclasses import dataclass
 
@@ -9,6 +10,7 @@ import torch.distributed as dist
 from torchtitan.models.dspark_draft.trainer import DSparkTrainer
 
 from .store import FEATURE_FIELDS
+from .topology import consumer_dp
 
 
 class StreamingDSparkTrainer(DSparkTrainer):
@@ -21,6 +23,18 @@ class StreamingDSparkTrainer(DSparkTrainer):
         self.active_position = None
         if self.parallel_dims.cp != 1 or self.parallel_dims.pp != 1:
             raise ValueError("The initial streaming recipe requires CP=PP=1")
+        ray.get(
+            self.dataloader.buffer.event.remote(
+                "consumer_rank_initialized",
+                reader=dist.get_rank(),
+                hostname=socket.gethostname(),
+                dp_rank=self.dataloader.dp_rank,
+                tp_rank=self.parallel_dims.get_mesh("tp").get_local_rank(),
+                world_size=dist.get_world_size(),
+                gradient_accumulation_steps=self.gradient_accumulation_steps,
+            )
+        )
+        dist.barrier()
         if dist.get_rank() == 0:
             ray.get(self.dataloader.buffer.consumer_initialized.remote())
 
@@ -32,12 +46,14 @@ class StreamingDSparkTrainer(DSparkTrainer):
         features = self.dataloader.take_features(
             descriptor, self.device if direct else "cpu"
         )
+        features_ready = time.monotonic()
         # All source reads have completed; this rank now owns independent buffers.
         ray.get(
             self.dataloader.buffer.acknowledge.remote(
                 descriptor["position"], dist.get_rank()
             )
         )
+        acknowledged = time.monotonic()
         input_dict.update(features)
         result = super().materialize_batch(input_dict, labels)
         torch.cuda.current_stream(self.device).synchronize()
@@ -48,6 +64,9 @@ class StreamingDSparkTrainer(DSparkTrainer):
                 position=self.active_position,
                 reader=dist.get_rank(),
                 seconds=time.monotonic() - started,
+                feature_wait_seconds=features_ready - started,
+                acknowledge_seconds=acknowledged - features_ready,
+                materialize_seconds=time.monotonic() - acknowledged,
                 receive_device=pipeline["receive_device"],
             )
         )
@@ -158,6 +177,8 @@ class StreamingDSparkTrainer(DSparkTrainer):
                 reader=dist.get_rank(),
                 step=self.step,
                 next_global_microbatch=self.dataloader.next_global_microbatch,
+                next_global_sample=self.dataloader.next_global_microbatch
+                * consumer_dp(self.dataloader.pipeline),
             )
         )
         return result

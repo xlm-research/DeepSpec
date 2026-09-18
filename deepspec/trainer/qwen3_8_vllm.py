@@ -2,18 +2,19 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import hashlib
 import json
 import os
-from pathlib import Path
 import signal
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+from dataclasses import dataclass
+from pathlib import Path
 
+import numpy as np
 import torch
 
 from deepspec.trainer.glm5_partitioned_swap import atomic_write_json, load_json
@@ -122,17 +123,35 @@ def convert_hidden_states(
             f"Expected BF16 features {expected}, got {hidden.shape}/{hidden.dtype}."
         )
     indices = context_indices(length, cp_size, cp_rank)
-    local = hidden.index_select(0, indices.clamp_max(length - 1))
-    local[indices >= length] = 0
-    for start in range(0, len(local), 2048):
-        chunk = local[start : start + 2048]
-        if not bool(torch.isfinite(chunk).all()):
-            raise ValueError("Qwen teacher features contain non-finite values.")
+    if cp_size == 1:
+        local = hidden
+    else:
+        local = hidden.index_select(0, indices.clamp_max(length - 1))
+        local[indices >= length] = 0
+    if local.device.type == "cpu":
+        # BF16 NaN/Inf have all eight exponent bits set. Inspect those bits
+        # without float conversion, using at most 4M elements of scratch.
+        words = local.detach().view(torch.int16).numpy()
+        chunk_tokens = max(1, (4 * 1024**2) // ((num_layers + 1) * hidden_size))
+        for start in range(0, len(local), chunk_tokens):
+            exponent = np.bitwise_and(words[start : start + chunk_tokens], 0x7F80)
+            if np.any(exponent == 0x7F80):
+                raise ValueError("Qwen teacher features contain non-finite values.")
+    else:
+        for start in range(0, len(local), 2048):
+            if not bool(torch.isfinite(local[start : start + 2048]).all()):
+                raise ValueError("Qwen teacher features contain non-finite values.")
     return {
         "input_ids": ids,
         "loss_mask": mask,
-        "target_hidden_states": local[:, :-1].flatten(1).contiguous().unsqueeze(0),
-        "target_last_hidden_states": local[:, -1].contiguous().unsqueeze(0),
+        # Keep independent output buffers even for one-token/one-layer inputs.
+        "target_hidden_states": local[:, :-1]
+        .flatten(1)
+        .clone(memory_format=torch.contiguous_format)
+        .unsqueeze(0),
+        "target_last_hidden_states": local[:, -1]
+        .clone(memory_format=torch.contiguous_format)
+        .unsqueeze(0),
         "context_chunk_len": torch.tensor([len(indices)]),
         "seq_len": torch.tensor([length]),
     }
@@ -197,11 +216,12 @@ def _watch_parent():
 def worker_main(job_path):
     _watch_parent()
     from safetensors import safe_open
-    from vllm import LLM, SamplingParams
     from vllm.config.kv_transfer import KVTransferConfig
     from vllm.distributed.kv_transfer.kv_connector.v1 import (
         example_hidden_states_connector as connector,
     )
+
+    from vllm import LLM, SamplingParams
 
     job = load_json(job_path)
     config = QwenVllmConfig(**job["config"])

@@ -10,7 +10,9 @@ import torch.distributed as dist
 from torchtitan.models.dspark_draft.data import FeatureLoader
 
 from .prefetch import FeaturePrefetch
+from .schema import normalize_pipeline_config
 from .store import FIELDS, TensorStore
+from .topology import consumer_dp
 
 
 class MooncakeFeatureLoader(FeatureLoader):
@@ -22,8 +24,16 @@ class MooncakeFeatureLoader(FeatureLoader):
         from pathlib import Path
 
         self.pipeline = json.loads(Path(config.pipeline_config).read_text())
-        if kwargs["dp_world_size"] != 1:
-            raise ValueError("The initial 4+4 pipeline supports consumer DP=1")
+        normalize_pipeline_config(self.pipeline)
+        dp = consumer_dp(self.pipeline)
+        tp = self.pipeline["consumer_world_size"] // dp
+        if (
+            kwargs["dp_world_size"] != dp
+            or dist.get_world_size() != self.pipeline["consumer_world_size"]
+            or kwargs["dp_rank"] != dist.get_rank() // tp
+        ):
+            raise ValueError("Native consumer DP/TP ranks differ from the stream plan")
+        self.dp_rank = kwargs["dp_rank"]
         if not config.plan_path:
             raise ValueError("Streaming features require the native input plan")
         super().__init__(replace(config, require_producer_manifest=False), **kwargs)
@@ -60,7 +70,8 @@ class MooncakeFeatureLoader(FeatureLoader):
         if self.pipeline["receive_device"] == "cpu":
             self.prefetch = FeaturePrefetch(
                 self.pipeline["store"],
-                depth=2,
+                depth=int(self.pipeline["transport"]["prefetch_depth"]),
+                max_bytes=self.pipeline["transport"]["prefetch_bytes"],
                 timeout=self.pipeline["timeout_seconds"],
                 device=torch.cuda.current_device()
                 if torch.cuda.is_available()

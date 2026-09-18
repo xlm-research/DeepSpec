@@ -39,8 +39,18 @@ def node_memory():
     }
 
 
-def feature_budget(pool_bytes, max_sample_bytes, window, readers, gas):
-    snapshot = node_memory()
+def feature_budget(
+    pool_bytes,
+    max_sample_bytes,
+    window,
+    readers,
+    gas,
+    *,
+    writer=True,
+    snapshot=None,
+    writer_inflight=None,
+):
+    snapshot = node_memory() if snapshot is None else snapshot
     # The pool includes its replicas (one here); freed objects remain in this pool.
     # Writer raw/gather/converted buffers, every rank's CPU/GPU-verification
     # staging, and each Store client's preallocated local buffer are outside it.
@@ -53,10 +63,17 @@ def feature_budget(pool_bytes, max_sample_bytes, window, readers, gas):
             snapshot["headroom_bytes"] - reserve,
         ),
     )
-    scratch = (3 * window + 2 * readers * gas) * max_sample_bytes
+    staging = window if writer_inflight is None else writer_inflight
+    if staging < 1:
+        raise ValueError("Writer staging must allow at least one sample")
+    scratch = (3 * staging * int(writer) + 2 * readers * gas) * max_sample_bytes
+    # The async writer copies converted features into one registered host
+    # buffer per in-flight slot.  Keep this separate from model scratch so
+    # diagnostics can distinguish transport pressure from tensor pressure.
+    transport_staging = staging * int(writer) * max_sample_bytes
     # Each training rank has separate metadata and background feature clients.
-    local_buffers = (2 * readers + 2) * 16 * 1024**2
-    estimate = pool_bytes + scratch + local_buffers + GIB
+    local_buffers = (2 * readers + int(writer) + int(pool_bytes > 0)) * 16 * 1024**2
+    estimate = pool_bytes + scratch + transport_staging + local_buffers + GIB
     if estimate > budget:
         raise ValueError(
             f"Feature allocation bound {estimate} exceeds node budget {budget}"
@@ -68,5 +85,6 @@ def feature_budget(pool_bytes, max_sample_bytes, window, readers, gas):
         "memory_snapshot": snapshot,
         "pool_bytes": pool_bytes,
         "scratch_bound_bytes": scratch,
+        "transport_staging_bound_bytes": transport_staging,
         "client_buffers_bytes": local_buffers,
     }

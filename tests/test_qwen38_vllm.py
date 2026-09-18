@@ -1,6 +1,6 @@
-from pathlib import Path
 import subprocess
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -90,6 +90,64 @@ def test_bad_teacher_outputs_are_rejected(failure):
         tensors["hidden_states"][0, 0, 0] = float("nan")
     with pytest.raises(ValueError):
         convert(tensors, batch)
+
+
+def test_converter_checks_all_bfloat16_encodings_and_preserves_finite_bits():
+    words = torch.arange(65536, dtype=torch.int32).to(torch.int16)
+    values = words.view(torch.bfloat16)
+    finite = torch.isfinite(values)
+    hidden = values[finite].reshape(-1, 2, 1)
+    ids = torch.arange(len(hidden)).unsqueeze(0)
+    batch = {"input_ids": ids, "loss_mask": torch.ones_like(ids, dtype=torch.bool)}
+    features = convert_hidden_states(
+        {"hidden_states": hidden, "token_ids": ids[0]},
+        batch,
+        hidden_size=1,
+        num_layers=1,
+    )
+    restored = torch.stack(
+        (features["target_hidden_states"][0], features["target_last_hidden_states"][0]),
+        dim=1,
+    )
+    assert torch.equal(restored.view(torch.int16), hidden.view(torch.int16))
+    tensors, batch = teacher_sample(length=1)
+    for word in words[~finite]:
+        tensors["hidden_states"].view(torch.int16)[0, 0, 0] = word
+        with pytest.raises(ValueError, match="non-finite"):
+            convert(tensors, batch)
+
+
+@pytest.mark.parametrize("length", [1, 7])
+@pytest.mark.parametrize("strided", [False, True])
+def test_features_remain_independent_of_producer_storage(length, strided):
+    tensors, batch = teacher_sample(length=length)
+    if strided:
+        backing = torch.empty(length, 3, 16, dtype=torch.bfloat16)
+        backing[..., ::2].copy_(tensors["hidden_states"])
+        tensors["hidden_states"] = backing[..., ::2]
+    original = tensors["hidden_states"].clone()
+    features = convert(tensors, batch)
+    assert torch.equal(tensors["hidden_states"], original)
+    tensors["hidden_states"].zero_()
+    for name, expected in (
+        ("target_hidden_states", original[:, :-1].flatten(1)),
+        ("target_last_hidden_states", original[:, -1]),
+    ):
+        assert features[name].is_contiguous()
+        assert torch.equal(
+            features[name][0].view(torch.int16), expected.view(torch.int16)
+        )
+
+
+def test_nonfinite_after_the_first_validation_chunk_is_rejected():
+    hidden = torch.zeros(257, 3, 8192, dtype=torch.bfloat16)
+    hidden[-1, -1, -1] = float("inf")
+    ids = torch.arange(len(hidden)).unsqueeze(0)
+    with pytest.raises(ValueError, match="non-finite"):
+        convert(
+            {"hidden_states": hidden, "token_ids": ids[0]},
+            {"input_ids": ids, "loss_mask": torch.ones_like(ids, dtype=torch.bool)},
+        )
 
 
 def test_tp4_cp2_model_group_has_one_teacher_and_one_cache_owner_per_cp_rank():

@@ -61,6 +61,17 @@ store_py.cpp 的 batch_put_from / batch_get_into
 
 ## 当前已验证与尚未验证
 
+## TorchSpec Mooncake 设计借鉴
+
+本轮还对照了 TorchSpec commit `6c042a87140a84d13839e341ece2c5c3ada918bc`：
+
+- [`buffers.py`](https://github.com/lightseekorg/TorchSpec/blob/main/torchspec/transfer/mooncake/buffers.py)：复用注册 host buffer、CUDA event 生命周期和有界异步 put；本项目对应 `mooncake/buffers.py` 与 `TensorStore.put_async()`。
+- [`store.py`](https://github.com/lightseekorg/TorchSpec/blob/main/torchspec/transfer/mooncake/store.py)：能力探测、`batch_exists`/可见性等待、native client 串行化和 partial put 清理；本项目对应 `MooncakeCapabilities`、`wait_for_keys()` 和 `_cleanup_keys()`。
+- [`eagle_store.py`](https://github.com/lightseekorg/TorchSpec/blob/main/torchspec/transfer/mooncake/eagle_store.py)：把发布提交放在 transfer 完成之后；本项目保持 READY 发布晚于 put handle 完成，并将描述符校验留在 FeatureBuffer。
+- [`deferred_delete.py`](https://github.com/lightseekorg/TorchSpec/blob/main/torchspec/transfer/mooncake/deferred_delete.py)：删除失败不提前释放所有权；本项目用 `DeleteManager` 重试删除，成功后才调用 `ledger.deleted()`。
+
+这些实现只借鉴生命周期和错误处理模式，不把 TorchSpec 的 Eagle 数据格式或 GPU/RDMA 运行假设带入当前六字段协议。
+
 已验证：真实安装包的 CPU 注册缓冲读写、SHA256 对齐、分块对象、容量压力下 hard-pin
 对象保留、全部读者确认后删除、有界预取、四个独立 CPU rank 的原生加载器与 GAS 背压。
 

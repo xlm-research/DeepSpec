@@ -83,6 +83,27 @@ def test_chunked_tensors_round_trip_and_explicit_deletion(store_config):
         owner.close()
 
 
+def test_consumer_pool_with_distinct_writer_and_reader_clients(store_config):
+    from deepspec.pipeline.cluster import StoreProbe
+
+    owner = TensorStore(store_config, pool_bytes=64 * 1024**2)
+    writer = StoreProbe(store_config)
+    reader = StoreProbe(store_config)
+    try:
+        assert owner.endpoint.startswith("127.0.0.1:")
+        fields = writer.write("placement-probe")
+        assert len(fields["target_hidden_states"]["chunks"]) > 1
+        result = reader.read(fields)
+        assert result["nbytes"] == sum(f["nbytes"] for f in fields.values())
+        assert reader.store.last_read["verified"]
+        assert writer.store.last_write["nbytes"] == result["nbytes"]
+        reader.remove(fields)
+    finally:
+        reader.close()
+        writer.close()
+        owner.close()
+
+
 def test_hard_pinned_features_survive_store_allocation_pressure(store_config):
     owner = TensorStore(store_config, pool_bytes=64 * 1024**2)
     client = TensorStore(store_config)
@@ -119,9 +140,19 @@ def test_hard_pinned_features_survive_store_allocation_pressure(store_config):
 
 
 def test_ray_buffer_waits_for_all_readers_and_drains(store_config, tmp_path):
+    import asyncio
+
     import ray
 
+    from deepspec.pipeline.actors import Producer
     from deepspec.pipeline.buffer import FeatureBuffer
+
+    class ProducerLoopProbe(Producer):
+        def __init__(self):
+            pass
+
+        def run(self):
+            return asyncio.run(asyncio.sleep(0, result="native-loop-entered"))
 
     tensors = {
         "input_ids": torch.arange(16).reshape(1, -1),
@@ -165,11 +196,14 @@ def test_ray_buffer_waits_for_all_readers_and_drains(store_config, tmp_path):
         log_to_driver=False,
     )
     buffer = ray.remote(FeatureBuffer).remote(config)
+    frontend = ray.remote(ProducerLoopProbe).remote()
     client = TensorStore(store_config)
     try:
+        assert ray.get(frontend.run.remote(), timeout=30) == "native-loop-entered"
         ray.get(buffer.summary.remote(), timeout=30)
         for i, sample in enumerate(samples):
             ray.get(buffer.reserve.remote(i))
+            ray.get(buffer.begin_write.remote(i))
             fields = describe_tensors(f"ray-test/{i}", tensors)
             client.put(fields, tensors)
             ray.get(buffer.publish.remote(i, {**sample, "fields": fields}))
@@ -188,6 +222,7 @@ def test_ray_buffer_waits_for_all_readers_and_drains(store_config, tmp_path):
         assert summary["released"] == 4 and summary["remaining"] == 0
         ray.get(buffer.close.remote())
     finally:
+        ray.kill(frontend)
         ray.kill(buffer)
         ray.shutdown()
         client.close()
@@ -236,7 +271,13 @@ def test_prefetch_bounds_storage_and_preserves_read_order(store_config):
         owner.close()
 
 
-def test_four_native_loader_ranks_consume_two_complete_updates(store_config, tmp_path):
+@pytest.mark.parametrize("consumer_dp,producer_dp", [(1, 1), (2, 1), (2, 2)])
+def test_native_loader_ranks_consume_two_complete_updates(
+    store_config, tmp_path, consumer_dp, producer_dp
+):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+
     import ray
     from torchtitan.models.dspark_draft.planning import input_identity
 
@@ -295,7 +336,9 @@ def test_four_native_loader_ranks_consume_two_complete_updates(store_config, tmp
         "teacher": teacher,
         "capacity_bytes": samples[0]["nbytes"] * 4,
         "window": 4,
-        "consumer_world_size": 4,
+        "consumer_world_size": 4 * consumer_dp,
+        "consumer_dp": consumer_dp,
+        "producer_dp": producer_dp,
         "samples_per_update": 4,
         "store": store_config,
         "pool_bytes": 64 * 1024**2,
@@ -303,7 +346,7 @@ def test_four_native_loader_ranks_consume_two_complete_updates(store_config, tmp
         "feature_memory_budget": 256 * 1024**2,
         "memory_reserve_bytes": 0,
         "scratch_bound_bytes": 0,
-        "timeout_seconds": 60,
+        "timeout_seconds": 120,
         "plan_path": str(plan_path),
         "manifest_path": str(manifest_path),
         "receive_device": "cpu",
@@ -322,6 +365,7 @@ def test_four_native_loader_ranks_consume_two_complete_updates(store_config, tmp
     )
     buffer = ray.remote(FeatureBuffer).options(name="features").remote(config)
     client = TensorStore(store_config)
+    second_client = TensorStore(store_config) if producer_dp == 2 else None
     process = None
     try:
         ray.get(buffer.summary.remote(), timeout=30)
@@ -335,7 +379,7 @@ def test_four_native_loader_ranks_consume_two_complete_updates(store_config, tmp
                     "-m",
                     "torch.distributed.run",
                     "--standalone",
-                    "--nproc-per-node=4",
+                    f"--nproc-per-node={4 * consumer_dp}",
                     "-m",
                     "tests.pipeline_rank_probe",
                 ],
@@ -350,22 +394,59 @@ def test_four_native_loader_ranks_consume_two_complete_updates(store_config, tmp
                 stdout=log,
                 stderr=subprocess.STDOUT,
             )
-            for sample, tensors in zip(samples, batches, strict=True):
-                position = sample["position"]
-                ray.get(buffer.reserve.remote(position), timeout=65)
+            odd_ready = [Event() for _ in range(4)]
+
+            def write(position):
+                sample, tensors = samples[position], batches[position]
+                rank = position % producer_dp
+                ray.get(buffer.begin_write.remote(position, rank))
                 fields = describe_tensors(f"rank-probe/{position}", tensors)
-                client.put(fields, tensors)
-                ray.get(buffer.publish.remote(position, {**sample, "fields": fields}))
+                writer = client if rank == 0 else second_client
+                writer.put(fields, tensors)
+                if producer_dp == 2 and rank == 0:
+                    assert odd_ready[position // 2].wait(30)
+                ray.get(
+                    buffer.publish.remote(position, {**sample, "fields": fields}, rank)
+                )
+                if rank == 1:
+                    odd_ready[position // 2].set()
+
+            # Each writer owns one client and a serial queue; only admission
+            # remains global. DP1 is the existing synchronous reference.
+            with ThreadPoolExecutor(1) as even, ThreadPoolExecutor(1) as odd:
+                writes = []
+                for position in range(len(samples)):
+                    ray.get(buffer.reserve.remote(position), timeout=125)
+                    if producer_dp == 1:
+                        write(position)
+                    else:
+                        writes.append(
+                            (even if position % 2 == 0 else odd).submit(write, position)
+                        )
+                for future in writes:
+                    future.result(timeout=125)
             ray.get(buffer.finish_production.remote())
-            assert process.wait(timeout=60) == 0, (tmp_path / "ranks.log").read_text()
-        for rank in range(4):
+            assert process.wait(timeout=90) == 0, (tmp_path / "ranks.log").read_text()
+        for rank in range(4 * consumer_dp):
             assert json.loads((tmp_path / f"rank-result-{rank}.json").read_text()) == {
-                "positions": list(range(8)),
-                "cursor": 8,
+                "positions": list(range(rank // 4, 8, consumer_dp)),
+                "cursor": 8 // consumer_dp,
             }
         summary = ray.get(buffer.summary.remote())
         assert summary["remaining"] == 0 and summary["released"] == 8
         assert "backpressure" in (tmp_path / "events.jsonl").read_text()
+        if producer_dp == 2:
+            events = [
+                json.loads(line)
+                for line in (tmp_path / "events.jsonl").read_text().splitlines()
+            ]
+            ready = [e["position"] for e in events if e["event"] == "ready"]
+            assert all(ready.index(p + 1) < ready.index(p) for p in range(0, 8, 2))
+            assert all(
+                e["producer_rank"] == e["position"] % 2
+                for e in events
+                if e["event"] == "ready"
+            )
         ray.get(buffer.close.remote())
     finally:
         if process is not None and process.poll() is None:
@@ -374,3 +455,5 @@ def test_four_native_loader_ranks_consume_two_complete_updates(store_config, tmp
         ray.kill(buffer)
         ray.shutdown()
         client.close()
+        if second_client is not None:
+            second_client.close()

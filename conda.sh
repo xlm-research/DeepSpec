@@ -1,0 +1,1 @@
+source /mnt/afs-agentpro/share/env/miniconda3/etc/profile.d/conda.sh
