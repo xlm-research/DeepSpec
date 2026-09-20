@@ -10,10 +10,11 @@ import socket
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 
 from .memory import feature_budget, node_memory
-from .topology import consumer_dp, consumer_microbatches, producer_dp
+from .topology import consumer_dp, producer_dp
 
 logger = logging.getLogger(__name__)
 PACKAGES = ("torch", "vllm", "ray", "mooncake-transfer-engine", "transformers", "numpy")
@@ -25,15 +26,218 @@ def versions():
 
 def source_hashes(root):
     paths = [
-        *sorted((root / "deepspec/pipeline").glob("*.py")),
+        *sorted((root / "deepspec/pipeline").rglob("*.py")),
+        root / "deepspec/orchestration/process.py",
         root / "deepspec/trainer/qwen3_8_vllm.py",
         root / "torchtitan/torchtitan/trainer.py",
-        root / "torchtitan/torchtitan/models/dspark_draft/data.py",
+        *sorted((root / "torchtitan/torchtitan/models/dspark_draft").rglob("*.py")),
+        root / "vllm/vllm/config/parallel.py",
+        root / "vllm/vllm/v1/engine/utils.py",
+        root / "vllm/vllm/v1/engine/core.py",
+        root / "vllm/vllm/v1/executor/ray_executor_v2.py",
     ]
     return {
         str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest()
         for p in paths
     }
+
+
+def native_placement_capabilities(root):
+    """Require explicit implementation markers across native placement seams.
+
+    A package version or a synthetic actor is not evidence of these hooks.
+    Native integration tests must validate the marker-bearing implementation.
+    """
+    import ast
+
+    paths = {
+        "borrowed_pg": ("vllm/vllm/config/parallel.py", "vllm/vllm/v1/engine/utils.py"),
+        "cpu_core": ("vllm/vllm/v1/engine/core.py",),
+        "allocation_gate": ("vllm/vllm/v1/executor/ray_executor_v2.py",),
+    }
+    result = {}
+    for capability, files in paths.items():
+        supported = []
+        for path in files:
+            if not (Path(root) / path).is_file():
+                supported.append(False)
+                continue
+            tree = ast.parse((Path(root)/path).read_text())
+            supported.append(any(
+                isinstance(statement, ast.Assign)
+                and any(isinstance(target, ast.Name) and target.id == "RAY_PLACEMENT_API_VERSION" for target in statement.targets)
+                and isinstance(statement.value, ast.Constant) and statement.value.value == 1
+                for statement in tree.body
+            ))
+        result[capability] = all(supported)
+    return result
+
+
+class TaskNodeInspector:
+    """Short-lived CPU actor: inspect existing resources, never allocate GPUs."""
+
+    def __init__(self, config, run, token):
+        self.config, self.run, self.token = config, run, token
+        self.sample_sequence = 1
+
+    def ready(self):
+        return True
+
+    def sample_startup_memory(self, request_id):
+        """Sample after slow identity hashing, with request-specific freshness."""
+        import ray
+
+        self.sample_sequence += 1
+        return {
+            "node_id": ray.get_runtime_context().get_node_id(),
+            "agent_epoch": self.token,
+            "request_id": request_id,
+            "sample_seq": self.sample_sequence,
+            "memory": node_memory(),
+            "observed_at": time.monotonic(),
+        }
+
+    def inspect(self):
+        import ray
+        from torchtitan.models.dspark_draft.planning import model_identity
+
+        from .run import ROOT
+        from .schema import content_hash
+
+        config = self.config
+        output = Path(self.run["output_dir"])
+        if (output / f".inspection-{self.token}").read_text() != self.token:
+            raise ValueError("Shared output witness is not visible on this node")
+        source = Path(config["data"]["source_path"])
+        digest = hashlib.sha256()
+        with source.open("rb") as stream:
+            for block in iter(lambda: stream.read(8*1024**2), b""):
+                digest.update(block)
+        context = ray.get_runtime_context()
+        node_id = context.get_node_id()
+        ip = ray.util.get_node_ip_address()
+        inventory = gpu_inventory()
+        busy = set(subprocess.check_output(
+            ["nvidia-smi", "--query-compute-apps=gpu_uuid", "--format=csv,noheader"], text=True, timeout=10).splitlines())
+        witness = output / f".inspection-{self.token}-{node_id}"
+        witness.write_text(self.token)
+        versions_value = {"python": sys.version, "python_executable": sys.executable, "packages": versions()}
+        return {"node_id": node_id, "ip": ip, "hostname": socket.gethostname(), "alive": True,
+                "gpus": inventory, "free_gpu_uuids": [g["uuid"] for g in inventory if g["uuid"] not in busy],
+                "memory": node_memory(), "identities": {
+                    "source": content_hash(source_hashes(ROOT)), "dependencies": content_hash(versions_value),
+                    "model": content_hash(model_identity(config["model_path"])), "input": digest.hexdigest()},
+                "environment": versions_value, "network_interface": interface_for_ip(ip),
+                "shared_paths": {"readable": True, "writable": True, "witness_path": str(witness)},
+                "capabilities": native_placement_capabilities(ROOT),
+                "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
+                "agent_epoch": self.token, "sample_seq": 1, "observed_at": time.monotonic(),
+                "evidence_level": "observed"}
+
+
+def _inspect_task_nodes_worker(config, run):
+    import ray
+    from ray._private.state import available_resources_per_node
+    from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+
+    from .runtime import Deadline, PipelineError
+
+    deadline = Deadline.after(config["timeouts_seconds"]["allocation"])
+    token = uuid.uuid4().hex
+    output = Path(run["output_dir"])
+    witness = output / f".inspection-{token}"
+    witness.write_text(token)
+    actors, local_witnesses = [], []
+    try:
+        ray.init(address=config["ray_address"], namespace=f"{run['namespace']}-inspect-{token}", log_to_driver=False)
+        resolved_address = (
+            ray.get_runtime_context().gcs_address
+            if config["ray_address"] == "auto" else config["ray_address"]
+        )
+        selected = []
+        for spec in config["nodes"]:
+            key, value = next(iter(spec["selector"].items()))
+            field = "NodeID" if key == "node_id" else "NodeManagerAddress"
+            matches = [n for n in ray.nodes() if n["Alive"] and n[field] == value]
+            if len(matches) != 1 or any(n["NodeID"] == matches[0]["NodeID"] for n in selected):
+                raise PipelineError("NODE_SELECTION", "Expected unique live node selectors", field_path="nodes", exit_code=4)
+            node = matches[0]
+            selected.append(node)
+            actor = ray.remote(num_cpus=1, num_gpus=0, max_restarts=0)(TaskNodeInspector).options(
+                scheduling_strategy=NodeAffinitySchedulingStrategy(node["NodeID"], soft=False)
+            ).remote(config, run, token)
+            actors.append(actor)
+        ray.get([actor.ready.remote() for actor in actors], timeout=deadline.remaining())
+        reports = ray.get([actor.inspect.remote() for actor in actors], timeout=deadline.remaining())
+        available = available_resources_per_node()
+        request_id = uuid.uuid4().hex
+        sent_at = time.monotonic()
+        snapshots = ray.get(
+            [actor.sample_startup_memory.remote(request_id) for actor in actors],
+            timeout=min(deadline.remaining(), config["timeouts_seconds"]["budget_snapshot"]),
+        )
+        if len(snapshots) != len(reports):
+            raise PipelineError("NODE_FACTS_MISSING", "Missing startup memory snapshots", field_path="nodes", exit_code=4)
+        for report, snapshot in zip(reports, snapshots):
+            if (snapshot.get("request_id") != request_id
+                    or snapshot.get("node_id") != report["node_id"]
+                    or snapshot.get("agent_epoch") != report["agent_epoch"]
+                    or snapshot.get("sample_seq", 0) <= report["sample_seq"]):
+                raise PipelineError("NODE_FACTS_MISMATCH", "Startup memory snapshot identity mismatch", field_path="nodes", exit_code=4)
+            report.update(snapshot)
+        for report in reports:
+            path = Path(report["shared_paths"]["witness_path"])
+            local_witnesses.append(path)
+            if path.read_text() != token:
+                raise PipelineError("SHARED_PATH_UNAVAILABLE", "Remote write is not visible to controller", field_path="output_dir", exit_code=4)
+            free = available.get(report["node_id"], {})
+            report.update(ray_address=resolved_address, request_sent_at=sent_at, cpu_available=free.get("CPU", 0)+1,
+                          gpu_available=min(free.get("GPU", 0), len(report["free_gpu_uuids"])))
+        return reports
+    finally:
+        cleanup_errors = []
+        try:
+            for actor in actors:
+                try:
+                    ray.kill(actor, no_restart=True)
+                except Exception as error:  # noqa: BLE001 -- collect cleanup failures for every owned actor
+                    cleanup_errors.append(str(error))
+        finally:
+            ray.shutdown()
+            witness.unlink(missing_ok=True)
+            for path in local_witnesses:
+                path.unlink(missing_ok=True)
+        if cleanup_errors:
+            raise PipelineError("INSPECTION_CLEANUP_UNKNOWN", "; ".join(cleanup_errors), field_path="nodes", exit_code=4)
+
+
+def inspect_task_nodes(config, run):
+    """Bound Ray connection and native inspection in a killable CPU driver."""
+    from .runtime import PipelineError, atomic_json
+
+    output = Path(run.output_dir)
+    token = uuid.uuid4().hex
+    request, result = output/f"inspection-{token}.request.json", output/f"inspection-{token}.result.json"
+    atomic_json(request, {"config": config, "run": run.to_dict(), "result_path": str(result)})
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-m", "deepspec.pipeline.cluster", "--inspect-task", str(request)],
+            env=dict(os.environ, CUDA_VISIBLE_DEVICES=""), capture_output=True, text=True, check=False,
+            timeout=config["timeouts_seconds"]["allocation"]+config["timeouts_seconds"]["cleanup"],
+        )
+        if result.exists():
+            payload = json.loads(result.read_text())
+            if "error" in payload:
+                details = payload["error"]
+                raise PipelineError(**details, exit_code=payload["exit_code"])
+            if completed.returncode == 0:
+                return payload["nodes"]
+        raise PipelineError("NODE_INSPECTION_FAILED", completed.stderr[-4000:] or "Inspection process failed", field_path="nodes", exit_code=4)
+    except subprocess.TimeoutExpired as error:
+        raise PipelineError("NODE_INSPECTION_TIMEOUT", "CPU node inspection exceeded its shared deadline", field_path="nodes", exit_code=4) from error
+    finally:
+        request.unlink(missing_ok=True)
+        result.unlink(missing_ok=True)
 
 
 def select_nodes(nodes, producer, consumer, *, consumer_dp=1, producer_dp=1):
@@ -75,7 +279,7 @@ def interface_for_ip(address):
     return matches[0]
 
 
-def gpu_inventory():
+def gpu_inventory(*, timeout=30):
     rows = subprocess.check_output(
         [
             "nvidia-smi",
@@ -83,6 +287,7 @@ def gpu_inventory():
             "--format=csv,noheader,nounits",
         ],
         text=True,
+        timeout=timeout,
     ).splitlines()
     result = []
     for row in rows:
@@ -107,6 +312,7 @@ def gpu_processes(run_id, known_owned=None, *, proc_root=Path("/proc")):
             "--format=csv,noheader,nounits",
         ],
         text=True,
+        timeout=10,
     ).splitlines()
     marker = f"DEEPSPEC_PIPELINE_RUN_ID={run_id}".encode()
     if known_owned is None:
@@ -120,8 +326,13 @@ def gpu_processes(run_id, known_owned=None, *, proc_root=Path("/proc")):
             if state[0] in ("Z", "X"):
                 continue
             process_identity = (int(pid), int(state[19]))
-            environment = (process / "environ").read_bytes().split(b"\0")
-        except FileNotFoundError:
+            try:
+                environment = (process / "environ").read_bytes().split(b"\0")
+            except PermissionError:
+                # Non-root monitors may lose environ access during worker exit.
+                # Only an already observed PID/start-time remains trusted.
+                environment = []
+        except (FileNotFoundError, ProcessLookupError):
             continue
         if marker in environment:
             known_owned.add(process_identity)
@@ -240,6 +451,8 @@ class NodeMonitor:
         self.node_id = ray.get_runtime_context().get_node_id()
         self.budget = None
         self.known_owned = set()
+        self.agent_epoch = uuid.uuid4().hex
+        self.sample_seq = 0
         self.path = Path(config["output_dir"]) / f"node-{role}.jsonl"
 
     def inspect(self, expected_config_digest):
@@ -318,6 +531,19 @@ class NodeMonitor:
             ),
         }
 
+    def sample_budget(self, request):
+        from .runtime import validate_message
+
+        validate_message(request, run_id=self.config["run_id"], plan_hash=self.config["plan_hash"])
+        self.sample_seq += 1
+        return {**request, "sender_identity": {"component": "node_agent", "node_id": self.node_id},
+                "event_id": uuid.uuid4().hex, "node_id": self.node_id,
+                "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
+                "agent_epoch": self.agent_epoch, "sample_seq": self.sample_seq,
+                "memory": node_memory(), "sampled_at": time.monotonic(),
+                # Configured pool size/RSS cannot establish a retained charge.
+                "retained_charges": []}
+
     def sample(self):
         record = {
             "time": time.time(),
@@ -336,13 +562,208 @@ class NodeMonitor:
         return record
 
 
+class NodeAgent:
+    """Lease-bound node control, independent of model actor execution.
+
+    The runtime must create this CPU actor with a run-unique detached lifetime
+    and exit_on_orphan=True. Its lease then outlives a lost driver, cleans only
+    registered identities, writes a node-local report, and exits its own actor.
+    """
+
+    def __init__(self, plan, node_id, fencing_token, *, exit_on_orphan=False, report_dir=None, sample_resources=False):
+        import re
+        import threading
+
+        from deepspec.orchestration.process import NodeLease
+
+        from .planning import TopologyPlan
+
+        self.plan = TopologyPlan.from_dict(plan).to_dict()
+        if node_id not in {n["node_id"] for n in plan["nodes"].values()} or not re.fullmatch(r"[A-Za-z0-9_-]+", node_id):
+            raise ValueError("NodeAgent must belong to a planned node")
+        self.node_id, self.fencing_token = node_id, fencing_token
+        self.agent_epoch, self.sample_seq = uuid.uuid4().hex, 0
+        self.boot_id = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+        self.output = Path(plan["config"]["output_dir"])
+        if report_dir is not None:
+            report_dir = Path(report_dir).resolve()
+            if not report_dir.is_relative_to(self.output.resolve()):
+                raise ValueError("Node reports must remain within their run directory")
+            self.output = report_dir
+        self.exit_on_orphan = exit_on_orphan
+        self._processes, self.known_owned = {}, set()
+        self._lock, self._cleanup_lock = threading.Lock(), threading.Lock()
+        self._stopped = threading.Event()
+        self.accepting, self.cleanup_result = True, None
+        self.lease = NodeLease(fencing_token, timeout=plan["timeouts_seconds"]["lease"], on_expire=self._expire)
+        self._watcher = threading.Thread(target=self._watch, name="deepspec-node-lease", daemon=True)
+        self.sampler = None
+        if sample_resources:
+            from .observation import ResourceSampler
+
+            self.sampler = ResourceSampler(plan, node_id, self.output)
+        self._watcher.start()
+
+    def _validate(self, request):
+        from .runtime import validate_message
+
+        validate_message(request, run_id=self.plan["run_id"], plan_hash=self.plan["plan_hash"])
+
+    def _reply(self, **payload):
+        from .runtime import message_envelope
+
+        return message_envelope(self.plan["run_id"], self.plan["plan_hash"],
+                                {"component": "node_agent", "node_id": self.node_id}, **payload)
+
+    def _watch(self):
+        interval = min(0.1, self.plan["timeouts_seconds"]["heartbeat"])
+        while not self._stopped.wait(interval):
+            if not self.lease.check():
+                return
+
+    def _expire(self):
+        self.cleanup(orphan=True)
+        if self.exit_on_orphan:
+            os._exit(1)
+
+    def heartbeat(self, request):
+        self._validate(request)
+        accepted = self.lease.heartbeat(request.get("fencing_token"), request.get("sequence"))
+        return self._reply(accepted=accepted, agent_epoch=self.agent_epoch, node_id=self.node_id)
+
+    def register_process(self, request):
+        from deepspec.orchestration.process import capture_process
+
+        self._validate(request)
+        identity = request["process"]
+        if request.get("fencing_token") != self.fencing_token or identity["pid"] == os.getpid():
+            raise ValueError("Invalid registration token or agent self-registration")
+        observed = capture_process(identity["pid"], self.plan["run_id"])
+        if observed["start_ticks"] != identity["start_ticks"] or identity["run_id"] != self.plan["run_id"]:
+            raise ValueError("Registered process PID/start-time or run marker differs")
+        report = request.get("supervisor_report_path")
+        if report and not Path(report).resolve().is_relative_to(self.output.resolve()):
+            raise ValueError("Supervisor report must belong to this run directory")
+        with self._lock:
+            if not self.accepting or not self.lease.is_active():
+                raise ValueError("Expired node cannot register new work")
+            key = (observed["pid"], observed["start_ticks"])
+            value = {**observed, "supervisor_report_path": report}
+            if key in self._processes and self._processes[key] != value:
+                raise ValueError("Conflicting registered process")
+            self._processes[key] = value
+            self.known_owned.add(key)
+        return self._reply(process=observed)
+
+    def sample_budget(self, request):
+        self._validate(request)
+        with self._lock:
+            if not self.accepting or not self.lease.is_active():
+                raise RuntimeError("Node admission is stopped")
+            self.sample_seq += 1
+            sequence = self.sample_seq
+        return {**request, "sender_identity": {"component": "node_agent", "node_id": self.node_id},
+                "event_id": uuid.uuid4().hex, "node_id": self.node_id, "boot_id": self.boot_id,
+                "agent_epoch": self.agent_epoch, "sample_seq": sequence,
+                "sampled_at": time.monotonic(), "memory": node_memory(), "retained_charges": []}
+
+    def check_allocated_devices(self, request):
+        self._validate(request)
+        selected = set(request["gpu_uuids"])
+        observed = gpu_processes(self.plan["run_id"], self.known_owned)
+        foreign = [p for p in observed if p["gpu_uuid"] in selected and not p["owned"]]
+        if foreign:
+            raise RuntimeError(f"Allocated devices contain external processes: {foreign}")
+        return self._reply(node_id=self.node_id, gpu_uuids=sorted(selected), external_processes=[])
+
+    def cleanup(self, *, orphan=False, timeout=None):
+        from deepspec.orchestration.process import signal_process
+
+        from .runtime import Deadline, atomic_json, bounded_lock
+
+        duration = self.plan["timeouts_seconds"]["cleanup"] if timeout is None else min(timeout, self.plan["timeouts_seconds"]["cleanup"])
+        deadline = Deadline.after(duration)
+        with bounded_lock(self._cleanup_lock, deadline):
+            if self.cleanup_result is not None:
+                return self.cleanup_result
+            with self._lock:
+                self.accepting = False
+                identities = list(self._processes.values())
+            with self.lease.lock:
+                self.lease.expired = True
+            self._stopped.set()
+            term_until = time.monotonic() + min(1, duration / 3)
+            supervisor_until = deadline.expires_at - min(0.1, duration / 10)
+            states = {}
+            while True:
+                for identity in identities:
+                    key = str(identity["pid"])+":"+str(identity["start_ticks"])
+                    # A supervisor must stay alive while it kills/reaps resistant
+                    # descendants and writes its identity-bound cleanup report.
+                    grace = supervisor_until if identity["supervisor_report_path"] else term_until
+                    states[key] = signal_process(identity, signal.SIGTERM if time.monotonic() < grace else signal.SIGKILL)
+                if all(state == "released" for state in states.values()) or time.monotonic() >= deadline.expires_at:
+                    break
+                time.sleep(min(0.05, max(0, deadline.expires_at-time.monotonic())))
+            errors = []
+            for identity in identities:
+                report_path = identity["supervisor_report_path"]
+                if report_path:
+                    try:
+                        report = json.loads(Path(report_path).read_text())
+                        if (report["run_id"] != self.plan["run_id"] or report.get("cleanup_complete") is not True
+                                or report.get("supervisor_pid") != identity["pid"]
+                                or report.get("supervisor_start_ticks") != identity["start_ticks"]):
+                            raise ValueError("Supervisor cleanup was not confirmed")
+                    except (OSError, ValueError, KeyError) as error:
+                        errors.append({"pid": identity["pid"], "error": str(error)})
+            report = self._reply(node_id=self.node_id, agent_epoch=self.agent_epoch, orphan=orphan,
+                      reason="lease_expired" if orphan else "requested_cleanup", processes=identities,
+                      release_states=states, errors=errors,
+                      cleanup_complete=all(s == "released" for s in states.values()) and not errors)
+            if self.sampler is not None:
+                try:
+                    self.sampler.stop(timeout=deadline.remaining())
+                except Exception as error:
+                    report["cleanup_complete"] = False
+                    report["errors"].append({"sampler": str(error)})
+            atomic_json(self.output / f"{'orphan' if orphan else 'cleanup'}-{self.node_id}.json", report)
+            self.cleanup_result = report
+            return report
+
+    def close(self):
+        from .runtime import Deadline
+
+        deadline = Deadline.after(self.plan["timeouts_seconds"]["cleanup"])
+        report = self.cleanup(timeout=deadline.remaining())
+        self._stopped.set()
+        self._watcher.join(timeout=deadline.remaining())
+        if self._watcher.is_alive():
+            raise TimeoutError("Node watchdog did not exit")
+        return report
+
+
 class StoreProbe:
     """Create/read probe tensors locally; only descriptors cross Ray."""
 
-    def __init__(self, store_config):
+    def __init__(self, store_config, *, identity_config=None, defer_store=False):
+        self.store_config, self.identity_config = store_config, identity_config
+        self.store = None
+        self.objects = {}
+        if not defer_store:
+            self.initialize()
+
+    def identity(self):
+        from .runtime import actor_identity
+
+        return actor_identity(self.identity_config)
+
+    def initialize(self):
         from .store import TensorStore
 
-        self.store = TensorStore(store_config)
+        if self.store is None:
+            self.store = TensorStore(self.store_config)
+        return {"ready": True}
 
     def write(self, prefix):
         import torch
@@ -360,6 +781,7 @@ class StoreProbe:
             ),
         }
         fields = describe_tensors(prefix, tensors)
+        self.objects[prefix] = fields
         self.store.put(fields, tensors)
         return fields
 
@@ -371,6 +793,7 @@ class StoreProbe:
         return {
             "nbytes": sum(t.numel() * t.element_size() for t in tensors.values()),
             "seconds": time.monotonic() - started,
+            "verified": self.store.verify_mode == "full",
         }
 
     def remove(self, fields):
@@ -379,365 +802,41 @@ class StoreProbe:
         self.store.remove(fields)
         if any(self.store.client.is_exist(key) != 0 for key in object_keys(fields)):
             raise RuntimeError("Probe objects were not deleted")
+        for prefix, pending in list(self.objects.items()):
+            if pending == fields:
+                del self.objects[prefix]
+        return {"confirmed_absent": True}
 
-    def close(self):
-        self.store.close()
+    def close(self, *, timeout=35):
+        from .runtime import Deadline
+
+        deadline = Deadline.after(timeout)
+        if self.store is not None:
+            for fields in list(self.objects.values()):
+                deadline.remaining()
+                self.remove(fields)
+            self.store.close(timeout=deadline.remaining())
+        return {"cleanup_complete": True}
 
 
 def launch_cluster(config, config_path):
-    import ray
-    from ray.util.placement_group import placement_group, remove_placement_group
-    from ray.util.scheduling_strategies import (
-        NodeAffinitySchedulingStrategy,
-        PlacementGroupSchedulingStrategy,
-    )
+    """Legacy callers share the versioned planner and native controller."""
+    from .legacy import run_config
 
-    from .actors import Consumer, Producer
-    from .buffer import FeatureBuffer
-    from .run import ROOT, environment, summarize_events, write_json
-    from .runtime import MooncakeMaster
-    from .schema import normalize_pipeline_config
-    from .store import free_port
+    return run_config(config)
 
-    normalize_pipeline_config(config)
-    output = Path(config["output_dir"])
-    common_env = {
-        **environment(config["model_path"]),
-        "DEEPSPEC_PIPELINE_RUN_ID": config["run_id"],
-    }
-    actors, groups, monitors, probes = [], [], [], []
-    master = buffer = producer = None
+
+if __name__ == "__main__":
+    from .runtime import PipelineError, atomic_json
+
+    if len(sys.argv) != 3 or sys.argv[1] != "--inspect-task":
+        raise SystemExit("Use deepspec.pipeline.cli preview --config FILE")
+    request = json.loads(Path(sys.argv[2]).read_text())
     try:
-        context = ray.init(
-            address=config["cluster_address"],
-            namespace=config["namespace"],
-            runtime_env={"env_vars": common_env},
-            log_to_driver=False,
-        )
-        nodes = select_nodes(
-            ray.nodes(),
-            config["producer_node"],
-            config["consumer_node"],
-            consumer_dp=consumer_dp(config),
-            producer_dp=producer_dp(config),
-        )
-        config["producer_node_id"], config["consumer_node_id"] = [
-            n["NodeID"] for n in nodes
-        ]
-        producer_indices = [0] * producer_dp(config)
-        config["producer_node_ids"] = [nodes[i]["NodeID"] for i in producer_indices]
-        config["producer_node_ips"] = [
-            nodes[i]["NodeManagerAddress"] for i in producer_indices
-        ]
-        consumer_indices = [1]
-        config["consumer_nodes"] = 1
-        config["role_separation"] = True
-        config["consumer_node_ids"] = [nodes[i]["NodeID"] for i in consumer_indices]
-        config["ray_address"] = context.address_info["gcs_address"]
-        config["store"]["per_node_hosts"] = True
-        envs = [
-            {**common_env, "DEEPSPEC_STORE_HOST": n["NodeManagerAddress"]}
-            for n in nodes
-        ]
-        affinities = [
-            NodeAffinitySchedulingStrategy(n["NodeID"], soft=False) for n in nodes
-        ]
-        write_json(config_path, config)
-        digest = hashlib.sha256(config_path.read_bytes()).hexdigest()
-        for role, env, affinity in zip(
-            ("producer", "consumer"), envs, affinities, strict=True
-        ):
-            monitor = (
-                ray.remote(NodeMonitor)
-                .options(
-                    num_cpus=1,
-                    num_gpus=0,
-                    max_restarts=0,
-                    runtime_env={"env_vars": env},
-                    scheduling_strategy=affinity,
-                )
-                .remote(config, role)
-            )
-            actors.append(monitor)
-            monitors.append(monitor)
-        facts = ray.get([m.inspect.remote(digest) for m in monitors], timeout=120)
-        local_versions, local_hashes = versions(), source_hashes(ROOT)
-        for fact in facts:
-            if (
-                fact["versions"] != local_versions
-                or fact["source_sha256"] != local_hashes
-            ):
-                raise RuntimeError(
-                    f"Dependency or source mismatch on {fact['hostname']}: {fact['versions']}"
-                )
-            if fact["python_version"] != sys.version:
-                raise RuntimeError(f"Python build mismatch on {fact['hostname']}")
-        config["store"]["hosts_by_hostname"] = {
-            fact["hostname"]: node["NodeManagerAddress"]
-            for fact, node in zip(facts, nodes, strict=True)
-        }
-        if len(config["store"]["hosts_by_hostname"]) != 2:
-            raise ValueError("The two nodes must have distinct hostnames")
-        config["node_memory_budgets"] = {
-            f["node_id"]: f["memory_budget"] for f in facts
-        }
-        config["consumer_hostnames"] = [facts[1]["hostname"]] * consumer_dp(config)
-        config.update(facts[1]["memory_budget"])
-        write_json(
-            output / "environment.json",
-            {"driver": socket.gethostname(), "nodes": facts},
-        )
-        write_json(config_path, config)
-        master = MooncakeMaster(
-            config["store"]["master"],
-            output / "mooncake-master.log",
-            metrics_port=free_port(),
-            ttl_seconds=300,
-            env=dict(
-                os.environ, **common_env, DEEPSPEC_ORCHESTRATOR_PID=str(os.getpid())
-            ),
-        ).start(timeout=30)
-        buffer = (
-            ray.remote(FeatureBuffer)
-            .options(
-                name=config["buffer_name"],
-                num_cpus=1,
-                num_gpus=0,
-                max_restarts=0,
-                runtime_env={"env_vars": envs[1]},
-                scheduling_strategy=affinities[1],
-            )
-            .remote(config, monitors)
-        )
-        actors.append(buffer)
-        pool = ray.get(buffer.summary.remote(), timeout=120)
-        if pool["store_endpoint"].rsplit(":", 1)[0] != nodes[1]["NodeManagerAddress"]:
-            raise RuntimeError("Feature pool did not advertise the consumer node")
-        for env, affinity in zip(envs, affinities, strict=True):
-            probe = (
-                ray.remote(StoreProbe)
-                .options(
-                    num_cpus=1,
-                    num_gpus=0,
-                    max_restarts=0,
-                    runtime_env={"env_vars": env},
-                    scheduling_strategy=affinity,
-                )
-                .remote(config["store"])
-            )
-            actors.append(probe)
-            probes.append(probe)
-        fields = ray.get(
-            probes[0].write.remote(f"{config['run_id']}/transport-probe"), timeout=120
-        )
-        probe_result = ray.get(probes[1].read.remote(fields), timeout=120)
-        ray.get(probes[1].remove.remote(fields), timeout=30)
-        probe_result.update(
-            producer_node_id=nodes[0]["NodeID"],
-            consumer_node_id=nodes[1]["NodeID"],
-            store_endpoint=pool["store_endpoint"],
-        )
-        write_json(output / "transport-probe.json", probe_result)
-        for probe in probes:
-            ray.get(probe.close.remote(), timeout=30)
-            ray.kill(probe, no_restart=True)
-            actors.remove(probe)
-        probes.clear()
-        if config["transport_only"]:
-            write_json(
-                output / "result.json",
-                {"transport_probe": probe_result, "models_started": False},
-            )
-            print(json.dumps(probe_result), flush=True)
-            return
-        # A node resource is required in every bundle; STRICT_PACK alone does
-        # not require the producer and consumer groups to occupy different nodes.
-        producer_bundles = [{"GPU": 1}] * 4 + [{"CPU": 1}]
-        consumer_bundles = [
-            {
-                "GPU": config["consumer_world_size"],
-                "CPU": 2 * config["consumer_world_size"],
-            }
-        ]
-        allocations = [] if producer_dp(config) > 1 else [(producer_bundles, nodes[0])]
-        allocations += [(consumer_bundles, nodes[i]) for i in consumer_indices]
-        for bundles, node in allocations:
-            resources = [
-                {**bundle, f"node:{node['NodeManagerAddress']}": 0.001}
-                for bundle in bundles
-            ]
-            group = placement_group(resources, strategy="STRICT_PACK")
-            groups.append(group)
-        ray.get([g.ready() for g in groups], timeout=120)
-        producer_env = {
-            **envs[0],
-            "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1",
-        }
-        if producer_dp(config) > 1:
-            # Native AsyncLLM creates its DP/TP groups from the remaining GPUs.
-            # Its frontend must not capture child tasks into a consumer group.
-            producer_strategy = affinities[0]
-            producer_env.update(
-                VLLM_RAY_DP_PLACEMENT_NODE_IPS=config["producer_node_ips"][0],
-                VLLM_RAY_DP_PACK_STRATEGY="strict",
-                VLLM_RAY_EXTRA_ENV_VARS_TO_COPY="DEEPSPEC_PIPELINE_RUN_ID,PYTHONPATH,LD_LIBRARY_PATH,OMP_NUM_THREADS,RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES",
-                LD_LIBRARY_PATH=os.environ.get("LD_LIBRARY_PATH", ""),
-                NCCL_IB_DISABLE="1",
-                NCCL_NET="Socket",
-                NCCL_SOCKET_IFNAME=f"={facts[0]['network_interface']}",
-                NCCL_SOCKET_FAMILY="AF_INET",
-                GLOO_SOCKET_IFNAME=facts[0]["network_interface"],
-            )
-            consumer_groups = groups
-        else:
-            producer_strategy = PlacementGroupSchedulingStrategy(
-                placement_group=groups[0],
-                placement_group_bundle_index=4,
-                placement_group_capture_child_tasks=True,
-            )
-            consumer_groups = groups[1:]
-        producer = (
-            ray.remote(Producer)
-            .options(
-                num_cpus=1,
-                num_gpus=0,
-                max_restarts=0,
-                runtime_env={"env_vars": producer_env},
-                scheduling_strategy=producer_strategy,
-            )
-            .remote(str(config_path))
-        )
-        actors.append(producer)
-        consumers = []
-        for node_rank, index in enumerate(consumer_indices):
-            env = dict(envs[index])
-            if consumer_dp(config) > 1:
-                interface = facts[index]["network_interface"]
-                env.update(
-                    NCCL_IB_DISABLE="1",
-                    NCCL_NET="Socket",
-                    NCCL_SOCKET_IFNAME=f"={interface}",
-                    NCCL_SOCKET_FAMILY="AF_INET",
-                    GLOO_SOCKET_IFNAME=interface,
-                    NCCL_DEBUG="INFO",
-                )
-            consumer = (
-                ray.remote(Consumer)
-                .options(
-                    num_cpus=2 * config["consumer_world_size"],
-                    num_gpus=config["consumer_world_size"],
-                    max_restarts=0,
-                    runtime_env={"env_vars": env},
-                    scheduling_strategy=PlacementGroupSchedulingStrategy(
-                        placement_group=consumer_groups[node_rank],
-                        placement_group_bundle_index=0,
-                    ),
-                )
-                .remote(str(config_path), node_rank)
-            )
-            actors.append(consumer)
-            consumers.append(consumer)
-        pending = {producer.run.remote(): "producer"}
-        pending.update(
-            {
-                consumer.run.remote(): "consumer"
-                if rank == 0
-                else f"consumer_node_{rank}"
-                for rank, consumer in enumerate(consumers)
-            }
-        )
-        results = {"transport_probe": probe_result}
-        deadline = time.monotonic() + config["timeout_seconds"]
-        while pending:
-            finished, _ = ray.wait(list(pending), timeout=5)
-            ray.get([m.sample.remote() for m in monitors], timeout=30)
-            for ref in finished:
-                role = pending.pop(ref)
-                results[role] = ray.get(ref)
-                print(f"{role} completed", flush=True)
-            if time.monotonic() >= deadline:
-                raise TimeoutError("Two-node pipeline timed out")
-        if consumer_dp(config) > 1:
-            ray.get(
-                buffer.event.remote(
-                    "consumer_finished",
-                    completed_updates=results["consumer"]["completed_updates"],
-                    completed_nodes=len(consumers),
-                )
-            )
-        results["buffer"] = ray.get(buffer.summary.remote(), timeout=30)
-        if results["buffer"]["remaining"] or results["buffer"]["released"] != len(
-            config["samples"]
-        ):
-            raise RuntimeError(
-                "Feature objects were not completely consumed and released"
-            )
-        results["events"] = summarize_events(Path(config["events_path"]), config)
-        from torchtitan.models.dspark_draft.checkpoint import read_commit
-
-        commit = read_commit(results["consumer"]["commit"]["checkpoint"])
-        if (
-            commit != results["consumer"]["commit"]
-            or commit["completed_updates"] != config["steps"]
-            or commit["next_global_microbatch"] != consumer_microbatches(config)
-            or results["consumer"]["consumed_microbatches"]
-            != consumer_microbatches(config)
-            or commit["run_id"] != config["run_id"]
-        ):
-            raise RuntimeError(
-                "Checkpoint does not match the completed two-node stream"
-            )
-        results["consumer"]["consumed_samples"] = len(config["samples"])
-        write_json(output / "result.json", results)
-        print(
-            json.dumps(
-                {
-                    "output_dir": str(output),
-                    "buffer": results["buffer"],
-                    "events": results["events"],
-                }
-            ),
-            flush=True,
-        )
-    except BaseException as error:
-        write_json(output / "failure.json", {"error": repr(error)})
-        if buffer is not None:
-            try:
-                ray.get(buffer.fail.remote(repr(error)), timeout=10)
-            except Exception:
-                logger.exception("Could not notify buffer of failure")
-        raise
-    finally:
-        if producer is not None:
-            try:
-                ray.get(producer.close.remote(), timeout=15)
-            except Exception:
-                logger.exception("Producer close did not finish before actor cleanup")
-        for actor in reversed(actors):
-            try:
-                if actor in monitors:
-                    ray.get(actor.cleanup.remote(), timeout=20)
-                if actor == buffer or actor in probes:
-                    ray.get(actor.close.remote(), timeout=10)
-            except Exception:
-                logger.exception("Store close did not finish before actor cleanup")
-            try:
-                ray.kill(actor, no_restart=True)
-            except Exception:
-                logger.exception("Could not stop a job-owned actor")
-        for group in groups:
-            remove_placement_group(group)
-        if producer_dp(config) > 1 and ray.is_initialized():
-            from ray.util.placement_group import get_placement_group
-
-            # Names resolve only in this run's unique namespace, including
-            # partially constructed native groups after engine startup failure.
-            for rank in range(producer_dp(config)):
-                try:
-                    group = get_placement_group(f"dp_rank_{rank}")
-                except ValueError:
-                    continue
-                remove_placement_group(group)
-        ray.shutdown()
-        if master is not None:
-            master.stop()
+        result = _inspect_task_nodes_worker(request["config"], request["run"])
+    except Exception as error:  # noqa: BLE001 -- subprocess boundary must report structured failures
+        wrapped = error if isinstance(error, PipelineError) else PipelineError(
+            "NODE_INSPECTION_FAILED", str(error), field_path="nodes", exit_code=4)
+        atomic_json(request["result_path"], {"error": wrapped.to_dict(), "exit_code": wrapped.exit_code})
+        raise SystemExit(wrapped.exit_code)
+    atomic_json(request["result_path"], {"nodes": result})

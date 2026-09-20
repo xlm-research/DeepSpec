@@ -1,5 +1,49 @@
 # DSpark 异步训练流水线
 
+## v3 计划与受控运行（2026-09-20）
+
+新入口支持 `preview/run/transport-check/status/cancel/verify`。下文旧入口的历史训练结果
+保留原有证据范围，不能作为 v3 controller 或 M2/M3 的验收结果。
+
+```bash
+source ./h800conda.sh
+"$PIPELINE_PYTHON" -m deepspec.pipeline.cli preview --config /absolute/task.json
+"$PIPELINE_PYTHON" -m deepspec.pipeline.cli transport-check --plan /absolute/run/plan.json
+"$PIPELINE_PYTHON" -m deepspec.pipeline.cli run --plan /absolute/run/plan.json
+"$PIPELINE_PYTHON" -m deepspec.pipeline.cli status --run-dir /absolute/run
+"$PIPELINE_PYTHON" -m deepspec.pipeline.cli status --run-dir /absolute/run --json
+"$PIPELINE_PYTHON" -m deepspec.pipeline.cli cancel --run-dir /absolute/run
+"$PIPELINE_PYTHON" -m deepspec.pipeline.cli verify --run-dir /absolute/run
+```
+
+配置示例见 `specs/001-unify-ray-topology/contracts/`，示例中的变量须替换为实际值。
+每次 preview 使用不存在的输出目录；run 不复用已执行的计划。输入文件、兼容配置、
+环境文件均被计划摘要绑定，运行前再次核对节点、源码、依赖、模型与原始输入身份。
+生成的 `pipeline.runtime.json` 只补充本次服务 endpoint、actor 名称等运行信息。
+
+CPU verifier 的工作集从模型 safetensors 元数据保守估计，执行前检查节点额度及
+64 GiB 余量；模型进程与 GPU placement groups 完成释放后，在计划指定节点的一核
+CPU actor 内加载完整原生 DCP，CUDA 可见设备为空。核验内存不够即拒绝；不会申请
+额外 GPU。`verify` 另写 `verification.json`，不会将 failed/cancelled 的 status 改成成功。
+
+`status` 为只读视图，分别列出 produced、complete_reads、逐 rank optimizer updates
+和 checkpoint committed ranks。比如 48 次完整读取而 committed ranks 为空，表示
+源数据读完但尚无全员训练提交。preview_complete 尚未启动，不要求 lease；运行中
+controller lease 过期时视图显示 failed，并保留原 controller_state，清理缺证据仍为
+unknown。预算等待按原因和本地单调时钟时长记录，缺失测量保留为 null。
+
+取消在处理/清理期限内结束，终态保持 cancelled；独立资源观测或对象删除仍有 unknown
+时不能 succeeded。成功须同时具备全计划样本、全部 rank 更新及 commit、CPU DCP
+核验、源对象释放、实际落点与所有已登记资源的回收证据。指标不跨节点相减时间戳。
+
+退出码：0 命令执行成功（status 的 0 不代表任务成功），2 配置/身份错误，3 运行或
+核验失败，4 资源不足/节点不可达，130 主动取消。当前完整验收范围以
+`specs/001-unify-ray-topology/acceptance-report.md` 和 append-only results.json 为准。
+
+旧 `deepspec.pipeline.run` 和 `cluster.launch_cluster` 已转接同一 v3 planning/controller，旧脚本仍传递显式参数和 `PIPELINE_PYTHON`。生产 DP2、训练 DP1 不再被入口耦合限制。TCP 配置中的 `rdma_devices` 原样保留，不因此切换协议。历史 `retain_for_peak` 保留对象压力模式目前由 v3 迁移明确拒绝，不能当作已兼容。
+
+## 历史入口与训练记录（以下为改造前记录）
+
 本目录增量接入现有 vLLM 特征提取与 TorchTitan DSpark 训练。
 Ray 负责资源、轻量元数据、就绪与背压；隐藏层张量通过 Mooncake Store 传输。
 参考实现的 commit、关键函数和接入边界见 [源码核实记录](REFERENCES.md)。

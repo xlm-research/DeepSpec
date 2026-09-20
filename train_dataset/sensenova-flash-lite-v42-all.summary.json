@@ -1,0 +1,43 @@
+{
+  "input": "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/train_dataset/input_v42.txt",
+  "text_output": "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/train_dataset/sensenova-flash-lite-v42-all.jsonl",
+  "multimodal_output": "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/train_dataset/sensenova-flash-lite-v42-multimodal-all.jsonl",
+  "source_specs": "/mnt/afs_agents/hongjiawei/code/DeepSpec_basemain/train_dataset/sensenova-flash-lite-v42-all.source_specs.tsv",
+  "num_specs": 900,
+  "declared_sum_ignored_for_full_conversion": 2155265,
+  "totals": {
+    "raw_lines": 12449684,
+    "text_rows": 2050980,
+    "multimodal_rows": 10398704
+  },
+  "multimodal_reason_counts": {
+    "marker:data:image": 27628,
+    "marker:s3://": 2014,
+    "marker:image_url": 43255,
+    "marker:oss://": 88,
+    "marker:<image>": 42,
+    "marker:audio_url": 33,
+    "marker:video_url": 351,
+    "field:images": 10325293
+  },
+  "section_stats": {
+    "=== flashlitev42_meta.json ===": {
+      "raw_lines": 1563883,
+      "text_rows": 1504758,
+      "multimodal_rows": 59125
+    },
+    "=== ppt_recover_swift_meta.json ===": {
+      "raw_lines": 266050,
+      "multimodal_rows": 235979,
+      "text_rows": 30071
+    },
+    "=== dataanalyse_swiftmeta.json ===": {
+      "raw_lines": 10619751,
+      "text_rows": 516151,
+      "multimodal_rows": 10103600
+    }
+  },
+  "elapsed_seconds": 5024.947,
+  "text_output_bytes": 151763687511,
+  "multimodal_output_bytes": 107310762413
+}

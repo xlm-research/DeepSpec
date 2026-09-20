@@ -1,22 +1,18 @@
 """Single-node 4+4 real-model pilot; run with the user's existing Python env."""
 
 import argparse
-import hashlib
-import importlib.metadata
 import json
 import logging
 import os
 import socket
 import subprocess
 import sys
-import tempfile
 import time
 import uuid
 from collections import Counter
 from pathlib import Path
 
 from .memory import GIB, feature_budget
-from .store import free_port
 from .topology import (
     consumer_dp,
     consumer_nodes,
@@ -33,7 +29,7 @@ def write_json(path, data):
     Path(path).write_text(json.dumps(data, indent=2) + "\n")
 
 
-def environment(model_path):
+def environment(model_path, *, inference_tp=4):
     return {
         "PYTHONPATH": ":".join(map(str, (ROOT, ROOT / "torchtitan", ROOT / "vllm"))),
         "TARGET_MODEL_PATH": model_path,
@@ -41,14 +37,15 @@ def environment(model_path):
         "TOKENIZERS_PARALLELISM": "false",
         "VLLM_USE_V2_MODEL_RUNNER": "0",
         "VLLM_USE_RAY_V2_EXECUTOR_BACKEND": "1",
-        "VLLM_RAY_BUNDLE_INDICES": "0,1,2,3",
+        "VLLM_RAY_BUNDLE_INDICES": ",".join(map(str, range(inference_tp))),
     }
 
 
-def prepare(config, config_path):
+def prepare(config, config_path, *, timeout_seconds=None, validate_legacy_buffer=True):
     import torch
 
     from deepspec.trainer.qwen3_8_vllm import teacher_identity
+
     from .schema import normalize_pipeline_config
 
     normalize_pipeline_config(config)
@@ -84,6 +81,7 @@ def prepare(config, config_path):
             stdout=log,
             stderr=subprocess.STDOUT,
             check=True,
+            timeout=timeout_seconds,
         )
     plan_path = output / "inputs" / "input-plan.json"
     plan = json.loads(plan_path.read_text())
@@ -158,7 +156,13 @@ def prepare(config, config_path):
             )
     from .buffer import BufferLedger
 
-    BufferLedger(
+    if validate_legacy_buffer:
+        _validate_prepared_legacy_buffer(config, BufferLedger)
+    write_json(config_path, config)
+
+
+def _validate_prepared_legacy_buffer(config, ledger_type):
+    ledger_type(
         config["samples"],
         capacity=config["capacity_bytes"],
         window=config["window"],
@@ -169,7 +173,6 @@ def prepare(config, config_path):
         ],
         producer_dp=producer_dp(config),
     )
-    write_json(config_path, config)
 
 
 def require_idle_gpus():
@@ -424,220 +427,13 @@ def summarize_events(events, config):
 
 
 def launch(config, config_path):
-    from .schema import normalize_pipeline_config
+    """Compatibility API using the same frozen planning/controller entry."""
+    from .legacy import run_config
 
-    normalize_pipeline_config(config)
-    if config.get("cluster_address"):
-        from .cluster import launch_cluster
-
-        return launch_cluster(config, config_path)
-    import ray
-    from ray.util.placement_group import placement_group, remove_placement_group
-    from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
-
-    from .actors import Consumer, Producer
-    from .buffer import FeatureBuffer
-    from .runtime import MooncakeMaster
-
-    output = Path(config["output_dir"])
-    write_json(
-        output / "environment.json",
-        {
-            "hostname": socket.gethostname(),
-            "python": sys.executable,
-            "versions": {
-                p: importlib.metadata.version(p)
-                for p in ("torch", "vllm", "ray", "mooncake-transfer-engine")
-            },
-            "gpu_inventory": require_idle_gpus(),
-            "source_sha256": {
-                str(path.relative_to(ROOT)): hashlib.sha256(
-                    path.read_bytes()
-                ).hexdigest()
-                for path in [
-                    *sorted((ROOT / "deepspec/pipeline").glob("*.py")),
-                    ROOT / "torchtitan/torchtitan/trainer.py",
-                    ROOT / "torchtitan/torchtitan/models/dspark_draft/data.py",
-                ]
-            },
-        },
-    )
-    master = MooncakeMaster(
-        config["store"]["master"],
-        output / "mooncake-master.log",
-        metrics_port=free_port(),
-        ttl_seconds=300,
-        env=dict(
-            os.environ,
-            **environment(config["model_path"]),
-            DEEPSPEC_ORCHESTRATOR_PID=str(os.getpid()),
-        ),
-    ).start(timeout=30)
-    actors, groups = [], []
-    buffer = producer = None
-    try:
-        os.environ.update(environment(config["model_path"]))
-        context = ray.init(
-            address="local",
-            num_gpus=8,
-            num_cpus=24,
-            namespace=config["namespace"],
-            include_dashboard=False,
-            object_store_memory=128 * 1024**2,
-            log_to_driver=False,
-            _temp_dir=tempfile.mkdtemp(prefix="dspark-ray-", dir="/tmp"),
-        )
-        config["ray_address"] = context.address_info["gcs_address"]
-        config["ray_logs"] = context.address_info["session_dir"] + "/logs"
-        write_json(config_path, config)
-        # Spawned vLLM EngineCore processes must reconnect to this private Ray,
-        # whose custom temp directory is not discovered by a default ray.init().
-        common_env = {
-            **environment(config["model_path"]),
-            "RAY_ADDRESS": config["ray_address"],
-            "DEEPSPEC_PIPELINE_RUN_ID": config["run_id"],
-            "VLLM_RAY_EXTRA_ENV_VARS_TO_COPY": ",".join(
-                filter(
-                    None,
-                    [
-                        os.environ.get("VLLM_RAY_EXTRA_ENV_VARS_TO_COPY", ""),
-                        "DEEPSPEC_PIPELINE_RUN_ID,PYTHONPATH,LD_LIBRARY_PATH,OMP_NUM_THREADS,RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES",
-                    ],
-                )
-            ),
-        }
-        buffer = (
-            ray.remote(FeatureBuffer)
-            .options(
-                name=config["buffer_name"],
-                num_cpus=1,
-                num_gpus=0,
-                max_restarts=0,
-                runtime_env={"env_vars": common_env},
-            )
-            .remote(config)
-        )
-        actors.append(buffer)
-        ray.get(buffer.summary.remote(), timeout=60)
-        # Four one-GPU worker bundles plus a CPU-only frontend. vLLM creates
-        # the actual GPU actors itself in these bundles (no double reservation).
-        producer_group = placement_group(
-            [{"GPU": 1}] * 4 + [{"CPU": 1}], strategy="STRICT_PACK"
-        )
-        groups.append(producer_group)
-        ray.get(producer_group.ready(), timeout=60)
-        consumer_group = placement_group([{"GPU": 4, "CPU": 8}], strategy="STRICT_PACK")
-        groups.append(consumer_group)
-        ray.get(consumer_group.ready(), timeout=60)
-        producer = (
-            ray.remote(Producer)
-            .options(
-                num_cpus=1,
-                num_gpus=0,
-                max_restarts=0,
-                runtime_env={
-                    "env_vars": {
-                        **common_env,
-                        "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1",
-                    }
-                },
-                scheduling_strategy=PlacementGroupSchedulingStrategy(
-                    placement_group=producer_group,
-                    placement_group_bundle_index=4,
-                    placement_group_capture_child_tasks=True,
-                ),
-            )
-            .remote(str(config_path))
-        )
-        actors.append(producer)
-        consumer = (
-            ray.remote(Consumer)
-            .options(
-                num_cpus=8,
-                num_gpus=4,
-                max_restarts=0,
-                runtime_env={"env_vars": common_env},
-                scheduling_strategy=PlacementGroupSchedulingStrategy(
-                    placement_group=consumer_group, placement_group_bundle_index=0
-                ),
-            )
-            .remote(str(config_path))
-        )
-        actors.append(consumer)
-        pending = {producer.run.remote(): "producer", consumer.run.remote(): "consumer"}
-        results = {}
-        known_gpu_processes = set()
-        deadline = time.monotonic() + config["timeout_seconds"]
-        while pending:
-            finished, _ = ray.wait(list(pending), timeout=5)
-            check_gpu_ownership(output, config["run_id"], known_gpu_processes)
-            for ref in finished:
-                role = pending.pop(ref)
-                results[role] = ray.get(ref)
-                print(f"{role} completed", flush=True)
-            if time.monotonic() > deadline:
-                raise TimeoutError("Pipeline run timed out")
-        results["buffer"] = ray.get(buffer.summary.remote())
-        if results["buffer"]["remaining"] or results["buffer"]["released"] != len(
-            config["samples"]
-        ):
-            raise RuntimeError("The pipeline did not drain every feature object")
-        results["events"] = summarize_events(Path(config["events_path"]), config)
-        from torchtitan.models.dspark_draft.checkpoint import read_commit
-
-        commit = read_commit(results["consumer"]["commit"]["checkpoint"])
-        if (
-            commit != results["consumer"]["commit"]
-            or commit["completed_updates"] != config["steps"]
-            or commit["next_global_microbatch"] != len(config["samples"])
-            or commit["run_id"] != config["run_id"]
-        ):
-            raise RuntimeError(
-                "Persisted checkpoint does not match the completed stream"
-            )
-        write_json(output / "result.json", results)
-        print(
-            json.dumps(
-                {
-                    "output_dir": str(output),
-                    "buffer": results["buffer"],
-                    "events": results["events"],
-                }
-            ),
-            flush=True,
-        )
-    except BaseException as error:
-        write_json(output / "failure.json", {"error": repr(error)})
-        if buffer is not None:
-            try:
-                ray.get(buffer.fail.remote(repr(error)), timeout=10)
-            except Exception:
-                logger.exception("Could not report failure to buffer")
-        raise
-    finally:
-        if producer is not None:
-            try:
-                ray.get(producer.close.remote(), timeout=15)
-            except Exception:
-                logger.exception(
-                    "Producer shutdown did not complete before actor cleanup"
-                )
-        # Killing the consumer launcher triggers its existing subreaper to stop
-        # its torchrun descendants. Never stop unrelated jobs or Ray clusters.
-        for actor in reversed(actors):
-            if actor == buffer:
-                try:
-                    ray.get(buffer.close.remote(), timeout=10)
-                except Exception:
-                    logger.exception("Buffer close failed during cleanup")
-            ray.kill(actor, no_restart=True)
-        for group in groups:
-            remove_placement_group(group)
-        ray.shutdown()
-        master.stop()
+    return run_config(config)
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--model", default="/mnt/afs_agents/hongjiawei/share_models/Qwen/Qwen3.8-27B"
@@ -670,7 +466,7 @@ def main():
         type=int,
         choices=(1, 2),
         default=1,
-        help="DP2 uses native AsyncLLM DP2/TP4 with consumer DP2 (16 GPUs)",
+        help="Native inference DP, independent of consumer DP",
     )
     parser.add_argument(
         "--consumer-dp",
@@ -684,42 +480,29 @@ def main():
         action="store_true",
         help="Check cross-node Store without loading GPU models",
     )
-    args = parser.parse_args()
-    if min(args.producer_batch_size, args.epochs, args.prefetch_depth) < 1 or (
-        args.writer_inflight is not None and args.writer_inflight < 1
-    ) or (args.prefetch_bytes is not None and args.prefetch_bytes < 1):
-        parser.error("Batch size, epochs, prefetch depth and byte limits must be positive")
+    args = parser.parse_args(argv)
+    if (
+        min(args.producer_batch_size, args.epochs, args.prefetch_depth) < 1
+        or (args.writer_inflight is not None and args.writer_inflight < 1)
+        or (args.prefetch_bytes is not None and args.prefetch_bytes < 1)
+    ):
+        parser.error(
+            "Batch size, epochs, prefetch depth and byte limits must be positive"
+        )
     if not 0 < args.pool_utilization <= 0.99:
         parser.error("Pool utilization must be in (0, 0.99]")
     if args.retain_for_peak and args.pool_utilization < 0.95:
         parser.error("Peak mode requires --pool-utilization >= 0.95")
-    if args.ray_address and (
-        args.producer_batch_size != 1
-        or args.writer_inflight
-        or args.retain_for_peak
-        or args.pool_utilization != 0.75
-    ):
-        parser.error(
-            "Batch/peak tuning currently requires the single-node debug launcher"
-        )
-    if args.producer_dp > 1 and (not args.ray_address or args.consumer_dp != 2):
-        parser.error("--producer-dp 2 requires --ray-address and --consumer-dp 2")
-    if args.ray_address:
-        if not args.producer_node or not args.consumer_node:
-            parser.error("--ray-address requires --producer-node and --consumer-node")
-        if args.producer_node == args.consumer_node:
-            parser.error(
-                "The two-node pipeline requires distinct producer and consumer nodes"
-            )
-    elif (
+    if args.ray_address and (not args.producer_node or not args.consumer_node):
+        parser.error("--ray-address requires --producer-node and --consumer-node")
+    if not args.ray_address and (
         args.producer_node
         or args.consumer_node
-        or args.transport_only
         or args.consumer_dp != 1
+        or args.producer_dp != 1
     ):
-        parser.error("Node selection and --transport-only require --ray-address")
+        parser.error("Separate role nodes require --ray-address and explicit selectors")
     output = Path(args.output).resolve()
-    output.mkdir(parents=True, exist_ok=False)
     run_id = f"dspark-{uuid.uuid4().hex[:12]}"
     host = socket.gethostbyname(socket.gethostname())
     config = {
@@ -752,7 +535,7 @@ def main():
         "events_path": str(output / "events.jsonl"),
         "store": {
             "host": host,
-            "master": f"{host}:{free_port()}",
+            "master": {"mode": "owned"},
             "protocol": args.protocol,
             "rdma_devices": args.rdma_devices,
         },
@@ -761,13 +544,27 @@ def main():
         "consumer_node": args.consumer_node,
         "transport_only": args.transport_only,
     }
-    path = output / "pipeline.json"
-    write_json(path, config)
-    prepare(config, path)
-    print(f"Prepared {len(config['samples'])} samples in {output}", flush=True)
-    if not args.prepare_only:
-        launch(config, path)
+    from .legacy import run_config
+    from .runtime import PipelineError
+
+    try:
+        result = run_config(
+            config, prepare_only=args.prepare_only, transport_only=args.transport_only
+        )
+    except PipelineError as error:
+        print(json.dumps(error.to_dict()), file=sys.stderr)
+        return error.exit_code
+    print(json.dumps(result))
+    return (
+        0
+        if args.prepare_only
+        or result.get("state") == "succeeded"
+        or result.get("status") == "passed"
+        else 130
+        if result.get("state") == "cancelled"
+        else 3
+    )
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

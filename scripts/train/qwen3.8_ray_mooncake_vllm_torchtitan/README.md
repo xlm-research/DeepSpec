@@ -1,5 +1,7 @@
 # Qwen3.8：Ray + Mooncake + vLLM + TorchTitan
 
+> 2026-09-20：`train.sh`、`train_multinode.sh`、`ray_mutilnode_train.sh train` 仍转入 `deepspec.pipeline.run`，该 Python 入口现统一执行 v3 preview/controller。先 `source ./h800conda.sh` 使用现有 `PIPELINE_PYTHON`；当前验证与六命令用法见 [流水线说明](../../../deepspec/pipeline/README.md) 和 [验收报告](../../../specs/001-unify-ray-topology/acceptance-report.md)。下文旧地址、训练结果和峰值压力模式属于历史记录；`retain_for_peak` 模式目前迁移时明确拒绝，勿将旧成功视为新入口验收。外部 Ray 由脚本管理，controller 仅回收本次登记资源。
+
 实际操作请先读 [训练操作指南](TRAINING_GUIDE.md)：按顺序说明何时启动 Ray、何时自动启动 Mooncake，
 以及 A/B 两台机器分别执行的命令、全十六卡参数、日志和退出方式。
 
@@ -337,8 +339,9 @@ DRY_RUN=true bash scripts/train/qwen3.8_ray_mooncake_vllm_torchtitan/export_hf.s
 
 导出后由 `Qwen3_8DSparkModel.from_pretrained()` 加载该 HF 目录，或将其配置为 vLLM
 DSpark 的 `speculative_config.model`。当前 vLLM 分支的 DSpark 推理需要
-`VLLM_USE_V2_MODEL_RUNNER=1`。导出脚本已检查语法、dry-run 和 `--help`；本次没有执行
-`step-3` 的实际导出及 vLLM 推理验证。
+`VLLM_USE_V2_MODEL_RUNNER=1`。用户已完成 `step-3` 导出；加载测试发现并修复了 vLLM
+将 Qwen DSpark 误判为 MTP 的兼容问题。GPU 4–7、TP4、BF16 下模型加载及 warmup
+已通过；参数抽查和短生成尚未完成。修复与证据见 [加载验证](VLLM_LOAD.md)。
 
 具体实现和验证范围见 [流水线说明](../../../deepspec/pipeline/README.md)
 与 [4+4 验收记录](../../../deepspec/pipeline/VALIDATION.md)。

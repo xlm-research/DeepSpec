@@ -10,12 +10,18 @@ import torch.distributed as dist
 from torchtitan.models.dspark_draft.data import FeatureLoader
 
 from .prefetch import FeaturePrefetch
+from .runtime import component_deadline, get_with_deadline
 from .schema import normalize_pipeline_config
 from .store import FIELDS, TensorStore
 from .topology import consumer_dp
 
 
 class MooncakeFeatureLoader(FeatureLoader):
+    def _get(self, ref, *, timeout=None):
+        return get_with_deadline(
+            ref, self.pipeline, deadline=self.run_deadline, timeout=timeout
+        )
+
     @dataclass(kw_only=True, slots=True)
     class Config(FeatureLoader.Config):
         pipeline_config: str = ""
@@ -25,6 +31,7 @@ class MooncakeFeatureLoader(FeatureLoader):
 
         self.pipeline = json.loads(Path(config.pipeline_config).read_text())
         normalize_pipeline_config(self.pipeline)
+        self.run_deadline = component_deadline(self.pipeline)
         dp = consumer_dp(self.pipeline)
         tp = self.pipeline["consumer_world_size"] // dp
         if (
@@ -80,7 +87,7 @@ class MooncakeFeatureLoader(FeatureLoader):
             )
 
     def _transfer_event(self, event, **fields):
-        ray.get(self.buffer.event.remote(event, reader=self.reader, **fields))
+        self._get(self.buffer.event.remote(event, reader=self.reader, **fields))
 
     def _fill_prefetch(self):
         if self.prefetch is not None:
@@ -88,6 +95,8 @@ class MooncakeFeatureLoader(FeatureLoader):
                 if len(self.prefetch.pending) >= self.prefetch.depth:
                     break
                 if position not in self.prefetch.pending:
+                    if not self.prefetch.can_submit(descriptor):
+                        break
                     self.prefetch.submit(descriptor)
 
     def take_features(self, descriptor, device):
@@ -104,7 +113,7 @@ class MooncakeFeatureLoader(FeatureLoader):
 
     def read_entry(self, entry):
         expected = self.expected_samples[entry["id"]]
-        descriptor = ray.get(
+        descriptor = self._get(
             self.buffer.claim.remote(expected["position"], self.reader)
         )
         for key in ("position", "sample_id", "input_identity", "length"):

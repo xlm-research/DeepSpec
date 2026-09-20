@@ -319,6 +319,21 @@ def training_command(args, output, context):
 
 
 def verify_training(directory):
+    if (directory / "plan.json").exists():
+        from deepspec.pipeline.execution import verify_run
+
+        status = read(directory / "status.json")
+        require(
+            status["state"] == "succeeded" and status.get("cleanup_complete") is True,
+            "Unified run did not succeed with confirmed cleanup",
+        )
+        report = verify_run(directory)
+        require(
+            report.get("verified") is True and report.get("independent") is True,
+            "Independent v3 verification failed",
+        )
+        return report
+
     import torch
     import torch.distributed.checkpoint as dcp
 

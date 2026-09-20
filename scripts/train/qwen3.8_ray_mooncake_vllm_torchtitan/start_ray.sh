@@ -20,7 +20,7 @@ Environment:
   PIPELINE_RAY_BLOCK          true keeps either role in foreground (default: false)
   DRY_RUN                    true prints the command without starting Ray
 
-Python is fixed at /tmp/deepspec_vllm_torchtitan_envs/bin/python.
+PIPELINE_PYTHON overrides /tmp/deepspec_vllm_torchtitan_envs/bin/python.
 Ray's object store is separate from the Mooncake feature pool on node B.
 EOF
 }
@@ -41,7 +41,7 @@ done
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd -- "${SCRIPT_DIR}/../../.." && pwd)
-PIPELINE_PYTHON=/tmp/deepspec_vllm_torchtitan_envs/bin/python
+PIPELINE_PYTHON=${PIPELINE_PYTHON:-/tmp/deepspec_vllm_torchtitan_envs/bin/python}
 cd "${REPO_ROOT}"
 export PYTHONPATH="${REPO_ROOT}:${REPO_ROOT}/torchtitan:${REPO_ROOT}/vllm"
 

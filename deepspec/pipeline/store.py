@@ -121,6 +121,10 @@ class TensorStore:
         self._registered_buffers = {}
         self._last_write_lock = threading.Lock()
         self._closed = False
+        self._close_lock = threading.Lock()
+        self._close_finished = threading.Event()
+        self._close_thread = None
+        self._close_error = None
         self.last_write = None
         self.last_read = None
         self.verify_mode = self.store_config.get("verify_mode", "full")
@@ -164,7 +168,9 @@ class TensorStore:
         self.config.nof_replica_num = 0
         host = self.store_config["host"]
         if self.store_config.get("per_node_hosts"):
-            host = self.store_config.get("hosts_by_hostname", {}).get(socket.gethostname())
+            host = self.store_config.get("hosts_by_hostname", {}).get(
+                socket.gethostname()
+            )
             if host is None:
                 host = os.environ["DEEPSPEC_STORE_HOST"]
         status = self.client.setup(
@@ -290,7 +296,9 @@ class TensorStore:
             raise RuntimeError("Mooncake tensor store is closed")
         keys, pointers, sizes = list(keys), list(pointers), list(sizes)
         if not keys or len(keys) != len(pointers) or len(keys) != len(sizes):
-            raise ValueError("Registered Mooncake put lists must have equal non-zero length")
+            raise ValueError(
+                "Registered Mooncake put lists must have equal non-zero length"
+            )
         method = getattr(self.client, "batch_put_from_multi_buffers", None)
         if not callable(method):
             raise RuntimeError(  # noqa: TRY004 -- a missing native capability is a runtime failure
@@ -338,6 +346,10 @@ class TensorStore:
             if not isinstance(tensor, torch.Tensor):
                 raise TypeError(f"Mooncake value {name} is not a tensor")
             nbytes = int(tensor.numel() * tensor.element_size())
+            if fields[name]["shape"] != list(tensor.shape) or fields[name][
+                "dtype"
+            ] != str(tensor.dtype).removeprefix("torch."):
+                raise ValueError(f"Tensor shape/dtype differs from descriptor: {name}")
             self._validate_chunks(name, fields[name], nbytes)
             for chunk in fields[name]["chunks"]:
                 keys.append(chunk["key"])
@@ -401,7 +413,9 @@ class TensorStore:
         started = time.monotonic()
         names, keys, offsets, sizes, _total = self._plan_put(fields, tensors)
         source_tensors = [tensors[name] for name in names]
-        if any(not tensor.is_contiguous() or tensor.is_cuda for tensor in source_tensors):
+        if any(
+            not tensor.is_contiguous() or tensor.is_cuda for tensor in source_tensors
+        ):
             raise ValueError("Synchronous Mooncake puts require contiguous CPU tensors")
         pointers = [tensors[name].data_ptr() + offset for name, offset in offsets]
         transfer_started = time.monotonic()
@@ -452,6 +466,8 @@ class TensorStore:
             raise RuntimeError("Mooncake tensor store is closed")
         started = time.monotonic()
         names, keys, offsets, sizes, total = self._plan_put(fields, tensors)
+        if self.host_buffer_size and total > self.host_buffer_size:
+            raise ValueError("Feature exceeds the planned writer staging byte bound")
         pool, manager = self._ensure_async_put()
         buffer = pool.acquire(max(total, self.host_buffer_size), timeout=timeout)
         try:
@@ -516,7 +532,9 @@ class TensorStore:
             try:
                 results = self.client.batch_get_into(keys, pointers, sizes)
                 if list(results) != sizes:
-                    raise RuntimeError(f"Mooncake get returned {results}, expected {sizes}")
+                    raise RuntimeError(
+                        f"Mooncake get returned {results}, expected {sizes}"
+                    )
             except Exception:
                 self.quarantined.extend(buffers)
                 raise
@@ -571,6 +589,8 @@ class TensorStore:
             raise RuntimeError(
                 f"Mooncake existence query returned {len(result)} results for {len(keys)} keys"
             )
+        if any(value not in (0, 1, False, True) for value in result):
+            raise RuntimeError(f"Mooncake existence query failed: {result}")
         return {key: value == 1 or value is True for key, value in zip(keys, result)}
 
     def exists(self, key):
@@ -626,9 +646,43 @@ class TensorStore:
     def remove(self, fields):
         if self._closed:
             raise RuntimeError("Mooncake tensor store is closed")
-        self._remove_keys(object_keys(fields))
+        keys = object_keys(fields)
+        self._remove_keys(keys)
+        if any(self.batch_exists(keys).values()):
+            raise RuntimeError("Mooncake objects are still visible after removal")
 
-    def close(self):
+    def close(self, *, timeout=35):
+        """Bound the caller's wait while retaining native buffers until completion.
+
+        A timeout is not cleanup success. The actor/process supervisor must then
+        stop this client's owning process; no Python cancellation can stop C++.
+        """
+        from .runtime import Deadline, bounded_lock
+
+        deadline = Deadline.after(timeout)
+        with bounded_lock(self._close_lock, deadline):
+            if self._close_thread is None:
+
+                def close_native():
+                    try:
+                        self._close_blocking()
+                    except BaseException as error:  # noqa: BLE001 -- deliver native cleanup failure to the waiting caller
+                        self._close_error = error
+                    finally:
+                        self._close_finished.set()
+
+                self._close_thread = threading.Thread(
+                    target=close_native, name="deepspec-store-close", daemon=True
+                )
+                self._close_thread.start()
+        if not self._close_finished.wait(deadline.remaining()):
+            raise TimeoutError(
+                "Mooncake close exceeded cleanup deadline; native buffers remain owned"
+            )
+        if self._close_error is not None:
+            raise self._close_error
+
+    def _close_blocking(self):
         if self._closed:
             return
         self._closed = True
@@ -648,12 +702,11 @@ class TensorStore:
         if self._get_executor is not None:
             self._get_executor.shutdown(wait=True, cancel_futures=False)
             self._get_executor = None
-        try:
-            with self._io_lock:
-                status = self.client.close()
-            if status not in (None, 0):
-                error = error or RuntimeError(f"Mooncake close failed: {status}")
-        finally:
+        with self._io_lock:
+            status = self.client.close()
+        if status not in (None, 0):
+            error = error or RuntimeError(f"Mooncake close failed: {status}")
+        if error is None:
             self.quarantined.clear()
             self._registered_buffers.clear()
         if error is not None:

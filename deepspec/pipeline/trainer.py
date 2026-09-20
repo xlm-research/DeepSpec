@@ -1,10 +1,10 @@
 """Materialize DSpark features at Titan's existing microbatch boundary."""
 
+import math
 import socket
 import time
 from dataclasses import dataclass
 
-import ray
 import torch
 import torch.distributed as dist
 from torchtitan.models.dspark_draft.trainer import DSparkTrainer
@@ -14,29 +14,43 @@ from .topology import consumer_dp
 
 
 class StreamingDSparkTrainer(DSparkTrainer):
+    def _get(self, ref, *, timeout=None):
+        return self.dataloader._get(ref, timeout=timeout)
+
     @dataclass(kw_only=True, slots=True)
     class Config(DSparkTrainer.Config):
         pass
 
     def __init__(self, config):
-        super().__init__(config)
-        self.active_position = None
-        if self.parallel_dims.cp != 1 or self.parallel_dims.pp != 1:
-            raise ValueError("The initial streaming recipe requires CP=PP=1")
-        ray.get(
-            self.dataloader.buffer.event.remote(
-                "consumer_rank_initialized",
-                reader=dist.get_rank(),
-                hostname=socket.gethostname(),
-                dp_rank=self.dataloader.dp_rank,
-                tp_rank=self.parallel_dims.get_mesh("tp").get_local_rank(),
-                world_size=dist.get_world_size(),
-                gradient_accumulation_steps=self.gradient_accumulation_steps,
+        from .training import TrainingHandshake
+
+        self.handshake = TrainingHandshake.begin(config.dataloader.pipeline_config)
+        try:
+            super().__init__(config)
+            self.active_position = None
+            self._update_losses = []
+            if self.parallel_dims.cp != 1 or self.parallel_dims.pp != 1:
+                raise ValueError("The initial streaming recipe requires CP=PP=1")
+            self._get(
+                self.dataloader.buffer.event.remote(
+                    "consumer_rank_initialized",
+                    reader=dist.get_rank(),
+                    hostname=socket.gethostname(),
+                    dp_rank=self.dataloader.dp_rank,
+                    tp_rank=self.parallel_dims.get_mesh("tp").get_local_rank(),
+                    world_size=dist.get_world_size(),
+                    gradient_accumulation_steps=self.gradient_accumulation_steps,
+                )
             )
-        )
-        dist.barrier()
-        if dist.get_rank() == 0:
-            ray.get(self.dataloader.buffer.consumer_initialized.remote())
+            dist.barrier()
+            if self.handshake is not None:
+                self.handshake.initialized(self)
+            elif dist.get_rank() == 0:
+                self._get(self.dataloader.buffer.consumer_initialized.remote())
+        except BaseException as error:
+            if self.handshake is not None:
+                self.handshake.failed(error)
+            raise
 
     def materialize_batch(self, input_dict, labels):
         descriptor = input_dict.pop("_mooncake_features")
@@ -48,9 +62,13 @@ class StreamingDSparkTrainer(DSparkTrainer):
         )
         features_ready = time.monotonic()
         # All source reads have completed; this rank now owns independent buffers.
-        ray.get(
+        self._get(
             self.dataloader.buffer.acknowledge.remote(
-                descriptor["position"], dist.get_rank()
+                descriptor["position"],
+                dist.get_rank(),
+                verified=True,
+                nbytes=sum(field["nbytes"] for field in descriptor["fields"].values()),
+                duration_seconds=features_ready - started,
             )
         )
         acknowledged = time.monotonic()
@@ -58,7 +76,13 @@ class StreamingDSparkTrainer(DSparkTrainer):
         result = super().materialize_batch(input_dict, labels)
         torch.cuda.current_stream(self.device).synchronize()
         self.active_position = descriptor["position"]
-        ray.get(
+        self._get(
+            self.dataloader.buffer.reader_copy_state.remote(
+                self.active_position, dist.get_rank(), "active"
+            ),
+            timeout=pipeline["timeout_seconds"],
+        )
+        self._get(
             self.dataloader.buffer.event.remote(
                 "gpu_ready",
                 position=self.active_position,
@@ -74,7 +98,7 @@ class StreamingDSparkTrainer(DSparkTrainer):
 
     def forward_backward_step(self, *args, **kwargs):
         started = time.monotonic()
-        ray.get(
+        self._get(
             self.dataloader.buffer.event.remote(
                 "compute_start",
                 position=self.active_position,
@@ -84,6 +108,11 @@ class StreamingDSparkTrainer(DSparkTrainer):
         )
         result = super().forward_backward_step(*args, **kwargs)
         torch.cuda.current_stream(self.device).synchronize()
+        if self.handshake is not None:
+            detached = result.detach()
+            if hasattr(detached, "to_local"):
+                detached = detached.to_local()
+            self._update_losses.append(float(detached.item()))
         if (
             self.step == 1
             and self._accumulation_index == self.gradient_accumulation_steps
@@ -122,7 +151,7 @@ class StreamingDSparkTrainer(DSparkTrainer):
                     }
             if len(norms) != 3:
                 raise RuntimeError("Did not find the three DSpark context projections")
-            ray.get(
+            self._get(
                 self.dataloader.buffer.event.remote(
                     "context_gradient_observed",
                     reader=dist.get_rank(),
@@ -145,14 +174,14 @@ class StreamingDSparkTrainer(DSparkTrainer):
                     raise RuntimeError(
                         f"DSpark context gradient is invalid: {name}={norm}"
                     )
-            ray.get(
+            self._get(
                 self.dataloader.buffer.event.remote(
                     "context_gradient_verified",
                     reader=dist.get_rank(),
                     norms=norms,
                 )
             )
-        ray.get(
+        self._get(
             self.dataloader.buffer.event.remote(
                 "compute_end",
                 position=self.active_position,
@@ -166,12 +195,20 @@ class StreamingDSparkTrainer(DSparkTrainer):
         # stream completion; keep only the small batch metadata in that list.
         for name in FEATURE_FIELDS:
             del kwargs["input_dict"][name]
+        self._get(
+            self.dataloader.buffer.reader_copy_state.remote(
+                self.active_position, dist.get_rank(), "retired"
+            ),
+            timeout=self.dataloader.pipeline["timeout_seconds"],
+        )
         return result
 
     def train_step(self, data_iterator):
+        started = time.monotonic()
+        self._update_losses = []
         result = super().train_step(data_iterator)
         torch.cuda.current_stream(self.device).synchronize()
-        ray.get(
+        self._get(
             self.dataloader.buffer.event.remote(
                 "optimizer_update_complete",
                 reader=dist.get_rank(),
@@ -181,4 +218,25 @@ class StreamingDSparkTrainer(DSparkTrainer):
                 * consumer_dp(self.dataloader.pipeline),
             )
         )
+        if self.handshake is not None:
+            self.handshake.update(
+                self,
+                math.fsum(self._update_losses),
+                duration_seconds=time.monotonic() - started,
+            )
         return result
+
+    def train(self):
+        result = super().train()
+        if self.handshake is not None:
+            if self.checkpointer.last_commit is None:
+                raise ValueError("Training finished without a native checkpoint commit")
+            self.handshake.checkpoint(self.checkpointer.last_commit)
+        return result
+
+    def close(self):
+        try:
+            return super().close()
+        finally:
+            if self.handshake is not None:
+                self.handshake.close()

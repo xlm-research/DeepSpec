@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd -- "${SCRIPT_DIR}/../../.." && pwd)
-PIPELINE_PYTHON=/tmp/deepspec_vllm_torchtitan_envs/bin/python
+PIPELINE_PYTHON=${PIPELINE_PYTHON:-/tmp/deepspec_vllm_torchtitan_envs/bin/python}
 
 cd "${REPO_ROOT}"
 export PYTHONPATH="${REPO_ROOT}:${REPO_ROOT}/torchtitan:${REPO_ROOT}/vllm"

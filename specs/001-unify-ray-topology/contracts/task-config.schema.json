@@ -1,0 +1,633 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:deepspec:pipeline:task-config:3",
+  "title": "DeepSpec unified Ray task configuration v3",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "const": 3
+    },
+    "layout": {
+      "enum": [
+        "M0",
+        "M1",
+        "M2",
+        "M3"
+      ]
+    },
+    "ray_address": {
+      "type": "string",
+      "minLength": 1
+    },
+    "model_path": {
+      "type": "string",
+      "minLength": 1
+    },
+    "output_dir": {
+      "type": "string",
+      "minLength": 1
+    },
+    "nodes": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 3,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "alias": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_-]*$"
+          },
+          "selector": {
+            "oneOf": [
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "node_id": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                },
+                "required": [
+                  "node_id"
+                ]
+              },
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "ip": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                },
+                "required": [
+                  "ip"
+                ]
+              }
+            ]
+          },
+          "cpu_limit": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "feature_memory_cap_bytes": {
+            "type": "integer",
+            "minimum": 1
+          }
+        },
+        "required": [
+          "alias",
+          "selector",
+          "cpu_limit"
+        ]
+      }
+    },
+    "inference": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "tp": {
+          "enum": [
+            4,
+            8
+          ]
+        },
+        "dp": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "nodes": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 2,
+          "items": {
+            "$ref": "#/$defs/allocation"
+          }
+        },
+        "batch_size": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "writer_inflight": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "required": [
+        "tp",
+        "dp",
+        "nodes",
+        "batch_size",
+        "writer_inflight"
+      ]
+    },
+    "training": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "tp": {
+          "const": 4
+        },
+        "dp": {
+          "enum": [
+            1,
+            2
+          ]
+        },
+        "dp_mode": {
+          "const": "shard"
+        },
+        "cp": {
+          "const": 1
+        },
+        "pp": {
+          "const": 1
+        },
+        "nodes": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 2,
+          "items": {
+            "$ref": "#/$defs/allocation"
+          }
+        },
+        "global_batch_size": {
+          "const": 4
+        },
+        "steps": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "required": [
+        "tp",
+        "dp",
+        "dp_mode",
+        "cp",
+        "pp",
+        "nodes",
+        "global_batch_size",
+        "steps"
+      ]
+    },
+    "data": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "source_path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "context_length": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "epochs": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "required": [
+        "source_path",
+        "context_length",
+        "epochs"
+      ]
+    },
+    "store": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "node": {
+          "type": "string",
+          "minLength": 1
+        },
+        "pool_bytes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "utilization": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 0.99
+        },
+        "master": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "mode": {
+              "enum": [
+                "owned",
+                "external"
+              ]
+            },
+            "endpoint": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "required": [
+            "mode"
+          ],
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "mode": {
+                    "const": "external"
+                  }
+                }
+              },
+              "then": {
+                "required": [
+                  "endpoint"
+                ]
+              }
+            }
+          ]
+        }
+      },
+      "required": [
+        "node",
+        "pool_bytes",
+        "utilization",
+        "master"
+      ]
+    },
+    "transport": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "rdma_devices": {
+          "type": "string",
+          "default": "",
+          "description": "Preserve the legacy --rdma-devices / store.rdma_devices value verbatim. Empty uses the existing backend device selection; TCP retains but does not use this value."
+        },
+        "protocol": {
+          "enum": [
+            "tcp",
+            "rdma"
+          ]
+        },
+        "receive_device": {
+          "enum": [
+            "cpu",
+            "cuda"
+          ]
+        },
+        "verify_mode": {
+          "const": "full"
+        },
+        "window": {
+          "type": "integer",
+          "minimum": 4
+        },
+        "prefetch_depth": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "prefetch_bytes": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "required": [
+        "protocol",
+        "receive_device",
+        "verify_mode",
+        "window",
+        "prefetch_depth"
+      ]
+    },
+    "timeouts_seconds": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "budget_snapshot": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 5,
+          "description": "Exclusive maximum budget snapshot age in seconds. Normalization materializes the default before hashing; independent of lease and heartbeat."
+        },
+        "allocation": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "initialization": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "run": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "transfer": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "collective": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "cleanup": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "lease": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "heartbeat": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "required": [
+        "allocation",
+        "initialization",
+        "run",
+        "transfer",
+        "collective",
+        "cleanup",
+        "lease",
+        "heartbeat"
+      ]
+    }
+  },
+  "required": [
+    "schema_version",
+    "layout",
+    "ray_address",
+    "model_path",
+    "output_dir",
+    "nodes",
+    "inference",
+    "training",
+    "data",
+    "store",
+    "transport",
+    "timeouts_seconds"
+  ],
+  "$defs": {
+    "allocation": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "node": {
+          "type": "string",
+          "minLength": 1
+        },
+        "gpus": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "allowed_gpu_uuids": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      },
+      "required": [
+        "node",
+        "gpus"
+      ]
+    }
+  },
+  "description": "结构契约；节点唯一性、配额算术、支持矩阵、预算、endpoint与期限关系须按 cli.md/data-model.md 执行语义校验。环境占位符只允许存在于示例，preview/run 前必须显式替换。",
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "layout": {
+            "const": "M0"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "inference": {
+            "properties": {
+              "tp": {
+                "const": 4
+              },
+              "nodes": {
+                "minItems": 1,
+                "maxItems": 1
+              }
+            }
+          },
+          "training": {
+            "properties": {
+              "nodes": {
+                "minItems": 1,
+                "maxItems": 1
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "layout": {
+            "const": "M1"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "inference": {
+            "properties": {
+              "tp": {
+                "const": 4
+              },
+              "nodes": {
+                "minItems": 1,
+                "maxItems": 1
+              }
+            }
+          },
+          "training": {
+            "properties": {
+              "nodes": {
+                "minItems": 1,
+                "maxItems": 1
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "layout": {
+            "const": "M2"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "inference": {
+            "properties": {
+              "tp": {
+                "const": 8
+              },
+              "nodes": {
+                "minItems": 2,
+                "maxItems": 2
+              }
+            }
+          },
+          "training": {
+            "properties": {
+              "nodes": {
+                "minItems": 1,
+                "maxItems": 1
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "layout": {
+            "const": "M3"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "inference": {
+            "properties": {
+              "tp": {
+                "const": 4
+              },
+              "nodes": {
+                "minItems": 1,
+                "maxItems": 1
+              }
+            }
+          },
+          "training": {
+            "properties": {
+              "nodes": {
+                "minItems": 2,
+                "maxItems": 2
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "layout": {
+            "enum": [
+              "M2",
+              "M3"
+            ]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "training": {
+            "properties": {
+              "dp": {
+                "const": 2
+              }
+            }
+          },
+          "transport": {
+            "properties": {
+              "protocol": {
+                "const": "tcp"
+              },
+              "receive_device": {
+                "const": "cpu"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "layout": {
+            "enum": [
+              "M0",
+              "M3"
+            ]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "inference": {
+            "properties": {
+              "dp": {
+                "const": 1
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "layout": {
+            "const": "M0"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "training": {
+            "properties": {
+              "dp": {
+                "const": 1
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "layout": {
+            "const": "M1"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "inference": {
+            "properties": {
+              "dp": {
+                "enum": [
+                  1,
+                  2
+                ]
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

@@ -32,11 +32,15 @@ class FeaturePrefetch:
         self.timeout = timeout
         self.event = event
         self.pending = {}
+        self.closing = False
+        self.close_complete = False
         self.pending_bytes = 0
         self.peak_pending = 0
         self.peak_pending_bytes = 0
         self.executor = ThreadPoolExecutor(
-            max_workers=max(1, min(depth, int(store_config.get("prefetch_workers", depth)))),
+            max_workers=max(
+                1, min(depth, int(store_config.get("prefetch_workers", depth)))
+            ),
             thread_name_prefix="dspark-prefetch",
             initializer=self._initialize,
             initargs=(device,),
@@ -65,6 +69,8 @@ class FeaturePrefetch:
         return result
 
     def submit(self, descriptor):
+        if self.closing:
+            raise RuntimeError("Feature prefetch is closing")
         position = descriptor["position"]
         if position in self.pending:
             return
@@ -81,16 +87,40 @@ class FeaturePrefetch:
         self.peak_pending = max(self.peak_pending, len(self.pending))
         self.peak_pending_bytes = max(self.peak_pending_bytes, self.pending_bytes)
 
+    def can_submit(self, descriptor):
+        nbytes = sum(
+            int(descriptor["fields"][name]["nbytes"]) for name in FEATURE_FIELDS
+        )
+        if self.max_bytes is not None and nbytes > self.max_bytes:
+            raise ValueError("One feature exceeds the prefetch byte budget")
+        return len(self.pending) < self.depth and (
+            self.max_bytes is None or self.pending_bytes + nbytes <= self.max_bytes
+        )
+
     def take(self, position):
         future = self.pending[position]
         try:
             return future.result(timeout=self.timeout)
         finally:
-            del self.pending[position]
-            self.pending_bytes -= getattr(future, "_deepspec_nbytes", 0)
+            # A timeout does not stop the native read or release its buffer.
+            if future.done():
+                del self.pending[position]
+                self.pending_bytes -= getattr(future, "_deepspec_nbytes", 0)
 
-    def close(self):
-        self.executor.shutdown(wait=True, cancel_futures=True)
+    def close(self, *, timeout=None):
+        from .runtime import Deadline
+
+        if self.close_complete:
+            return
+        deadline = Deadline.after(self.timeout if timeout is None else timeout)
+        self.closing = True
+        self.executor.shutdown(wait=False, cancel_futures=True)
+        # Keep outstanding native reads and byte credits alive on timeout.
+        # Their owning actor/process must be stopped by its supervisor.
+        for future in self.pending.values():
+            if not future.cancelled():
+                future.result(timeout=deadline.remaining())
+        self.store.close(timeout=deadline.remaining())
         self.pending.clear()
         self.pending_bytes = 0
-        self.store.close()
+        self.close_complete = True

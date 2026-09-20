@@ -16,6 +16,7 @@ def qwen38_preparation():
     pipeline = json.loads(Path(pipeline_path).read_text())
     config = qwen38_27b_tp4()
     config.parallelism.data_parallel_shard_degree = pipeline.get("consumer_dp", 1)
+    config.parallelism.data_parallel_replicate_degree = 1
     config.parallelism.tensor_parallel_degree = 4
     config.training.max_context_length = pipeline["context_length"]
     config.training.num_tokens_per_microbatch_per_dp_rank = pipeline["context_length"]
@@ -31,7 +32,12 @@ def qwen38_preparation():
     config.metrics.log_freq = 1
     config.checkpoint.folder = str(Path(pipeline["output_dir"]) / "checkpoints")
     config.measure_phase = True
-    if pipeline.get("consumer_dp", 1) > 1:
+    if pipeline.get("topology_plan_path"):
+        config.comm.init_timeout_seconds = pipeline["timeouts_seconds"][
+            "initialization"
+        ]
+        config.comm.train_timeout_seconds = pipeline["timeouts_seconds"]["collective"]
+    elif pipeline.get("consumer_dp", 1) > 1:
         config.comm.init_timeout_seconds = 600
         config.comm.train_timeout_seconds = 600
     return config

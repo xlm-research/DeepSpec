@@ -7,7 +7,7 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd -- "${SCRIPT_DIR}/../../.." && pwd)
 RAY_SCRIPT="${SCRIPT_DIR}/start_ray.sh"
 TRAIN_SCRIPT="${SCRIPT_DIR}/train_multinode.sh"
-PIPELINE_PYTHON=/tmp/deepspec_vllm_torchtitan_envs/bin/python
+PIPELINE_PYTHON=${PIPELINE_PYTHON:-/tmp/deepspec_vllm_torchtitan_envs/bin/python}
 
 RAY_HEAD_PORT=${RAY_HEAD_PORT:-26379}
 RAY_NUM_GPUS=${RAY_NUM_GPUS:-8}

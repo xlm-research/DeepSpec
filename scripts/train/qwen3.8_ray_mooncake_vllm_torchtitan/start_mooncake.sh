@@ -15,7 +15,7 @@ Environment:
 
 Additional flags are passed directly to the installed mooncake_master.
 Defaults match training: disk offload and disk eviction are disabled.
-Python is fixed at /tmp/deepspec_vllm_torchtitan_envs/bin/python.
+PIPELINE_PYTHON overrides /tmp/deepspec_vllm_torchtitan_envs/bin/python.
 
 This starts the metadata/control service, not the feature memory pool.
 Training entry points automatically manage their own Master and FeatureBuffer
@@ -35,7 +35,7 @@ fi
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd -- "${SCRIPT_DIR}/../../.." && pwd)
-PIPELINE_PYTHON=/tmp/deepspec_vllm_torchtitan_envs/bin/python
+PIPELINE_PYTHON=${PIPELINE_PYTHON:-/tmp/deepspec_vllm_torchtitan_envs/bin/python}
 cd "${REPO_ROOT}"
 export PYTHONPATH="${REPO_ROOT}:${REPO_ROOT}/torchtitan:${REPO_ROOT}/vllm"
 
@@ -43,7 +43,7 @@ if [[ ! -x "${PIPELINE_PYTHON}" ]]; then
     printf 'Required Python environment is missing: %s\n' "${PIPELINE_PYTHON}" >&2
     exit 1
 fi
-# Use the Mooncake binary and CUDA 12 runtime from the same fixed environment.
+# Use the Mooncake binary and CUDA 12 runtime from the selected environment.
 CUDA_RUNTIME_LIB=$("${PIPELINE_PYTHON}" -c 'import sysconfig; print(sysconfig.get_path("purelib") + "/nvidia/cuda_runtime/lib")')
 export LD_LIBRARY_PATH="${CUDA_RUNTIME_LIB}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 MOONCAKE_MASTER=$("${PIPELINE_PYTHON}" -c 'from pathlib import Path; import mooncake; print(Path(mooncake.__file__).parent / "mooncake_master")')

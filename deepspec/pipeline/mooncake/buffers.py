@@ -302,6 +302,10 @@ class AsyncPutManager:
             error = exc
         with self._condition:
             self._closed = True
-        self._executor.shutdown(wait=True)
+            pending = bool(self._inflight)
+        # A failed drain cannot synchronously join a blocked native put. The
+        # operation and its callback keep the registered buffers alive until
+        # completion or termination of the owning process.
+        self._executor.shutdown(wait=not pending, cancel_futures=True)
         if error is not None:
             raise error

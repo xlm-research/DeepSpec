@@ -14,6 +14,136 @@ import torch
 from deepspec.pipeline.store import FIELDS, TensorStore, describe_tensors, free_port
 
 
+def test_cpu_contract_remove_requires_confirmed_absence():
+    import threading
+    from types import SimpleNamespace
+
+    store = TensorStore.__new__(TensorStore)
+    store._closed = False
+    store._io_lock = threading.Lock()
+    store.client = SimpleNamespace(
+        batch_remove=lambda keys, **kw: [0] * len(keys),
+        batch_is_exist=lambda keys: [1] * len(keys),
+    )
+    fields = {"x": {"chunks": [{"key": "r/sample/x"}]}}
+    with pytest.raises(RuntimeError, match="visible|exist"):
+        store.remove(fields)
+    store.client.batch_is_exist = lambda keys: [-500] * len(keys)
+    with pytest.raises(RuntimeError, match="existence"):
+        store.remove(fields)
+    store.client.batch_is_exist = lambda keys: [0] * len(keys)
+    store.remove(fields)
+
+
+def test_cpu_contract_same_bytes_wrong_shape_or_dtype_cannot_write():
+    store = TensorStore.__new__(TensorStore)
+    tensor = torch.zeros(2, 4, dtype=torch.float32)
+    fields = {
+        "x": {
+            "shape": [2, 4],
+            "dtype": "float32",
+            "nbytes": 32,
+            "chunks": [{"key": "fixture/x", "offset": 0, "nbytes": 32}],
+        }
+    }
+    fields["x"]["shape"] = [4, 2]
+    with pytest.raises(ValueError, match="shape|dtype"):
+        store._plan_put(fields, {"x": tensor})
+
+
+def test_cpu_contract_prefetch_timeout_keeps_inflight_bytes(monkeypatch):
+    import threading
+    from types import SimpleNamespace
+
+    from deepspec.pipeline.prefetch import FeaturePrefetch
+
+    release = threading.Event()
+    reads = []
+
+    def get(fields, names, **kwargs):
+        reads.append(1)
+        release.wait(2)
+        return {name: torch.zeros(1) for name in names}
+
+    monkeypatch.setattr(
+        "deepspec.pipeline.prefetch.TensorStore",
+        lambda *a, **kw: SimpleNamespace(get=get, close=lambda **kw: None),
+    )
+    prefetch = FeaturePrefetch({}, depth=2, max_bytes=8, timeout=0.01)
+    descriptor = {
+        "position": 0,
+        "fields": {
+            name: {"nbytes": 4}
+            for name in ("target_hidden_states", "target_last_hidden_states")
+        },
+    }
+    try:
+        prefetch.submit(descriptor)
+        with pytest.raises(TimeoutError):
+            prefetch.take(0)
+        assert prefetch.pending_bytes == 8
+        with pytest.raises(RuntimeError, match="byte budget"):
+            prefetch.submit({**descriptor, "position": 1})
+        assert len(reads) == 1
+        with pytest.raises(TimeoutError):
+            prefetch.close(timeout=0.01)
+        assert prefetch.pending_bytes == 8
+        release.set()
+        prefetch.take(0)
+        assert prefetch.pending_bytes == 0
+    finally:
+        release.set()
+        prefetch.close()
+
+
+@pytest.mark.parametrize("native_failure", [False, True])
+def test_cpu_contract_store_close_timeout_does_not_claim_native_cleanup(native_failure):
+    import threading
+    from types import SimpleNamespace
+
+    entered, release = threading.Event(), threading.Event()
+
+    def native_close():
+        entered.set()
+        assert release.wait(2)
+        if native_failure:
+            raise RuntimeError("native close failed")
+        return 0
+
+    store = TensorStore.__new__(TensorStore)
+    store._closed = False
+    store._put_manager = store._host_buffer_pool = store._get_executor = None
+    store._io_lock = threading.RLock()
+    store._close_lock = threading.Lock()
+    store._close_finished = threading.Event()
+    store._close_thread, store._close_error = None, None
+    store.quarantined = ["native-buffer"]
+    store._registered_buffers = {1: "retained"}
+    store.client = SimpleNamespace(close=native_close)
+    try:
+        with pytest.raises(TimeoutError, match="close"):
+            store.close(timeout=0.01)
+        assert entered.is_set()
+        assert store._registered_buffers and store.quarantined
+        with pytest.raises(TimeoutError, match="close"):
+            store.close(timeout=0.01)
+        release.set()
+        if native_failure:
+            with pytest.raises(RuntimeError, match="native close failed"):
+                store.close(timeout=1)
+            assert store._registered_buffers and store.quarantined
+        else:
+            store.close(timeout=1)
+            assert not store._registered_buffers and not store.quarantined
+    finally:
+        release.set()
+        if native_failure:
+            with pytest.raises(RuntimeError, match="native close failed"):
+                store.close(timeout=2)
+        else:
+            store.close(timeout=2)
+
+
 @pytest.fixture
 def store_config(tmp_path):
     import mooncake
@@ -428,10 +558,12 @@ def test_native_loader_ranks_consume_two_complete_updates(
             ray.get(buffer.finish_production.remote())
             assert process.wait(timeout=90) == 0, (tmp_path / "ranks.log").read_text()
         for rank in range(4 * consumer_dp):
-            assert json.loads((tmp_path / f"rank-result-{rank}.json").read_text()) == {
-                "positions": list(range(rank // 4, 8, consumer_dp)),
-                "cursor": 8 // consumer_dp,
-            }
+            report = json.loads((tmp_path / f"rank-result-{rank}.json").read_text())
+            assert report["positions"] == list(range(rank // 4, 8, consumer_dp))
+            assert report["cursor"] == report["native_cursor"] == 8 // consumer_dp
+            assert report["sample_cursor"] == 8 and report["steps"] == 2
+            assert report["gas"] == 4 // consumer_dp and report["rank"] == rank
+            assert report["run_id"] == "rank-probe" and report["node_id"]
         summary = ray.get(buffer.summary.remote())
         assert summary["remaining"] == 0 and summary["released"] == 8
         assert "backpressure" in (tmp_path / "events.jsonl").read_text()

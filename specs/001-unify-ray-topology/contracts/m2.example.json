@@ -1,0 +1,93 @@
+{
+  "schema_version": 3,
+  "layout": "M2",
+  "ray_address": "${RAY_ADDRESS}",
+  "model_path": "${TARGET_MODEL_PATH}",
+  "output_dir": "${RUN_OUTPUT}",
+  "nodes": [
+    {
+      "alias": "infer-a",
+      "selector": {
+        "node_id": "${INFER_NODE_A}"
+      },
+      "cpu_limit": 24
+    },
+    {
+      "alias": "infer-b",
+      "selector": {
+        "node_id": "${INFER_NODE_B}"
+      },
+      "cpu_limit": 24
+    },
+    {
+      "alias": "train-c",
+      "selector": {
+        "node_id": "${TRAIN_NODE_C}"
+      },
+      "cpu_limit": 24
+    }
+  ],
+  "inference": {
+    "tp": 8,
+    "dp": 2,
+    "nodes": [
+      {
+        "node": "infer-a",
+        "gpus": 8
+      },
+      {
+        "node": "infer-b",
+        "gpus": 8
+      }
+    ],
+    "batch_size": 1,
+    "writer_inflight": 1
+  },
+  "training": {
+    "tp": 4,
+    "dp": 2,
+    "dp_mode": "shard",
+    "cp": 1,
+    "pp": 1,
+    "nodes": [
+      {
+        "node": "train-c",
+        "gpus": 8
+      }
+    ],
+    "global_batch_size": 4,
+    "steps": 3
+  },
+  "data": {
+    "source_path": "${DATA_SOURCE}",
+    "context_length": 4096,
+    "epochs": 1
+  },
+  "store": {
+    "node": "train-c",
+    "pool_bytes": 68719476736,
+    "utilization": 0.75,
+    "master": {
+      "mode": "owned"
+    }
+  },
+  "transport": {
+    "rdma_devices": "",
+    "protocol": "tcp",
+    "receive_device": "cpu",
+    "verify_mode": "full",
+    "window": 8,
+    "prefetch_depth": 2
+  },
+  "timeouts_seconds": {
+    "budget_snapshot": 5,
+    "allocation": 120,
+    "initialization": 1800,
+    "run": 7200,
+    "transfer": 1800,
+    "collective": 600,
+    "cleanup": 120,
+    "lease": 30,
+    "heartbeat": 5
+  }
+}

@@ -493,6 +493,7 @@ vLLM 使用四卡，TorchTitan 使用另外四卡，Mooncake 保存和传输隐�
 - 这证明短程整链路可运行。多机、128K、RDMA、CPU→远端 GPU 直传、长期稳定性和实际加速比尚未验证。
 - 新增代码及修复仍在未提交的工作区中。仅 checkout 下表 commit 不包含完整实现。
 - 启动及 HF 导出脚本已写入本目录，已检查 Bash 语法、dry-run、`--help`；脚本整理未重新启动训练或执行大模型导出。
+- 用户随后完成了 `step-3` HF 导出。修复 Qwen DSpark 被误判为 MTP 后，11 项配置测试通过，GPU 4–7、TP4、BF16 模型加载及 warmup 通过；参数抽查与短生成尚未完成，见 [加载验证](VLLM_LOAD.md)。
 
 新窗口先读本文，再按问题定位下列材料：
 
@@ -500,6 +501,7 @@ vLLM 使用四卡，TorchTitan 使用另外四卡，Mooncake 保存和传输隐�
 | --- | --- |
 | 启动、改参数、找日志 | [启动说明](README.md)、[train.sh](train.sh) |
 | 导出 checkpoint 为 HF 模型 | [导出说明](README.md#导出-hf-模型)、[export_hf.sh](export_hf.sh) |
+| 查看导出草稿头的 vLLM 加载结果 | [加载验证](VLLM_LOAD.md) |
 | 核实成功结果和修复原因 | [验收记录](../../../deepspec/pipeline/VALIDATION.md) |
 | 理解进程、数据、容量和释放接口 | [流水线说明](../../../deepspec/pipeline/README.md)、本文第 4–5 节 |
 | 查 slime / Mooncake 源码依据 | [参考源码记录](../../../deepspec/pipeline/REFERENCES.md) |
@@ -520,7 +522,9 @@ vLLM 使用四卡，TorchTitan 使用另外四卡，Mooncake 保存和传输隐�
 
 TorchTitan 有自己的 `.git`；主仓库也跟踪其部分源码，后续提交时需检查两层 Git 状态。
 工作区原本存在文档删除、vLLM 文件模式及 demo 改动等，与本次流水线改造分开核对、保留。
-本次没有修改 vLLM 核心源码。
+流水线训练验收后，在导出草稿头的推理测试中修改了
+`vllm/vllm/config/speculative.py` 的 Qwen DSpark 配置识别，并在
+`vllm/tests/config/test_speculative_draft_hf_overrides.py` 添加回归测试；见 [加载验证](VLLM_LOAD.md)。
 
 **固定 Python 环境：`/tmp/deepspec_vllm_torchtitan_envs`；用户明确要求不使用 uv。**
 Python / pip 调用使用该环境的 `bin/python` / `bin/python -m pip`。
@@ -677,12 +681,13 @@ bash scripts/train/qwen3.8_ray_mooncake_vllm_torchtitan/train.sh
 本轮产物为完整 DCP checkpoint，自动 HF 导出未开启。同目录的 `export_hf.sh`
 接收两个位置参数：`checkpoint 目录`、`HF 输出目录`；在 CPU 上调用原生导出器，
 精度沿用 checkpoint 的 `export_dtype`（当前为 FP32）。命令见 [导出说明](README.md#导出-hf-模型)。
-原生模型路径已有导出并加载的历史成功记录；本轮 `step-3` 尚未实际导出或接入 vLLM
-投机解码验收。导出目录可交给 `Qwen3_8DSparkModel.from_pretrained()`；vLLM DSpark
+用户已将本轮 `step-3` 导出到运行目录下 `draft-hf-step-3`；vLLM 实测记录及必要的
+配置识别修复见 [加载验证](VLLM_LOAD.md)。导出目录可交给 `Qwen3_8DSparkModel.from_pretrained()`；vLLM DSpark
 推理需要 V2 model runner，不能沿用训练特征提取时的 `VLLM_USE_V2_MODEL_RUNNER=0`。
 
 ## 8. 尚未完成的工作与建议接续点
 
+- **导出后的推理：** vLLM 加载和 warmup 已通过；后续在可持续使用的 GPU 窗口完成参数抽查与短生成。完整验收被 RPC 脚本问题、外部任务及一次来源未定位的 SIGTERM 打断，详见 [加载记录](VLLM_LOAD.md)。
 - **正确性对照：** SHA256 证明存储和传输没有改变已生成字节，尚不能替代与旧文件路径的特征数值、token 对齐和同配置训练对照。
 - **性能与稳定性：** 主机事件中推理/训练重叠约 0.783 秒、传输/训练重叠约 2.333 秒；没有 GPU trace 或相对原流程加速比。先在相同模型、输入顺序、更新数和可比并行配置下对照，再延长运行、增加上下文。
 - **内存：** 池容量、字节预留和背压已有实现及局部验证；尚未实测整机特征相关 CPU 峰值满足 80% 的完整上界。所有副本和暂存都要计入。

@@ -4,12 +4,164 @@ import json
 import os
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
 from deepspec.pipeline.cluster import gpu_processes, select_nodes
 from deepspec.pipeline.memory import GIB, feature_budget
 from deepspec.pipeline.run import summarize_events
+
+
+def legacy_task(*, version=2, inference_dp=1, training_dp=1):
+    return {
+        "schema_version": version,
+        "cluster_address": "10.0.0.1:6379",
+        "model_path": "/fixture/model",
+        "source_path": "/fixture/input.jsonl",
+        "output_dir": "/fixture/migrated",
+        "producer_node": "node-a",
+        "consumer_node": "node-b",
+        "role_separation": True,
+        "producer_dp": inference_dp,
+        "consumer_dp": training_dp,
+        "consumer_world_size": 4 * training_dp,
+        "steps": 3,
+        "context_length": 4096,
+        "epochs": 2,
+        "samples_per_update": 4,
+        "producer_batch_size": 3,
+        "writer_inflight": 2,
+        "window": 8,
+        "pool_bytes": 64 * 1024**3,
+        "pool_utilization": 0.75,
+        "prefetch_depth": 3,
+        "prefetch_bytes": 123456,
+        "timeout_seconds": 1800,
+        "store": {"protocol": "tcp"},
+    }
+
+
+@pytest.mark.parametrize("version", [1, 2])
+@pytest.mark.parametrize("inference_dp,training_dp", [(1, 1), (1, 2), (2, 1), (2, 2)])
+def test_legacy_task_preserves_independent_dp_batch_and_transport(
+    version, inference_dp, training_dp
+):
+    from copy import deepcopy
+    from deepspec.pipeline.schema import upgrade_task_config
+
+    old = legacy_task(
+        version=version, inference_dp=inference_dp, training_dp=training_dp
+    )
+    before = deepcopy(old)
+    new = upgrade_task_config(old).to_dict()
+    assert old == before
+    assert new["layout"] == "M1"
+    assert new["inference"]["dp"] == inference_dp
+    assert new["training"]["dp"] == training_dp
+    assert len(new["training"]["nodes"]) == 1
+    assert new["training"]["nodes"][0]["gpus"] == 4 * training_dp
+    assert (new["inference"]["batch_size"], new["inference"]["writer_inflight"]) == (
+        3,
+        2,
+    )
+    assert (
+        new["transport"]["window"],
+        new["transport"]["prefetch_depth"],
+        new["transport"]["prefetch_bytes"],
+    ) == (8, 3, 123456)
+    assert new["data"]["epochs"] == 2
+
+
+@pytest.mark.parametrize("location", ["old", "new", "both", "neither"])
+def test_legacy_rdma_devices_preserves_exact_selection_without_enabling_rdma(location):
+    from deepspec.pipeline.schema import upgrade_task_config
+
+    old = legacy_task()
+    devices = "mlx5_0,mlx5_2"
+    if location in ("old", "both"):
+        old["store"]["rdma_devices"] = devices
+    if location in ("new", "both"):
+        old["transport"] = {"rdma_devices": devices}
+    new = upgrade_task_config(old).to_dict()
+    assert new["transport"]["rdma_devices"] == (
+        "" if location == "neither" else devices
+    )
+    assert new["transport"]["protocol"] == "tcp"
+
+
+@pytest.mark.parametrize(
+    "field,old_value,new_value",
+    [
+        ("prefetch_depth", 3, 4),
+        ("rdma_devices", "mlx5_0", "mlx5_2"),
+        ("protocol", "tcp", "rdma"),
+    ],
+)
+def test_legacy_transport_conflicts_name_both_fields(field, old_value, new_value):
+    from deepspec.pipeline.runtime import PipelineError
+    from deepspec.pipeline.schema import upgrade_task_config
+
+    old = legacy_task()
+    path = field if field == "prefetch_depth" else f"store.{field}"
+    (old if field == "prefetch_depth" else old["store"])[field] = old_value
+    old["transport"] = {field: new_value}
+    with pytest.raises(PipelineError) as caught:
+        upgrade_task_config(old)
+    assert path in str(caught.value) and f"transport.{field}" in str(caught.value)
+
+
+def test_missing_legacy_consumer_nodes_requires_original_layout_evidence():
+    from deepspec.pipeline.runtime import PipelineError
+    from deepspec.pipeline.schema import upgrade_task_config
+
+    old = legacy_task(version=1, training_dp=2)
+    del old["role_separation"]
+    with pytest.raises(PipelineError, match="consumer_nodes"):
+        upgrade_task_config(old)
+    old["consumer_nodes"] = 1
+    assert len(upgrade_task_config(old).to_dict()["training"]["nodes"]) == 1
+
+
+def test_legacy_mixed_parallel_fields_reject_conflicting_training_math():
+    from deepspec.pipeline.runtime import PipelineError
+    from deepspec.pipeline.schema import upgrade_task_config
+
+    old = legacy_task()
+    old["training"] = {"dp": 2}
+    with pytest.raises(PipelineError, match="consumer_dp.*training.dp"):
+        upgrade_task_config(old)
+
+
+def test_legacy_mixed_nodes_retain_explicit_aliases_cpu_and_memory_caps():
+    from deepspec.pipeline.schema import upgrade_task_config
+
+    old = legacy_task()
+    old["nodes"] = [
+        {
+            "alias": name,
+            "selector": {"node_id": selector},
+            "cpu_limit": 21,
+            "feature_memory_cap_bytes": 100 * 1024**3,
+        }
+        for name, selector in (("infer", "node-a"), ("train", "node-b"))
+    ]
+    old["inference"] = {"nodes": [{"node": "infer", "gpus": 4}]}
+    new = upgrade_task_config(old).to_dict()
+    assert new["nodes"] == old["nodes"]
+    assert new["training"]["nodes"] == [{"node": "train", "gpus": 4}]
+
+
+@pytest.mark.parametrize("section", ["inference", "training", "data", "transport"])
+def test_legacy_upgrade_rejects_unknown_grouped_fields(section):
+    from deepspec.pipeline.runtime import PipelineError
+    from deepspec.pipeline.schema import upgrade_task_config
+
+    old = legacy_task()
+    old[section] = {"typo": 1}
+    with pytest.raises(PipelineError) as caught:
+        upgrade_task_config(old)
+    assert caught.value.to_dict()["field_path"] == f"{section}.typo"
 
 
 def test_cleanup_stops_only_exact_run_processes():
@@ -79,6 +231,64 @@ def test_exiting_gpu_worker_stays_owned_but_reused_pid_does_not(tmp_path, monkey
     status("S", 100000)
     with pytest.raises(RuntimeError, match="Another job"):
         check_gpu_ownership(tmp_path, "test-run", local_known)
+
+
+def test_gpu_ownership_survives_unreadable_exit_environment(tmp_path, monkeypatch):
+    from deepspec.pipeline.run import check_gpu_ownership
+
+    monkeypatch.setattr(
+        "deepspec.pipeline.cluster.subprocess.check_output",
+        lambda *args, **kwargs: "77, GPU-test, 53174\n",
+    )
+    process = tmp_path / "77"
+    process.mkdir()
+    fields = ["S", "1", *(["0"] * 17), "12345"]
+    (process / "stat").write_text("77 (worker) " + " ".join(fields))
+    (process / "environ").write_bytes(b"DEEPSPEC_PIPELINE_RUN_ID=test-run\0")
+    monkeypatch.setattr(
+        "deepspec.pipeline.cluster.gpu_processes",
+        lambda run_id, known_owned: gpu_processes(
+            run_id, known_owned, proc_root=tmp_path
+        ),
+    )
+    monkeypatch.setattr("deepspec.orchestration.process.descendants", lambda pid: set())
+    known = set()
+    check_gpu_ownership(tmp_path, "test-run", known)
+    original_read = Path.read_bytes
+
+    def unreadable_environment(path):
+        if path == process / "environ":
+            raise PermissionError("Exiting worker environment is inaccessible")
+        return original_read(path)
+
+    monkeypatch.setattr(Path, "read_bytes", unreadable_environment)
+    check_gpu_ownership(tmp_path, "test-run", known)
+    fields[-1] = "99999"
+    (process / "stat").write_text("77 (worker) " + " ".join(fields))
+    with pytest.raises(RuntimeError, match="Another job"):
+        check_gpu_ownership(tmp_path, "test-run", known)
+    with pytest.raises(RuntimeError, match="Another job"):
+        check_gpu_ownership(tmp_path, "test-run", set())
+
+
+@pytest.mark.parametrize("error", [FileNotFoundError, ProcessLookupError])
+def test_gpu_worker_disappearing_during_inspection_is_ignored(
+    tmp_path, monkeypatch, error
+):
+    monkeypatch.setattr(
+        "deepspec.pipeline.cluster.subprocess.check_output",
+        lambda *args, **kwargs: "77, GPU-test, 53174\n",
+    )
+    process = tmp_path / "77"
+    process.mkdir()
+    fields = ["S", "1", *(["0"] * 17), "12345"]
+    (process / "stat").write_text("77 (worker) " + " ".join(fields))
+
+    def exited_environment(path):
+        raise error("Worker exited after reading stat")
+
+    monkeypatch.setattr(Path, "read_bytes", exited_environment)
+    assert gpu_processes("test-run", proc_root=tmp_path) == []
 
 
 def test_node_selection_rejects_aliases_for_the_same_machine():
@@ -384,3 +594,79 @@ def test_overlapping_producer_intervals_are_counted_once():
     from deepspec.pipeline.run import merge_intervals
 
     assert merge_intervals([(4, 8), (1, 5), (2, 3), (10, 12)]) == [(1, 8), (10, 12)]
+
+
+def test_legacy_cli_dp2_dp1_and_transport_settings_reach_shared_controller(
+    tmp_path, monkeypatch, capsys
+):
+    from deepspec.pipeline import legacy, run
+
+    captured = []
+
+    def execute(config, **kwargs):
+        captured.append((config, kwargs))
+        return {"state": "succeeded"}
+
+    monkeypatch.setattr(legacy, "run_config", execute)
+    assert (
+        run.main(
+            [
+                "--source",
+                str(tmp_path / "input.jsonl"),
+                "--output",
+                str(tmp_path / "run"),
+                "--ray-address",
+                "auto",
+                "--producer-node",
+                "10.0.0.1",
+                "--consumer-node",
+                "10.0.0.2",
+                "--producer-dp",
+                "2",
+                "--consumer-dp",
+                "1",
+                "--producer-batch-size",
+                "3",
+                "--writer-inflight",
+                "2",
+                "--rdma-devices",
+                "mlx5_0,mlx5_2",
+                "--protocol",
+                "tcp",
+            ]
+        )
+        == 0
+    )
+    config = captured[0][0]
+    assert config["producer_dp"] == 2 and config["consumer_dp"] == 1
+    assert config["producer_batch_size"] == 3 and config["writer_inflight"] == 2
+    assert (
+        config["store"]["rdma_devices"] == "mlx5_0,mlx5_2"
+        and config["store"]["protocol"] == "tcp"
+    )
+    assert not (tmp_path / "run").exists()
+    capsys.readouterr()
+
+
+def test_legacy_launch_uses_the_same_normalized_preview_and_frozen_run(
+    tmp_path, monkeypatch
+):
+    import json
+    from deepspec.pipeline import cli, execution, legacy
+    from deepspec.pipeline.schema import upgrade_task_config
+
+    config = legacy_task(inference_dp=2, training_dp=1)
+    config["output_dir"] = str(tmp_path / "run")
+    expected = upgrade_task_config(config).to_dict()
+    calls = []
+
+    def preview(path):
+        calls.append(json.loads(path.read_text()))
+        return {"plan_path": str(tmp_path / "run/plan.json")}
+
+    monkeypatch.setattr(cli, "preview", preview)
+    monkeypatch.setattr(
+        execution, "run_plan", lambda path: calls.append(path) or {"state": "succeeded"}
+    )
+    assert legacy.run_config(config)["state"] == "succeeded"
+    assert calls == [expected, str(tmp_path / "run/plan.json")]
