@@ -316,6 +316,8 @@ class TrainingGroup:
         return {"allocated": True, "launchers": reports}
 
     def _allocate_node(self, rank, deadline):
+        import os
+
         from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
         from .actors import Consumer
@@ -349,6 +351,14 @@ class TrainingGroup:
                 "runtime_env": {
                     "env_vars": {
                         **environment(self.plan["config"]["model_path"]),
+                        # Ray workers do not inherit the driver's environment.
+                        # Keep W&B settings (including auth) out of plan JSON.
+                        **{
+                            key: value
+                            for key, value in os.environ.items()
+                            if key.startswith("WANDB_")
+                        },
+                        "WANDB_MODE": os.environ.get("WANDB_MODE", "disabled"),
                         "DEEPSPEC_PIPELINE_RUN_ID": self.plan["run_id"],
                     }
                 },

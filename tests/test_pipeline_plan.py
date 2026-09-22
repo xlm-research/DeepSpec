@@ -170,3 +170,98 @@ def test_selector_ambiguity_and_explicit_uuid_inventory():
     facts.append({**facts[0], "node_id": "different-node"})
     with pytest.raises(PipelineError):
         make_plan(config, facts=facts)
+
+
+@pytest.mark.parametrize("length", [1, 7])
+def test_prepared_contract_accepts_native_converted_features(
+    tmp_path, monkeypatch, length
+):
+    import json
+
+    import torch
+    from safetensors.torch import save_file
+
+    from deepspec.pipeline import run as legacy_run
+    from deepspec.pipeline.buffer import BufferLedger
+    from deepspec.pipeline.planning import Run, prepare_input
+    from deepspec.pipeline.store import describe_tensors
+    from deepspec.trainer.qwen3_8_vllm import convert_hidden_states
+
+    model = tmp_path / "model"
+    model.mkdir()
+    save_file({"weight": torch.zeros(8, 8)}, model / "model.safetensors")
+    config = normalize_task_config(
+        task_config("M0", output_dir=tmp_path / "run", steps=1)
+    ).to_dict()
+    config["model_path"] = str(model)
+    config["data"]["context_length"] = length
+    run = Run.create(config["output_dir"])
+    ids = torch.arange(length).reshape(1, -1)
+    batch = {"input_ids": ids, "loss_mask": torch.ones_like(ids)}
+    features = convert_hidden_states(
+        {
+            "token_ids": ids[0],
+            "hidden_states": torch.zeros(length, 3, 8, dtype=torch.bfloat16),
+        },
+        batch,
+        hidden_size=8,
+        num_layers=2,
+    )
+    nbytes = sum(t.numel() * t.element_size() for t in features.values())
+
+    def prepare(legacy, path, **kwargs):
+        from pathlib import Path
+
+        inputs = Path(run.output_dir) / "inputs"
+        inputs.mkdir()
+        samples = []
+        for position in range(4):
+            target = inputs / f"sample-{position}.pt"
+            torch.save(batch, target)
+            samples.append(
+                {
+                    "position": position,
+                    "id": target.name,
+                    "sample_id": f"sample-{position}",
+                    "input_identity": f"identity-{position}",
+                    "input_path": str(target),
+                    "length": length,
+                    "nbytes": nbytes,
+                }
+            )
+        legacy.update(
+            samples=samples, teacher={"hidden_size": 8, "target_layer_ids": [0, 1]}
+        )
+        (inputs / "input-plan.json").write_text(json.dumps({"batches": samples}))
+
+    # The expensive tokenizer/model lookup is replaced; the production planner,
+    # native feature converter, serializer and strict publication gate are real.
+    monkeypatch.setattr(legacy_run, "prepare", prepare)
+    inputs, _ = prepare_input(config, run)
+    sample = inputs["batches"][0]
+    descriptor = {**sample, "fields": describe_tensors("native/sample-0", features)}
+    ledger = BufferLedger(
+        inputs["batches"],
+        capacity=4 * nbytes,
+        window=4,
+        readers=range(4),
+        samples_per_update=4,
+    )
+    assert ledger.reserve(0)
+    ledger.start_write(0)
+    ledger.ready(0, descriptor)
+    assert ledger.claim(0, 0) == descriptor
+    for field in ("seq_len", "context_chunk_len"):
+        ledger = BufferLedger(
+            inputs["batches"],
+            capacity=4 * nbytes,
+            window=4,
+            readers=range(4),
+            samples_per_update=4,
+        )
+        assert ledger.reserve(0)
+        ledger.start_write(0)
+        malformed = copy.deepcopy(descriptor)
+        malformed["fields"][field]["shape"] = []
+        with pytest.raises(ValueError, match=f"Published {field} shape/dtype"):
+            ledger.ready(0, malformed)

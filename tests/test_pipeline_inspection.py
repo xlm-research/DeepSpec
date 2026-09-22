@@ -14,8 +14,11 @@ from tests.pipeline_topology_fixtures import node_facts, task_config
 
 @pytest.mark.parametrize("failure", [False, True])
 @pytest.mark.parametrize("slow_inspection", [False, True])
+@pytest.mark.parametrize(
+    "sharing,ray_free", [("exclusive", 8), ("shared", 8), ("shared", 2)]
+)
 def test_inspection_reserves_only_cpu_and_releases_all_actors(
-    tmp_path, monkeypatch, failure, slow_inspection
+    tmp_path, monkeypatch, failure, slow_inspection, sharing, ray_free
 ):
     from deepspec.pipeline import cluster
 
@@ -24,6 +27,7 @@ def test_inspection_reserves_only_cpu_and_releases_all_actors(
         cluster, "time", types.SimpleNamespace(monotonic=lambda: now[0])
     )
     config = task_config(output_dir=tmp_path / "run")
+    config["gpu_sharing"] = sharing
     run = Run.create(config["output_dir"])
     facts = node_facts(config)
     actors, killed, requirements = [], [], []
@@ -49,7 +53,7 @@ def test_inspection_reserves_only_cpu_and_releases_all_actors(
                     "writable": True,
                     "witness_path": str(witness),
                 }
-                node["free_gpu_uuids"] = [gpu["uuid"] for gpu in node["gpus"]]
+                node["free_gpu_uuids"] = [gpu["uuid"] for gpu in node["gpus"][:2]]
                 return node
 
             def sample(request_id):
@@ -87,7 +91,7 @@ def test_inspection_reserves_only_cpu_and_releases_all_actors(
     ray.kill = lambda actor, **kwargs: killed.append(actor)
     state = types.ModuleType("ray._private.state")
     state.available_resources_per_node = lambda: {
-        n["node_id"]: {"CPU": 63, "GPU": 8} for n in facts
+        n["node_id"]: {"CPU": 63, "GPU": ray_free} for n in facts
     }
     strategies = types.ModuleType("ray.util.scheduling_strategies")
     strategies.NodeAffinitySchedulingStrategy = lambda *args, **kwargs: None
@@ -104,6 +108,12 @@ def test_inspection_reserves_only_cpu_and_releases_all_actors(
         result = _inspect_task_nodes_worker(config, run.to_dict())
         assert len(result) == 3
         assert all(n["cpu_available"] == 64 for n in result)
+        assert all(
+            n["gpu_available"] == min(ray_free, 8 if sharing == "shared" else 2)
+            for n in result
+        )
+        assert all(n["ray_gpu_available"] == ray_free for n in result)
+        assert all(len(n["free_gpu_uuids"]) == 2 for n in result)
         assert len(samples) == len(result)
         assert all(now[0] - n["request_sent_at"] < 5 for n in result)
     assert len(killed) == len(actors) == 3

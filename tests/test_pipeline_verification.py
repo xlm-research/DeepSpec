@@ -4,6 +4,7 @@ import copy
 import hashlib
 import json
 import pickle
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -21,6 +22,17 @@ from deepspec.pipeline.verification import (
     verify_release,
 )
 from tests.pipeline_topology_fixtures import input_plan, node_facts, task_config
+
+
+def save_native_checkpoint(state, path):
+    from torchtitan.components.checkpointer import CheckpointManager
+
+    # Exercise the same model-key flattening that native PhaseCheckpointer saves.
+    states = {**state, "model": SimpleNamespace(state_dict=lambda: state["model"])}
+    payload = CheckpointManager._flattened_model_states_sd(
+        SimpleNamespace(states=states)
+    )
+    dcp.save(payload, checkpoint_id=path, no_dist=True)
 
 
 def make_checkpoint(tmp_path, dp=1, steps=3, mutate=None):
@@ -86,7 +98,7 @@ def make_checkpoint(tmp_path, dp=1, steps=3, mutate=None):
     if mutate:
         mutate(state)
     path = tmp_path / "checkpoints" / f"step-{steps}"
-    dcp.save(state, checkpoint_id=path, no_dist=True)
+    save_native_checkpoint(state, path)
     commit = {
         "format_version": 1,
         "checkpoint": str(path),
@@ -126,6 +138,14 @@ def test_complete_native_state_uses_plan_counts_and_cpu_only(tmp_path, dp, steps
         (lambda s: s["dataloader"].update(next_global_microbatch=6), "cursor"),
         (lambda s: s["train_state"].update(step=2), "step"),
         (lambda s: s["train_state"].update(training_identity="wrong"), "identity"),
+        (lambda s: s["model"].pop("fc.weight"), "coverage"),
+        (lambda s: s["model"].update(extra=torch.zeros(1)), "coverage"),
+        (
+            lambda s: s["model"].update(
+                {"model.fc.weight": s["model"].pop("fc.weight")}
+            ),
+            "coverage",
+        ),
         (lambda s: s.pop("lr_scheduler"), "coverage"),
         (lambda s: s["optimizer"]["state"]["fc.weight"].pop("exp_avg"), "coverage"),
         (lambda s: s["train_state"].pop("rank_3"), "coverage"),
@@ -156,6 +176,14 @@ def test_wrong_teacher_in_initial_expectation_is_rejected(tmp_path):
         verify_checkpoint(plan, path, expectations, memory_budget_bytes=2**20)
 
 
+def test_model_and_auxiliary_checkpoint_key_collision_is_rejected(tmp_path):
+    plan, path, expectations = make_checkpoint(tmp_path)
+    for value in expectations:
+        value["schema"]["fc.weight"] = value["schema"]["model.fc.weight"]
+    with pytest.raises(ValueError, match="collide"):
+        verify_checkpoint(plan, path, expectations, memory_budget_bytes=2**20)
+
+
 @pytest.mark.parametrize("fault", ["missing_file", "truncated", "tensor_hole"])
 def test_missing_dcp_storage_or_tensor_range_is_rejected(tmp_path, fault):
     plan, path, expectations = make_checkpoint(tmp_path)
@@ -166,9 +194,7 @@ def test_missing_dcp_storage_or_tensor_range_is_rejected(tmp_path, fault):
         storage.write_bytes(b"partial")
     else:
         metadata = pickle.loads((path / ".metadata").read_bytes())
-        metadata.state_dict_metadata["model.fc.weight"].chunks[0].sizes = torch.Size(
-            [1, 3]
-        )
+        metadata.state_dict_metadata["fc.weight"].chunks[0].sizes = torch.Size([1, 3])
         (path / ".metadata").write_bytes(pickle.dumps(metadata))
         commit = json.loads((path / "commit.json").read_text())
         commit["metadata_sha256"] = hashlib.sha256(
@@ -418,7 +444,7 @@ def test_native_optimizer_flat_state_and_scheduler_survive_independent_cpu_load(
         optimizer.step()
         scheduler.step()
     state = _native_state(model, optimizer, scheduler, plan, step=3)
-    dcp.save(state, checkpoint_id=path, no_dist=True)
+    save_native_checkpoint(state, path)
     commit = json.loads((path / "commit.json").read_text())
     commit["metadata_sha256"] = hashlib.sha256(
         (path / ".metadata").read_bytes()
@@ -564,13 +590,13 @@ def test_complete_verification_requires_every_rank_native_commit(tmp_path, fault
         events.pop()
     elif fault == "foreign_commit":
         events[-1]["data"]["commit_identity"] = "different-checkpoint"
-    kwargs = dict(
-        events=events,
-        source=source,
-        registries=[registry],
-        cleanup=cleanup,
-        memory_budget_bytes=2**20,
-    )
+    kwargs = {
+        "events": events,
+        "source": source,
+        "registries": [registry],
+        "cleanup": cleanup,
+        "memory_budget_bytes": 2**20,
+    }
     if fault:
         with pytest.raises(ValueError, match="commit"):
             verify_execution(plan, path, **kwargs)

@@ -1,9 +1,15 @@
 # Qwen3.8：Ray + Mooncake + vLLM + TorchTitan
 
+当前 B300 使用 `source ./env.sh` 激活 conda；单机入口及明天多机接入命令见
+[B300 调试交接](B300_DEBUG.md)。本页其余 H800 地址和旧训练记录保留原有证据范围。
+
 > 2026-09-20：`train.sh`、`train_multinode.sh`、`ray_mutilnode_train.sh train` 仍转入 `deepspec.pipeline.run`，该 Python 入口现统一执行 v3 preview/controller。先 `source ./h800conda.sh` 使用现有 `PIPELINE_PYTHON`；当前验证与六命令用法见 [流水线说明](../../../deepspec/pipeline/README.md) 和 [验收报告](../../../specs/001-unify-ray-topology/acceptance-report.md)。下文旧地址、训练结果和峰值压力模式属于历史记录；`retain_for_peak` 模式目前迁移时明确拒绝，勿将旧成功视为新入口验收。外部 Ray 由脚本管理，controller 仅回收本次登记资源。
 
 实际操作请先读 [训练操作指南](TRAINING_GUIDE.md)：按顺序说明何时启动 Ray、何时自动启动 Mooncake，
 以及 A/B 两台机器分别执行的命令、全十六卡参数、日志和退出方式。
+
+查看 loss 曲线：启动前设置 `WANDB_MODE=online`、`WANDB_PROJECT=deepspec` 和
+`WANDB_NAME`，用法及多机认证见 [W&B loss 曲线](../../../deepspec/pipeline/README.md#wb-loss-曲线)。
 
 当前多机推荐使用统一入口 [`ray_mutilnode_train.sh`](ray_mutilnode_train.sh)，按
 [训练指南第 0 节](TRAINING_GUIDE.md#0-当前统一入口-ray_mutilnode_trainsh) 依次执行 `head`、`worker`、

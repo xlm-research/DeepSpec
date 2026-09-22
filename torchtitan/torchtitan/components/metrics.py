@@ -144,12 +144,13 @@ class WandBLogger(BaseLogger):
         self.tag = tag
 
         # Create logging directory
+        log_dir = os.getenv("WANDB_DIR") or log_dir
         os.makedirs(log_dir, exist_ok=True)
 
         self.wandb.init(
-            entity=os.getenv("WANDB_TEAM", None),
+            entity=os.getenv("WANDB_ENTITY", os.getenv("WANDB_TEAM")),
             project=os.getenv("WANDB_PROJECT", "torchtitan"),
-            name=os.getenv("WANDB_RUN_NAME", None),
+            name=os.getenv("WANDB_NAME", os.getenv("WANDB_RUN_NAME")),
             id=os.getenv("WANDB_RUN_ID", None),
             notes=os.getenv("WANDB_RUN_NOTES", None),
             tags=os.getenv("WANDB_RUN_TAGS", None),

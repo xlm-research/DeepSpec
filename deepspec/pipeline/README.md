@@ -42,6 +42,38 @@ unknown。预算等待按原因和本地单调时钟时长记录，缺失测量�
 
 旧 `deepspec.pipeline.run` 和 `cluster.launch_cluster` 已转接同一 v3 planning/controller，旧脚本仍传递显式参数和 `PIPELINE_PYTHON`。生产 DP2、训练 DP1 不再被入口耦合限制。TCP 配置中的 `rdma_devices` 原样保留，不因此切换协议。历史 `retain_for_peak` 保留对象压力模式目前由 v3 迁移明确拒绝，不能当作已兼容。
 
+需要与已有任务共享物理 GPU 时，在训练脚本追加 `--gpu-sharing shared`，或在 v3
+配置中设置 `"gpu_sharing": "shared"`。默认值为 `exclusive`。该选项写入冻结计划，
+允许设备上存在外部 GPU 进程；仍受 Ray 可用 GPU 配额、节点内存预算和本轮
+placement/rank 归属检查约束。节点观测保留实际空闲 GPU 与外部进程信息，退出只回收
+本轮登记的资源。共享任务之间的显存需求和计算负载会相互影响。
+
+## W&B loss 曲线
+
+在执行 `run` 或训练脚本的终端设置下列变量，再使用原有训练命令：
+
+```bash
+export WANDB_MODE=online
+export WANDB_PROJECT=deepspec
+export WANDB_NAME=dspark-experiment
+```
+
+训练环境需已执行 `wandb login`，或通过环境变量提供 `WANDB_API_KEY`。
+多机运行会将 driver 的 `WANDB_*` 变量传递给训练 launcher；账号信息不写入
+任务配置或冻结计划。只有 metrics rank 创建 run，TensorBoard 同时保留。
+`consumer.log` 中可找到 W&B run 链接。
+
+W&B 中选择 `loss_metrics/global_avg_loss` 查看每次 optimizer update 的总 loss；
+分项为 `train/ce_loss`、`train/l1_loss` 和 `train/confidence_loss`。
+横轴 `Step` 对应 optimizer step，训练流水线每次更新记录一次。
+如将 preview 和 run 分开执行，应在执行 run 的终端设置上述变量。
+
+无法联网时使用 `WANDB_MODE=offline`，之后执行
+`wandb sync /path/to/wandb/offline-run-*` 上传。
+本地记录默认位于本轮输出的 `training/tb/<时间>/wandb/`，可用 `WANDB_DIR` 指定目录。
+未设置 `WANDB_MODE` 或设置为 `disabled` 时不启用 W&B。
+常规 `train.py` 的对应配置见[项目说明](../../README.md#wb-loss-curves)。
+
 ## 历史入口与训练记录（以下为改造前记录）
 
 本目录增量接入现有 vLLM 特征提取与 TorchTitan DSpark 训练。

@@ -1,5 +1,6 @@
 """Independent node sampling, outside model/Store RPC executors."""
 
+import subprocess
 import threading
 from pathlib import Path
 
@@ -34,10 +35,25 @@ class ResourceSampler:
             ("processes", lambda: process_memory(self.plan["run_id"])),
             ("gpu_processes", lambda: gpu_processes(self.plan["run_id"])),
         ):
-            try:
-                data[field] = sample()
-            except Exception as error:  # noqa: BLE001 -- failed observations remain explicit missing evidence
-                data[field], missing[field] = None, repr(error)
+            for attempt in range(3):
+                try:
+                    data[field] = sample()
+                    break
+                except Exception as error:  # noqa: BLE001 -- failed observations remain explicit missing evidence
+                    # GPU teardown can briefly block nvidia-smi. Retry only its
+                    # bounded 10-second timeout, retaining every failed attempt.
+                    # A persistent failure still creates missing evidence.
+                    if (
+                        field == "gpu_processes"
+                        and isinstance(error, subprocess.TimeoutExpired)
+                        and attempt < 2
+                    ):
+                        data.setdefault("sample_retries", {}).setdefault(
+                            field, []
+                        ).append(repr(error))
+                        continue
+                    data[field], missing[field] = None, repr(error)
+                    break
         self.events.emit("resource_sample", data, basis="observed", missing=missing)
 
     def _run(self):

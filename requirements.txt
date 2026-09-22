@@ -8,6 +8,7 @@ numpy==2.4.4
 PyYAML==6.0.3
 tqdm==4.67.3
 tensorboard==2.20.0
+wandb==0.28.0
 matplotlib==3.10.9
 triton==3.5.1
 typing_extensions==4.15.0

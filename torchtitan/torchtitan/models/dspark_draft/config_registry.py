@@ -1,5 +1,7 @@
 """Native component recipe for the initial Qwen DSpark integration."""
 
+import os
+
 from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
 
 from torchtitan.components.checkpointer import CheckpointManager
@@ -71,7 +73,11 @@ def qwen38_debug() -> DSparkTrainer.Config:
         parallelism=ParallelismConfig(data_parallel_shard_degree=1),
         checkpoint=CheckpointManager.Config(enable=False),
         activation_checkpoint=None,
-        metrics=MetricsProcessor.Config(log_freq=1, enable_tensorboard=True),
+        metrics=MetricsProcessor.Config(
+            log_freq=1,
+            enable_tensorboard=True,
+            enable_wandb=os.environ.get("WANDB_MODE") in ("online", "offline"),
+        ),
         debug=DebugConfig(seed=1000),
     )
 

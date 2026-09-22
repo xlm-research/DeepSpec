@@ -12,11 +12,22 @@ from tests.pipeline_topology_fixtures import input_plan, node_facts, task_config
 
 
 @pytest.mark.parametrize("layout", ["M0", "M1-12"])
+@pytest.mark.parametrize("wandb_mode", [None, "offline"])
 def test_training_group_owns_whole_local_bundle_and_registers_before_torchrun(
-    tmp_path, layout
+    tmp_path, layout, wandb_mode, monkeypatch
 ):
     from deepspec.pipeline.groups import TrainingGroup
 
+    wandb_env = {
+        "WANDB_PROJECT": "dspark-test",
+        "WANDB_NAME": "training-test",
+        "WANDB_API_KEY": "test-only-key",
+    }
+    monkeypatch.delenv("WANDB_MODE", raising=False)
+    if wandb_mode is not None:
+        wandb_env["WANDB_MODE"] = wandb_mode
+    for key, value in wandb_env.items():
+        monkeypatch.setenv(key, value)
     config = task_config(layout, output_dir=tmp_path)
     plan = build_plan(
         config, node_facts(config), input_plan(config), run_id="train-group", now=100
@@ -49,6 +60,9 @@ def test_training_group_owns_whole_local_bundle_and_registers_before_torchrun(
             )
             assert strategy.placement_group_capture_child_tasks is False
             assert kwargs["gate"] is gate and kwargs["native_plan"] == plan
+            env = options["runtime_env"]["env_vars"]
+            assert {key: env[key] for key in wandb_env} == wandb_env
+            assert env["WANDB_MODE"] == (wandb_mode or "disabled")
             return SimpleNamespace(
                 **{
                     name: method(name)

@@ -124,6 +124,7 @@ class TaskNodeInspector:
         versions_value = {"python": sys.version, "python_executable": sys.executable, "packages": versions()}
         return {"node_id": node_id, "ip": ip, "hostname": socket.gethostname(), "alive": True,
                 "gpus": inventory, "free_gpu_uuids": [g["uuid"] for g in inventory if g["uuid"] not in busy],
+                "gpu_uuids_in_use": sorted(busy),
                 "memory": node_memory(), "identities": {
                     "source": content_hash(source_hashes(ROOT)), "dependencies": content_hash(versions_value),
                     "model": content_hash(model_identity(config["model_path"])), "input": digest.hexdigest()},
@@ -191,8 +192,11 @@ def _inspect_task_nodes_worker(config, run):
             if path.read_text() != token:
                 raise PipelineError("SHARED_PATH_UNAVAILABLE", "Remote write is not visible to controller", field_path="output_dir", exit_code=4)
             free = available.get(report["node_id"], {})
+            sharing = config.get("gpu_sharing", "exclusive")
+            eligible = report["gpus"] if sharing == "shared" else report["free_gpu_uuids"]
             report.update(ray_address=resolved_address, request_sent_at=sent_at, cpu_available=free.get("CPU", 0)+1,
-                          gpu_available=min(free.get("GPU", 0), len(report["free_gpu_uuids"])))
+                          gpu_sharing=sharing, ray_gpu_available=free.get("GPU", 0),
+                          gpu_available=min(free.get("GPU", 0), len(eligible)))
         return reports
     finally:
         cleanup_errors = []
@@ -672,9 +676,11 @@ class NodeAgent:
         selected = set(request["gpu_uuids"])
         observed = gpu_processes(self.plan["run_id"], self.known_owned)
         foreign = [p for p in observed if p["gpu_uuid"] in selected and not p["owned"]]
-        if foreign:
+        sharing = self.plan["config"].get("gpu_sharing", "exclusive")
+        if foreign and sharing != "shared":
             raise RuntimeError(f"Allocated devices contain external processes: {foreign}")
-        return self._reply(node_id=self.node_id, gpu_uuids=sorted(selected), external_processes=[])
+        return self._reply(node_id=self.node_id, gpu_uuids=sorted(selected),
+                           gpu_sharing=sharing, external_processes=foreign)
 
     def cleanup(self, *, orphan=False, timeout=None):
         from deepspec.orchestration.process import signal_process
@@ -724,7 +730,7 @@ class NodeAgent:
             if self.sampler is not None:
                 try:
                     self.sampler.stop(timeout=deadline.remaining())
-                except Exception as error:
+                except Exception as error:  # noqa: BLE001 -- record sampler failure without skipping cleanup evidence
                     report["cleanup_complete"] = False
                     report["errors"].append({"sampler": str(error)})
             atomic_json(self.output / f"{'orphan' if orphan else 'cleanup'}-{self.node_id}.json", report)

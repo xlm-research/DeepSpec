@@ -600,6 +600,9 @@ class BaseTrainer:
         training_logger.init(
             logging_steps=int(self.args.logging.logging_steps),
             tensorboard_dir=self.args.logging.tensorboard_dir,
+            project_name=self.args.get("project_name", "deepspec"),
+            exp_name=self.args.get("exp_name"),
+            config=self.args,
         )
 
         if self.partitioned_model_swap_enabled:

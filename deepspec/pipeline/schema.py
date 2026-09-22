@@ -254,6 +254,7 @@ def upgrade_task_config(value):
         "layout": layout,
         "ray_address": choose("cluster_address", "ray_address", default="auto")
         or "auto",
+        "gpu_sharing": choose("gpu_sharing", default="exclusive"),
         "model_path": value.get("model_path"),
         "output_dir": value.get("output_dir"),
         "nodes": nodes,
@@ -379,6 +380,7 @@ def normalize_task_config(value):
         error = errors[0]
         path = ".".join(map(str, error.absolute_path)) or "$"
         reject(error.message, path)
+    config.setdefault("gpu_sharing", "exclusive")
     config["transport"].setdefault("rdma_devices", "")
     config["timeouts_seconds"].setdefault("budget_snapshot", 5)
     if config["timeouts_seconds"]["heartbeat"] >= config["timeouts_seconds"]["lease"]:

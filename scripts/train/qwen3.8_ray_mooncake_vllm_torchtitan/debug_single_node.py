@@ -315,6 +315,8 @@ def training_command(args, output, context):
         "cpu",
         "--timeout-seconds",
         str(args.timeout_seconds),
+        "--allocation-timeout-seconds",
+        str(args.allocation_timeout_seconds),
     ]
 
 
@@ -576,6 +578,7 @@ def main():
     parser.add_argument("--writer-inflight", type=int, default=2)
     parser.add_argument("--epochs", type=int)
     parser.add_argument("--timeout-seconds", type=int)
+    parser.add_argument("--allocation-timeout-seconds", type=int, default=120)
     parser.add_argument("--probe-timeout", type=int, default=600)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument(
@@ -605,6 +608,7 @@ def main():
         args.pool_gib,
         args.steps,
         args.timeout_seconds,
+        args.allocation_timeout_seconds,
         args.probe_timeout,
         args.producer_batch_size,
         args.writer_inflight,

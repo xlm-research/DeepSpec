@@ -42,6 +42,37 @@ The modular PyTorch-native FSDP2/TP/fixed-CP architecture, torchrun profiles,
 distributed-checkpoint migration notes, support matrix, and validated commands
 are documented in [doc/distributed_training.md](./doc/distributed_training.md).
 
+### W&B loss curves
+
+Set the following in the shell that launches training, then run your usual
+DSpark command (including the Ray + TorchTitan launchers):
+
+```bash
+export WANDB_MODE=online
+export WANDB_PROJECT=deepspec
+export WANDB_NAME=dspark-experiment
+```
+
+Authenticate with `wandb login` in the training environment, or supply
+`WANDB_API_KEY` through the environment. Ray forwards `WANDB_*` variables to
+the training launchers, including across nodes; a login on the driver alone
+does not authenticate a remote node with a different home directory.
+Only the metrics rank writes a run. Existing TensorBoard logging is retained.
+
+The `train.py` trainer records `train/loss`, `train/ce_loss`, `train/l1_loss`,
+and `train/confidence_loss` when available, along with learning rate, gradient
+norm, and acceptance metrics. Its x-axis is `global_step`, and
+`logging.logging_steps` controls the interval. TorchTitan records total loss as
+`loss_metrics/global_avg_loss`, with the same `train/*` loss components, using
+optimizer steps as the x-axis; the streaming pipeline logs every update.
+
+For offline collection use `WANDB_MODE=offline`, then upload the resulting
+directory with `wandb sync /path/to/wandb/offline-run-*`. Local files default
+to the TensorBoard log directory; set `WANDB_DIR` to override it.
+Unset `WANDB_MODE` or use `WANDB_MODE=disabled` to disable W&B for DSpark.
+See the [W&B environment variable reference](https://docs.wandb.ai/models/track/environment-variables)
+for entity, server, and resume settings.
+
 
 ## Evaluation
 

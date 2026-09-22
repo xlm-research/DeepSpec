@@ -15,7 +15,6 @@ from deepspec.utils import (
 )
 
 os.environ['USE_TORCH']='true'
-os.environ['WANDB_DISABLED']='true'
 os.environ['TOKENIZERS_PARALLELISM']='false'
 torch.set_float32_matmul_precision("high")
 faulthandler.enable(all_threads=True)

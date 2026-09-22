@@ -204,6 +204,12 @@ def notify_buffer_failure(buffer, config, error, *, message):
 EVENT_FIELDS = {
     "phase_duration": ("phase", "duration_seconds"),
     "resource_sample": ("memory", "processes", "gpu_processes"),
+    "gpu_occupancy_observed": (
+        "node_id",
+        "gpu_uuids",
+        "gpu_sharing",
+        "external_processes",
+    ),
     "node_environment": ("identities", "placement"),
     "feature_produced": ("position", "nbytes", "tokens", "duration_seconds"),
     "feature_read": (

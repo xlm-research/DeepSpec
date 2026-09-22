@@ -8,6 +8,38 @@ from deepspec.pipeline import cli
 from tests.pipeline_topology_fixtures import input_plan, node_facts, task_config
 
 
+def test_legacy_cli_allocation_deadline_survives_v3_upgrade(tmp_path, monkeypatch):
+    from deepspec.pipeline import legacy, run
+    from deepspec.pipeline.schema import upgrade_task_config
+
+    captured = []
+
+    def capture(config, **kwargs):
+        captured.append(upgrade_task_config(config).to_dict())
+        return {"state": "succeeded"}
+
+    monkeypatch.setattr(legacy, "run_config", capture)
+    assert (
+        run.main(
+            [
+                "--source",
+                str(tmp_path / "input.jsonl"),
+                "--output",
+                str(tmp_path / "run"),
+                "--allocation-timeout-seconds",
+                "600",
+                "--timeout-seconds",
+                "3600",
+            ]
+        )
+        == 0
+    )
+    policy = captured[0]["timeouts_seconds"]
+    assert policy["allocation"] == 600
+    assert policy["run"] == policy["initialization"] == policy["transfer"] == 3600
+    assert policy["cleanup"] == 120
+
+
 def install_cpu_backend(monkeypatch):
     calls = {"inspect": 0, "prepare": 0}
 

@@ -25,6 +25,90 @@ def memory(headroom=236):
     }
 
 
+def test_cgroup_headroom_excludes_clean_inactive_cache_only(tmp_path):
+    from deepspec.pipeline.memory import _cgroup_memory
+
+    (tmp_path / "memory.current").write_text(str(490 * GIB))
+    (tmp_path / "memory.stat").write_text(
+        "\n".join(
+            f"{key} {value * GIB}"
+            for key, value in {
+                "file": 400,
+                "inactive_file": 300,
+                "active_file": 100,
+                "shmem": 5,
+                "file_dirty": 10,
+                "file_writeback": 3,
+                "unevictable": 2,
+                "anon": 70,
+                "slab_reclaimable": 10,
+            }.items()
+        )
+    )
+    result = _cgroup_memory(tmp_path, 500 * GIB)
+    assert result["raw_headroom_bytes"] == 10 * GIB
+    assert result["reclaimable_file_bytes"] == 285 * GIB
+    assert result["headroom_bytes"] == 295 * GIB
+
+
+@pytest.mark.parametrize("stats", [None, "inactive_file 100", "file invalid"])
+def test_cgroup_missing_stats_keeps_raw_usage_bound(tmp_path, stats):
+    from deepspec.pipeline.memory import _cgroup_memory
+
+    (tmp_path / "memory.current").write_text("490")
+    if stats is not None:
+        (tmp_path / "memory.stat").write_text(stats)
+    result = _cgroup_memory(tmp_path, 500)
+    assert result["reclaimable_file_bytes"] == 0
+    assert result["headroom_bytes"] == 10
+
+
+def test_cgroup_dirty_or_shmem_cache_does_not_become_available(tmp_path):
+    from deepspec.pipeline.memory import _cgroup_memory
+
+    (tmp_path / "memory.current").write_text("510")
+    (tmp_path / "memory.stat").write_text(
+        "file 400\ninactive_file 300\nshmem 390\nfile_dirty 8\n"
+        "file_writeback 3\nunevictable 0\n"
+    )
+    result = _cgroup_memory(tmp_path, 500)
+    assert result["reclaimable_file_bytes"] == result["headroom_bytes"] == 0
+
+
+def test_node_headroom_still_obeys_parent_cgroup_and_physical_memory(
+    tmp_path, monkeypatch
+):
+    from pathlib import Path
+
+    from deepspec.pipeline import memory as module
+
+    proc = tmp_path / "proc"
+    group = tmp_path / "sys/fs/cgroup"
+    (proc / "self").mkdir(parents=True)
+    (group / "job").mkdir(parents=True)
+    (proc / "self/cgroup").write_text("0::/job\n")
+    (proc / "meminfo").write_text("MemTotal: 1000 kB\nMemAvailable: 200 kB\n")
+    for folder, limit, used in [
+        (group, 500 * 1024, 450 * 1024),
+        (group / "job", 500 * 1024, 100 * 1024),
+    ]:
+        (folder / "memory.max").write_text(str(limit))
+        (folder / "memory.current").write_text(str(used))
+    # Preserve the absolute paths used by the hierarchy walk; redirect file I/O.
+    read_text, exists = Path.read_text, Path.exists
+
+    def redirect(path):
+        return tmp_path / str(path).lstrip("/")
+
+    monkeypatch.setattr(Path, "read_text", lambda path: read_text(redirect(path)))
+    monkeypatch.setattr(Path, "exists", lambda path: exists(redirect(path)))
+    result = module.node_memory()
+    assert result["headroom_bytes"] == 50 * 1024
+    assert len(result["cgroups"]) == 2
+    (group / "memory.current").write_text(str(10 * 1024))
+    assert module.node_memory()["headroom_bytes"] == 200 * 1024
+
+
 def charge(**overrides):
     return {
         "allocation_id": "pinned-pool",

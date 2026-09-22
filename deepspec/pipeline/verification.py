@@ -293,14 +293,20 @@ def verify_checkpoint(plan, path, expectations, *, memory_budget_bytes):
         raise ValueError(
             "Native commit identity or progress differs from the frozen plan"
         )
+    # Native CheckpointManager._flattened_model_states_sd saves model FQNs at
+    # the root. Initial expectations keep their component prefix so model
+    # coverage and update evidence remain distinct from auxiliary state.
+    storage_keys = {key: key.removeprefix("model.") for key in schema}
+    if len(set(storage_keys.values())) != len(schema):
+        raise ValueError("Native checkpoint keys collide after model flattening")
     metadata = FileSystemReader(path).read_metadata()
-    if set(metadata.state_dict_metadata) != set(schema):
+    if set(metadata.state_dict_metadata) != set(storage_keys.values()):
         raise ValueError("Native checkpoint state coverage differs from initialization")
     if not metadata.storage_data:
         raise ValueError("DCP storage range metadata is missing")
     largest = 0
-    for key, description in metadata.state_dict_metadata.items():
-        expected = schema[key]
+    for key, expected in schema.items():
+        description = metadata.state_dict_metadata[storage_keys[key]]
         if isinstance(description, TensorStorageMetadata):
             if {
                 "shape": list(description.size),
@@ -356,19 +362,23 @@ def verify_checkpoint(plan, path, expectations, *, memory_budget_bytes):
     }
     changed_found, loaded = set(), set()
     for key in sorted(schema):
-        values = _load_keys(path, {key})
-        if set(values) != {key}:
+        storage_key = storage_keys[key]
+        values = _load_keys(path, {storage_key})
+        if set(values) != {storage_key}:
             raise ValueError(
-                f"Native DCP did not load exactly the requested field: {key}"
+                f"Native DCP did not load exactly the requested field: {storage_key}"
             )
-        value = values[key]
+        value = values[storage_key]
         if not _finite(value):
             raise ValueError(f"Native checkpoint contains non-finite state: {key}")
         if key in scalars and value != scalars[key]:
             raise ValueError(f"Native checkpoint identity/step/cursor differs: {key}")
-        if key.startswith("optimizer.") and key.endswith(".step"):
-            if value != counts["optimizer_steps"]:
-                raise ValueError(f"Native optimizer step differs: {key}")
+        if (
+            key.startswith("optimizer.")
+            and key.endswith(".step")
+            and value != counts["optimizer_steps"]
+        ):
+            raise ValueError(f"Native optimizer step differs: {key}")
         if key.startswith("model."):
             for piece in initial[key]:
                 slices = tuple(

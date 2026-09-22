@@ -17,6 +17,8 @@ deepspec/utils/constant/internal.py
 
 # Experiment outputs and local environment snapshots
 /outputs/
+/wandb/
+/debug_logs/
 /envs/deepspec_vllm_torchtitan_envs-old.tar
 
 # Python environments and tool caches

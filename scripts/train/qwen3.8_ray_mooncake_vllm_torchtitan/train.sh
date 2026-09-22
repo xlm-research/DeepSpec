@@ -12,7 +12,7 @@ export PYTHONPATH="${REPO_ROOT}:${REPO_ROOT}/torchtitan:${REPO_ROOT}/vllm"
 DEFAULT_OUTPUT="${REPO_ROOT}/outputs/qwen3.8_ray_mooncake_vllm_torchtitan_$(date +%Y%m%d_%H%M%S)_$$"
 launch_command=(
     "${PIPELINE_PYTHON}" -u -m deepspec.pipeline.run
-    --model /mnt/afs_agents/hongjiawei/share_models/Qwen/Qwen3.8-27B
+    --model "${TARGET_MODEL_PATH:-/mnt/afs-agentpro/share/models/Qwen/Qwen3.8-27B}"
     --source "${REPO_ROOT}/outputs/dspark_torchtitan_orchestration_20260914/128k-source.jsonl"
     --output "${DEFAULT_OUTPUT}"
     --context-length 4096

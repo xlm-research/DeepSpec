@@ -199,12 +199,26 @@ class NativeCoordination(AllocationGate):
             deadline.remaining(),
         )
         self._validate(reply)
+        sharing = self.plan["config"].get("gpu_sharing", "exclusive")
+        external = reply.get("external_processes")
         if (
             reply.get("node_id") != message["node_id"]
             or sorted(reply.get("gpu_uuids", [])) != sorted(devices)
-            or reply.get("external_processes") != []
+            or reply.get("gpu_sharing", "exclusive") != sharing
+            or not isinstance(external, list)
+            or (sharing != "shared" and external)
         ):
-            raise ValueError("NodeAgent did not confirm exclusive allocated GPU use")
+            raise ValueError("NodeAgent did not confirm the planned GPU sharing policy")
+        self.events.emit(
+            "gpu_occupancy_observed",
+            {
+                "node_id": message["node_id"],
+                "gpu_uuids": sorted(devices),
+                "gpu_sharing": sharing,
+                "external_processes": external,
+            },
+            basis="observed",
+        )
 
     async def observe_native(self, message, *, timeout):
         """Fence the real process before allowing any worker to initialize CUDA."""

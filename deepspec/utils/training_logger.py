@@ -1,24 +1,61 @@
+import json
+import os
 import time
 from typing import Optional
 
 from torch.utils.tensorboard import SummaryWriter
 
-from deepspec.utils import ensure_dir, is_global_main_process, print_on_global_main
+from deepspec.utils import (
+    CustomJSONEncoder,
+    ensure_dir,
+    is_global_main_process,
+    print_on_global_main,
+)
 from deepspec.utils.metrics import add_metric, flush_async, reset
 
 
 _writer: Optional[SummaryWriter] = None
+_wandb_run = None
 _logging_steps: int = 1
 _session_start_wall: Optional[float] = None
 _session_start_step: int = 0
 
 
-def init(*, logging_steps: int, tensorboard_dir: Optional[str] = None) -> None:
-    global _writer, _logging_steps
+def init(
+    *,
+    logging_steps: int,
+    tensorboard_dir: Optional[str] = None,
+    project_name: str = "deepspec",
+    exp_name: Optional[str] = None,
+    config=None,
+) -> None:
+    global _writer, _wandb_run, _logging_steps
+    close()
     _logging_steps = int(logging_steps)
-    if tensorboard_dir is not None and is_global_main_process():
+    if not is_global_main_process():
+        return
+    if tensorboard_dir is not None:
         ensure_dir(tensorboard_dir)
         _writer = SummaryWriter(tensorboard_dir)
+    if os.environ.get("WANDB_MODE") in ("online", "offline"):
+        # Other ranks and runs with W&B disabled need no SDK or credentials.
+        import wandb
+
+        log_dir = os.environ.get("WANDB_DIR") or tensorboard_dir or "."
+        ensure_dir(log_dir)
+        _wandb_run = wandb.init(
+            project=os.environ.get("WANDB_PROJECT", project_name),
+            name=os.environ.get(
+                "WANDB_NAME", os.environ.get("WANDB_RUN_NAME", exp_name)
+            ),
+            entity=os.environ.get("WANDB_ENTITY", os.environ.get("WANDB_TEAM")),
+            dir=log_dir,
+            config=json.loads(json.dumps(config, cls=CustomJSONEncoder)),
+        )
+        _wandb_run.define_metric("global_step")
+        _wandb_run.define_metric("*", step_metric="global_step")
+        if os.environ.get("WANDB_MODE") == "online" and _wandb_run.url:
+            print_on_global_main(f"W&B loss curves: {_wandb_run.url}")
 
 
 def start_session(*, global_step: int) -> None:
@@ -78,17 +115,25 @@ def on_optimizer_step(**kwargs):
 
 
 def close() -> None:
-    global _writer
-    if _writer is not None:
-        _writer.close()
-        _writer = None
+    global _writer, _wandb_run
+    writer, run = _writer, _wandb_run
+    _writer = _wandb_run = None
+    try:
+        if writer is not None:
+            writer.close()
+    finally:
+        if run is not None:
+            run.finish()
 
 
 def _write_scalars(summary, *, global_step: int) -> None:
-    if _writer is None:
-        return
-    for key, value in summary.items():
-        _writer.add_scalar(key, value, global_step)
+    if _writer is not None:
+        for key, value in summary.items():
+            _writer.add_scalar(key, value, global_step)
+    if _wandb_run is not None:
+        _wandb_run.log(
+            {**summary, "global_step": global_step}, step=global_step, commit=True
+        )
 
 
 def _print_summary(

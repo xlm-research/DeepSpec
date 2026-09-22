@@ -436,7 +436,10 @@ def launch(config, config_path):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--model", default="/mnt/afs_agents/hongjiawei/share_models/Qwen/Qwen3.8-27B"
+        "--model",
+        default=os.environ.get(
+            "TARGET_MODEL_PATH", "/mnt/afs-agentpro/share/models/Qwen/Qwen3.8-27B"
+        ),
     )
     parser.add_argument("--source", required=True)
     parser.add_argument("--output", required=True)
@@ -455,12 +458,24 @@ def main(argv=None):
     parser.add_argument("--rdma-devices", default="")
     parser.add_argument("--receive-device", choices=("cpu", "cuda"), default="cpu")
     parser.add_argument("--timeout-seconds", type=int, default=1800)
+    parser.add_argument(
+        "--allocation-timeout-seconds",
+        type=int,
+        default=120,
+        help="Shared deadline for environment revalidation, transport probe and allocation",
+    )
     parser.add_argument("--prepare-only", action="store_true")
     parser.add_argument(
         "--ray-address", default="", help="Existing two-node Ray Head IP:port"
     )
     parser.add_argument("--producer-node", default="", help="Ray node IP or node ID")
     parser.add_argument("--consumer-node", default="", help="Ray node IP or node ID")
+    parser.add_argument(
+        "--gpu-sharing",
+        choices=("exclusive", "shared"),
+        default="exclusive",
+        help="Allow external GPU processes with shared; Ray allocations remain reserved",
+    )
     parser.add_argument(
         "--producer-dp",
         type=int,
@@ -482,7 +497,13 @@ def main(argv=None):
     )
     args = parser.parse_args(argv)
     if (
-        min(args.producer_batch_size, args.epochs, args.prefetch_depth) < 1
+        min(
+            args.producer_batch_size,
+            args.epochs,
+            args.prefetch_depth,
+            args.allocation_timeout_seconds,
+        )
+        < 1
         or (args.writer_inflight is not None and args.writer_inflight < 1)
         or (args.prefetch_bytes is not None and args.prefetch_bytes < 1)
     ):
@@ -530,6 +551,7 @@ def main(argv=None):
         "window": args.window,
         "pool_bytes": args.pool_gib * GIB,
         "timeout_seconds": args.timeout_seconds,
+        "timeouts_seconds": {"allocation": args.allocation_timeout_seconds},
         "receive_device": args.receive_device,
         "verify_transfers": True,
         "events_path": str(output / "events.jsonl"),
@@ -540,6 +562,7 @@ def main(argv=None):
             "rdma_devices": args.rdma_devices,
         },
         "cluster_address": args.ray_address,
+        "gpu_sharing": args.gpu_sharing,
         "producer_node": args.producer_node,
         "consumer_node": args.consumer_node,
         "transport_only": args.transport_only,

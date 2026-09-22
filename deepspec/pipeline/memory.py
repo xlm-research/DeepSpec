@@ -250,6 +250,55 @@ class BudgetAdmission:
         return update_index in self.admitted
 
 
+def _cgroup_memory(current, limit):
+    """Include clean inactive file cache in available memory, never anonymous RSS.
+
+    memory.current includes page cache. Treating all of it as unreclaimable
+    rejects idle nodes after large model/dataset reads. Only credit the inactive
+    file list, conservatively subtracting all dirty/writeback and unevictable
+    pages; active cache, tmpfs, kernel memory and swap receive no credit.
+    https://docs.kernel.org/admin-guide/cgroup-v2.html#memory-interface-files
+    """
+    used = int((current / "memory.current").read_text())
+    reclaimable = 0
+    try:
+        stats = {
+            key: int(value)
+            for key, value in (
+                line.split()
+                for line in (current / "memory.stat").read_text().splitlines()
+            )
+        }
+        # Missing/invalid fields fail closed to the previous raw-usage bound.
+        required = (
+            "inactive_file",
+            "file",
+            "shmem",
+            "file_dirty",
+            "file_writeback",
+            "unevictable",
+        )
+        if all(stats.get(key, -1) >= 0 for key in required):
+            clean_file = max(0, stats["file"] - stats["shmem"])
+            reclaimable = max(
+                0,
+                min(used, stats["inactive_file"], clean_file)
+                - stats["file_dirty"]
+                - stats["file_writeback"]
+                - stats["unevictable"],
+            )
+    except (OSError, ValueError):
+        pass
+    return {
+        "path": str(current),
+        "limit_bytes": limit,
+        "current_bytes": used,
+        "reclaimable_file_bytes": reclaimable,
+        "raw_headroom_bytes": max(0, limit - used),
+        "headroom_bytes": max(0, limit - used + reclaimable),
+    }
+
+
 def node_memory():
     info = {}
     for line in Path("/proc/meminfo").read_text().splitlines():
@@ -265,6 +314,7 @@ def node_memory():
     if not current.exists():
         current = Path("/sys/fs/cgroup")
     limits, remaining = [info["MemTotal"]], [info["MemAvailable"]]
+    cgroups = []
     while str(current).startswith("/sys/fs/cgroup"):
         limit_file, used_file = current / "memory.max", current / "memory.current"
         if limit_file.exists() and used_file.exists():
@@ -272,7 +322,9 @@ def node_memory():
             if raw != "max":
                 limit = int(raw)
                 limits.append(limit)
-                remaining.append(max(0, limit - int(used_file.read_text())))
+                sample = _cgroup_memory(current, limit)
+                cgroups.append(sample)
+                remaining.append(sample["headroom_bytes"])
         if current == Path("/sys/fs/cgroup"):
             break
         current = current.parent
@@ -281,6 +333,7 @@ def node_memory():
         "available_bytes": info["MemAvailable"],
         "limit_bytes": min(limits),
         "headroom_bytes": min(remaining),
+        "cgroups": cgroups,
     }
 
 

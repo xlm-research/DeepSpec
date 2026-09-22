@@ -472,6 +472,7 @@ def prepare_input(config, run):
         "pool_bytes": config["store"]["pool_bytes"],
         "pool_utilization": config["store"]["utilization"],
         "cluster_address": config["ray_address"],
+        "gpu_sharing": config.get("gpu_sharing", "exclusive"),
         "verify_transfers": True,
         "receive_device": config["transport"]["receive_device"],
         "timeout_seconds": config["timeouts_seconds"]["transfer"],
@@ -523,8 +524,10 @@ def prepare_input(config, run):
         }
         length, teacher = sample["length"], legacy["teacher"]
         fields.update(
-            seq_len={"shape": [], "dtype": "int64"},
-            context_chunk_len={"shape": [], "dtype": "int64"},
+            # Match convert_hidden_states() and the native feature-cache format:
+            # lengths are one-element vectors, not zero-dimensional scalars.
+            seq_len={"shape": [1], "dtype": "int64"},
+            context_chunk_len={"shape": [1], "dtype": "int64"},
             target_hidden_states={
                 "shape": [
                     1,
