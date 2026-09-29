@@ -1,0 +1,63 @@
+# Each backend version is a directory under docker/<backend>/<version>/ holding a
+# Dockerfile, paired with patches/<backend>/<version>/ if that version needs
+# patching. Select one with BACKEND plus the matching *_VERSION:
+#
+#   BACKEND=sglang just build
+#   BACKEND=vllm VLLM_VERSION=v0.22.1 just build
+#
+# Since every backend builds to the same IMAGE_REPO:version tag, use
+# ARG_TAG_POSTFIX to keep two backends' images apart in one registry.
+#
+# Pipeline-parallel hidden-state export needs the patched nightly rather than a
+# released vLLM, because every pipeline stage has to return the aux hidden
+# states it owns and released vLLM captures on the last stage only:
+#
+#   BACKEND=vllm VLLM_VERSION=nightly-7794b1e08bf505ff28664515ffaaeeec955ab796 \
+#       ARG_TAG_POSTFIX=-vllm-pp just build
+#
+# That Dockerfile applies patches/vllm/<version>/series in order rather than
+# globbing, so a patched image is reproducible from this repo alone; see the
+# series file for what each patch is for and which ones are upstream candidates.
+BACKEND := env("BACKEND", "sglang")
+SGLANG_VERSION := env("SGLANG_VERSION", "v0.5.14")
+VLLM_VERSION := env("VLLM_VERSION", "v0.22.1")
+TRTLLM_VERSION := env("TRTLLM_VERSION", "v1.3.0rc18")
+IMAGE_REPO := env("IMAGE_REPO", "ghcr.io/torchspec-project/torchspec")
+IMAGE_TAG := env("IMAGE_TAG", "")
+
+_dockerfile := if BACKEND == "vllm" { "docker/vllm/" + VLLM_VERSION + "/Dockerfile" } else if BACKEND == "trtllm" { "docker/trtllm/" + TRTLLM_VERSION + "/Dockerfile" } else { "docker/sglang/" + SGLANG_VERSION + "/Dockerfile" }
+
+build:
+    ARG_TAG_POSTFIX="${ARG_TAG_POSTFIX:-""}" ARG_BUILD_EXTRA_ARGS="" just _build-only
+
+release-primary:
+    ARG_TAG_POSTFIX="${ARG_TAG_POSTFIX:-""}" ARG_BUILD_EXTRA_ARGS="" just _release-raw
+
+
+_build-only:
+    #!/bin/bash
+    set -euxo pipefail
+    cd ..
+
+    VERSION="${IMAGE_TAG:-$(tr -d '\n' < docker/version.txt)}"
+    IMAGE_TAG=${VERSION}${ARG_TAG_POSTFIX}
+    IMAGE_NAME="{{IMAGE_REPO}}:$IMAGE_TAG"
+
+    docker build -f {{_dockerfile}} . $ARG_BUILD_EXTRA_ARGS -t "$IMAGE_NAME"
+
+_release-raw:
+    #!/bin/bash
+    set -euxo pipefail
+    cd ..
+
+    VERSION="${IMAGE_TAG:-$(tr -d '\n' < docker/version.txt)}"
+    IMAGE_TAG=${VERSION}${ARG_TAG_POSTFIX}
+    IMAGE_NAME="{{IMAGE_REPO}}:$IMAGE_TAG"
+
+    docker build -f {{_dockerfile}} . $ARG_BUILD_EXTRA_ARGS -t "$IMAGE_NAME"
+    docker push "$IMAGE_NAME"
+
+    if [ -z "${ARG_TAG_POSTFIX}" ] && [ -z "{{IMAGE_TAG}}" ]; then
+        docker tag "$IMAGE_NAME" "{{IMAGE_REPO}}:latest"
+        docker push "{{IMAGE_REPO}}:latest"
+    fi

@@ -1,0 +1,92 @@
+# Kimi-K2.5 BF16 Eagle3 training — 2-node setup (H200)
+#
+# Node layout (16 GPUs across 2 nodes):
+#   - 1 node  (8 GPUs) for inference via sgl.Engine with TP=8
+#   - 1 node  (8 GPUs) for training (FSDP/DP)
+#
+# Usage:
+#   bash examples/kimi-k25-2node-h200/run.sh
+
+model:
+  target_model_path: moonshotai/Kimi-K2.5
+  trust_remote_code: true
+  lm_head_key: language_model.lm_head.weight
+  embedding_key: language_model.model.embed_tokens.weight
+
+dataset:
+  train_data_path: ../examples/data/sample_conversations.jsonl
+  eval_data_path: ../examples/data/eval_conversations.jsonl
+  chat_template: kimi-k25-vlm
+  defer_tokenization: true
+
+training:
+  max_seq_length: 20000
+  seed: 42
+  micro_batch_size: 1
+  num_epochs: 3
+  save_interval: 5000
+  learning_rate: 5e-5
+  warmup_ratio: 0.015
+  max_grad_norm: 1
+  ttt_length: 4
+  draft_accumulation_steps: 1
+  training_num_nodes: 1
+  training_num_gpus_per_node: 8
+  attention_backend: flex_attention
+  max_concurrent_batches: 1
+  gradient_checkpointing: true
+  distributed_timeout_minutes: 30
+
+inference:
+  inference_engine_type: sgl
+  inference_num_gpus: 8
+  inference_num_gpus_per_engine: 8
+  inference_num_gpus_per_node: 8
+  max_sample_pool_size: 32
+  inference_buffer_threshold: 8
+  inference_fetch_batch: 32
+  inference_batch_size: 4
+  sglang:
+    tp_size: 8
+    nnodes: 1
+    dist_init_addr: null
+    mem_fraction_static: 0.6
+    enable_multimodal: true
+    init_timeout: 1800
+    dist_timeout: 600
+    extra_args:
+      model_loader_extra_config:
+        enable_multithread_load: true
+        num_threads: 32
+      disable_flashinfer_autotune: true
+      watchdog_timeout: 1800
+
+mooncake:
+  master_server_address: null
+  metadata_server: null
+  hidden_dim: 7168
+  global_segment_size: 96GB
+  local_buffer_size: 16GB
+  protocol: rdma # Change this to RDMA for good performance.
+  enable_gpu_direct: false
+  device_name: mlx5_7,mlx5_8,mlx5_9,mlx5_10,mlx5_11 # Please change this to correct network devices.
+  # protocol: tcp # Switch to TCP if RDMA is not available.
+  # kv_lease_ttl_s: 60 # Mooncake master internal lease only; does not affect deletion timing. Increase global_segment_size for TCP.
+
+
+output_dir: ./outputs/train_kimi25_2node_h200
+cache_dir: ./cache/train_kimi25_2node_h200
+model_download_dir: null
+
+debug:
+  save_debug_train_data: null
+
+
+logging:
+  report_to: none
+  wandb_key: null
+  wandb_project: train_kimi25
+  wandb_team: null
+  wandb_group: null
+  wandb_mode: online
+  wandb_random_suffix: true

@@ -1,0 +1,112 @@
+# Three 8-GPU nodes: one FSDP trainer, two independent TP=8 target engines.
+# vLLM extracts target hidden states for existing samples. Only DSpark is optimized.
+model:
+  target_model_path: ${oc.env:TARGET_MODEL_PATH,/mnt/afs_agents/hongjiawei/delivery/sensenova-flash-lite-v42-20260830-dpo-mtp}
+  target_model_backend: vllm
+  draft_model_config: configs/ci/qwen3_8_27b_dspark_draft.json
+  embedding_key: model.language_model.embed_tokens.weight
+  lm_head_key: lm_head.weight
+  norm_key: model.language_model.norm.weight
+  trust_remote_code: true
+
+dataset:
+  train_data_path: ../../mydata/sensenova-flash-lite-v42-text-1000000.jsonl
+  chat_template: qwen
+  prompt_key: conversations
+  shuffle_dataset: true
+  length_group_size: 1
+  min_loss_tokens: 14
+
+training:
+  load_path: null
+  ckpt_step: null
+  continual_training: false
+  attention_backend: flex_attention
+  fsdp_strategy: FULL_SHARD
+  gradient_checkpointing: true
+  micro_batch_size: 1
+  draft_accumulation_steps: 4
+  learning_rate: 1e-4
+  max_concurrent_batches: 1
+  max_grad_norm: 0.5
+  max_seq_length: 131072
+  num_epochs: 1
+  prefetch_depth: 4
+  save_interval: 500
+  save_per_epoch: true
+  max_checkpoints: 2
+  seed: 42
+  # Train on existing assistant answers using target hidden states.
+  train_with_decode: false
+  training_num_gpus_per_node: 8
+  training_num_nodes: 1
+  distributed_timeout_minutes: 60
+  ttt_length: 7
+  warmup_ratio: 0.0
+  dflash_block_size: 7
+  dspark_num_anchors: 512
+  dspark_num_target_layers: 5
+  dspark_loss_decay_gamma: 4.0
+  dspark_ce_loss_alpha: 0.1
+  dspark_l1_loss_alpha: 0.9
+  dspark_confidence_head_alpha: 1.0
+
+inference:
+  inference_engine_type: vllm
+  inference_num_gpus: 16
+  inference_num_gpus_per_engine: 8
+  inference_num_gpus_per_node: 8
+  inference_batch_size: 4
+  inference_buffer_threshold: 32
+  inference_fetch_batch: 32
+  max_sample_pool_size: 32
+  store_last_hidden_states: true
+  last_hidden_states_prenorm: true
+  aux_hidden_states_layers: [3, 15, 31, 47, 59]
+  vllm:
+    nnodes: 1
+    tp_size: 8
+    pp_size: 1
+    init_timeout: 1800
+    dist_timeout: 1800
+    mem_fraction_static: 0.80
+    extra_args:
+      enforce_eager: true
+      language_model_only: true
+      max_model_len: 131072
+      max_num_batched_tokens: 8192
+
+decode:
+  target_only: false
+  # Prefill extraction uses max_tokens=1 internally; these decode settings are inactive.
+  max_new_tokens: 1
+  min_new_tokens: 1
+  temperature: 1.0
+  top_k: -1
+  top_p: 1.0
+  speculative_algorithm: null
+  speculative_draft_model_path: null
+  weight_sync_enabled: false
+  weight_sync_interval: 0
+
+mooncake:
+  master_server_address: null
+  metadata_server: null
+  protocol: tcp
+  global_segment_size: 512GB
+  local_buffer_size: 16GB
+
+output_dir: ./outputs/qwen3.8-27b-3node
+cache_dir: ./cache/qwen3.8-27b-3node
+model_download_dir: null
+
+logging:
+  report_to: wandb
+  wandb_project: ${oc.env:WANDB_PROJECT,torchspec-dspark}
+  wandb_team: ${oc.env:WANDB_ENTITY,null}
+  wandb_group: ${oc.env:WANDB_NAME,qwen3.8-27b-3node}
+  wandb_mode: online
+  wandb_dir: ${output_dir}
+
+debug:
+  enable_perf_metrics: true

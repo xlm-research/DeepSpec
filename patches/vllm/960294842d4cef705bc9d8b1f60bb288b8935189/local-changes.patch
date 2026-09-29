@@ -1,0 +1,587 @@
+diff --git a/tests/v1/worker/test_gpu_autoregressive_speculator.py b/tests/v1/worker/test_gpu_autoregressive_speculator.py
+index b5234a6468..2c999bc379 100644
+--- a/tests/v1/worker/test_gpu_autoregressive_speculator.py
++++ b/tests/v1/worker/test_gpu_autoregressive_speculator.py
+@@ -394,6 +394,73 @@ def test_update_draft_decode_metadata_updates_fa3_scheduler_metadata(
+     assert torch.equal(builder.scheduler_metadata[:3], expected)
+ 
+ 
++def test_fa3_draft_metadata_uses_draft_attention_dimensions(monkeypatch):
++    """Qwen's 256-dim target must not size a 128-dim EAGLE draft's schedule."""
++    from vllm.model_executor.layers.attention import Attention
++    from vllm.v1.kv_cache_interface import FullAttentionSpec
++    from vllm.vllm_flash_attn import (
++        flash_attn_varlen_func,
++        is_fa_version_supported,
++    )
++
++    if not torch.cuda.is_available() or not is_fa_version_supported(3):
++        pytest.skip("requires FlashAttention 3 on Hopper")
++    monkeypatch.setattr(flash_attn_module, "get_flash_attn_version", lambda: 3)
++    config = SimpleNamespace(
++        model_config=SimpleNamespace(
++            get_num_attention_heads=lambda _: 6,
++            get_num_kv_heads=lambda _: 1,
++            get_head_size=lambda: 256,
++            rswa_window=None,
++            is_mm_prefix_lm=False,
++        ),
++        parallel_config=SimpleNamespace(cp_kv_cache_interleave_size=1),
++        cache_config=SimpleNamespace(cache_dtype="auto"),
++        compilation_config=SimpleNamespace(
++            cudagraph_mode=CUDAGraphMode.NONE,
++            max_cudagraph_capture_size=0,
++            static_forward_context={
++                "draft.attn": Mock(spec=Attention, impl=SimpleNamespace(num_heads=10))
++            },
++        ),
++        attention_config=SimpleNamespace(),
++    )
++    cache_spec = FullAttentionSpec(
++        block_size=16, num_kv_heads=2, head_size=128, dtype=torch.bfloat16
++    )
++    builder = flash_attn_module.FlashAttentionMetadataBuilder(
++        cache_spec, ["draft.attn"], config, torch.device("cuda")
++    )
++    builder.aot_sliding_window = (-1, -1)
++    query_starts = torch.tensor([0, 1], dtype=torch.int32, device="cuda")
++    seq_lens = torch.tensor([8], dtype=torch.int32, device="cuda")
++    metadata = builder._get_scheduler_metadata(
++        aot_schedule=True,
++        batch_size=1,
++        cu_query_lens=query_starts,
++        max_query_len=1,
++        seqlens=seq_lens,
++        max_seq_len=8,
++        causal=True,
++        max_num_splits=0,
++    )
++    kwargs = dict(
++        q=torch.randn(1, 10, 128, dtype=torch.bfloat16, device="cuda"),
++        k=torch.randn(1, 16, 2, 128, dtype=torch.bfloat16, device="cuda"),
++        v=torch.randn(1, 16, 2, 128, dtype=torch.bfloat16, device="cuda"),
++        max_seqlen_q=1,
++        max_seqlen_k=8,
++        cu_seqlens_q=query_starts,
++        seqused_k=seq_lens,
++        block_table=torch.tensor([[0]], dtype=torch.int32, device="cuda"),
++        causal=True,
++        fa_version=3,
++    )
++    actual = flash_attn_varlen_func(**kwargs, scheduler_metadata=metadata)
++    expected = flash_attn_varlen_func(**kwargs, scheduler_metadata=None)
++    torch.testing.assert_close(actual, expected)
++
++
+ def test_update_draft_decode_metadata_skips_without_scheduler_metadata(monkeypatch):
+     builder = object.__new__(flash_attn_module.FlashAttentionMetadataBuilder)
+     builder.aot_schedule = True
+diff --git a/vllm/config/speculative.py b/vllm/config/speculative.py
+index 65ebb681fd..3f31f19b12 100644
+--- a/vllm/config/speculative.py
++++ b/vllm/config/speculative.py
+@@ -887,6 +887,16 @@ class SpeculativeConfig:
+             self.prompt_lookup_max = 0
+             self.prompt_lookup_min = 0
+ 
++            # TorchSpec's native EAGLE path passes a small ``draft_model_config``
++            # dictionary to pin auxiliary target-layer IDs. Preserve those
++            # fields while constructing the real ModelConfig below. Upstream
++            # vLLM normally replaces this field entirely from ``model``.
++            draft_hf_config_overrides: dict[str, Any] = {}
++            if isinstance(self.draft_model_config, dict):
++                raw_hf_config = self.draft_model_config.get("hf_config", {})
++                if isinstance(raw_hf_config, dict):
++                    draft_hf_config_overrides = dict(raw_hf_config)
++
+             if self.model is not None:
+                 # Old-format Medusa checkpoints (e.g. FasterDecoding/medusa-*)
+                 # lack a model_type key in config.json, so AutoConfig cannot
+@@ -927,6 +937,8 @@ class SpeculativeConfig:
+                     hf_overrides=draft_hf_overrides,
+                     config_format=self.target_model_config.config_format,
+                 )
++                for key, value in draft_hf_config_overrides.items():
++                    setattr(self.draft_model_config.hf_config, key, value)
+ 
+                 # Old-format Medusa checkpoints (e.g. FasterDecoding/medusa-*)
+                 # omit vocab_size in config.json, so MedusaConfig falls back to
+@@ -1012,6 +1024,8 @@ class SpeculativeConfig:
+                             model_type="eagle",
+                         )
+                         self.draft_model_config.hf_config = eagle_config
++                        for key, value in draft_hf_config_overrides.items():
++                            setattr(self.draft_model_config.hf_config, key, value)
+                         self.update_arch_()
+ 
+                 if self.method == "dspark" and (
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/base.py b/vllm/distributed/kv_transfer/kv_connector/v1/base.py
+index e49dbebb12..1d0fafbf3e 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/base.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/base.py
+@@ -375,6 +375,16 @@ class KVConnectorBase_V1(ABC):
+         """
+         pass
+ 
++    def capture_hidden_states(self, **kwargs: Any) -> None:
++        """Optional hook for connectors that consume target model states.
++
++        Native speculative proposers can expose the exact rows used for draft
++        verification without putting them in a KV-cache group. Existing KV
++        connectors keep the no-op default so this remains backwards compatible.
++        """
++        del kwargs
++        return None
++
+     def get_finished(
+         self, finished_req_ids: set[str]
+     ) -> tuple[set[str] | None, set[str] | None]:
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py
+index 957b15ea40..eee19efae1 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py
+@@ -318,6 +318,10 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
+         for c in self._connectors:
+             c.wait_for_save()
+ 
++    def capture_hidden_states(self, **kwargs) -> None:
++        for c in self._connectors:
++            c.capture_hidden_states(**kwargs)
++
+     def get_finished(
+         self, finished_req_ids: set[str]
+     ) -> tuple[set[str] | None, set[str] | None]:
+diff --git a/vllm/v1/attention/backends/flash_attn.py b/vllm/v1/attention/backends/flash_attn.py
+index e7ef03d99c..c897824194 100755
+--- a/vllm/v1/attention/backends/flash_attn.py
++++ b/vllm/v1/attention/backends/flash_attn.py
+@@ -33,6 +33,7 @@ from vllm.v1.attention.backends.fa_utils import (
+ from vllm.v1.attention.backends.utils import (
+     fill_mm_prefix_query_ranges,
+     get_dcp_local_seq_lens,
++    get_num_attention_heads_from_layers,
+ )
+ from vllm.v1.attention.ops.common import cp_lse_ag_out_rs
+ from vllm.v1.attention.ops.dcp_alltoall import dcp_a2a_lse_reduce
+@@ -433,12 +434,13 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
+         self.compilation_config = vllm_config.compilation_config
+         self.attention_config = vllm_config.attention_config
+ 
+-        self.num_heads_q = self.model_config.get_num_attention_heads(
+-            self.parallel_config
+-        )
+-        self.num_heads_kv = self.model_config.get_num_kv_heads(self.parallel_config)
++        # Draft layers may have different attention dimensions from the target.
++        self.num_heads_q = get_num_attention_heads_from_layers(
++            vllm_config, layer_names
++        ) or self.model_config.get_num_attention_heads(self.parallel_config)
++        self.num_heads_kv = kv_cache_spec.num_kv_heads
+         self.kv_cache_dtype = kv_cache_spec.dtype
+-        self.headdim = self.model_config.get_head_size()
++        self.headdim = kv_cache_spec.head_size
+         self.block_size = kv_cache_spec.block_size
+ 
+         self.max_num_splits = 0  # No upper bound on the number of splits.
+diff --git a/vllm/v1/worker/gpu/kv_connector.py b/vllm/v1/worker/gpu/kv_connector.py
+index cdacb36e58..e9cf7286bb 100644
+--- a/vllm/v1/worker/gpu/kv_connector.py
++++ b/vllm/v1/worker/gpu/kv_connector.py
+@@ -29,6 +29,10 @@ if TYPE_CHECKING:
+ class KVConnector:
+     """KVConnector interface used by GPUModelRunner."""
+ 
++    def capture_hidden_states(self, **kwargs) -> None:
++        """Receive target hidden states for non-cache speculative connectors."""
++        pass
++
+     def pre_forward(self, scheduler_output: "SchedulerOutput") -> None:
+         pass
+ 
+@@ -74,6 +78,11 @@ class ActiveKVConnector(KVConnector):
+             with set_forward_context(None, self.vllm_config):
+                 self.kv_connector.start_load_kv(get_forward_context())
+ 
++    def capture_hidden_states(self, **kwargs) -> None:
++        if self._disabled:
++            return
++        self.kv_connector.capture_hidden_states(**kwargs)
++
+     def post_forward(
+         self, finished_req_ids: set[str], wait_for_save: bool = True
+     ) -> KVConnectorOutput | None:
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index ee4b9ce147..ff3f1623f3 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -231,7 +231,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+ 
+         # Speculative decoding.
+         self.speculator = None
+-        self.use_aux_hidden_state_outputs = False
++        kv_config = vllm_config.kv_transfer_config
++        kv_extra = kv_config.kv_connector_extra_config if kv_config else {}
++        self.target_hidden_state_layer_ids = tuple(
++            (kv_extra or {}).get("target_hidden_state_layer_ids", ())
++        )
++        if self.target_hidden_state_layer_ids and (
++            self.speculative_config is not None or self.use_pp
++        ):
++            raise ValueError(
++                "Target-only hidden-state capture requires no speculative_config "
++                "and pipeline_parallel_size=1."
++            )
++        self.use_aux_hidden_state_outputs = bool(self.target_hidden_state_layer_ids)
+         self.num_speculative_steps = vllm_config.num_speculative_tokens
+         if self.speculative_config is not None:
+             if self.is_last_pp_rank:
+@@ -361,8 +373,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 )
+ 
+             if self.use_aux_hidden_state_outputs:
+-                assert self.speculative_config is not None
+-                set_eagle3_aux_hidden_state_layers(self.model, self.speculative_config)
++                if self.target_hidden_state_layer_ids:
++                    self.model.set_aux_hidden_state_layers(
++                        self.target_hidden_state_layer_ids
++                    )
++                else:
++                    assert self.speculative_config is not None
++                    set_eagle3_aux_hidden_state_layers(
++                        self.model, self.speculative_config
++                    )
+             if isinstance(self.speculator, DraftModelSpeculator):
+                 self.speculator.load_model(self.model)
+                 eplb_models_added = self.eplb.maybe_register_speculator(
+@@ -451,12 +470,58 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             return None
+         return speculator.model
+ 
++    def _aux_hidden_states_for_drafter(
++        self, aux_hidden_states: list[torch.Tensor] | None
++    ) -> list[torch.Tensor] | None:
++        """Drop the Mooncake-only final EAGLE3 auxiliary state.
++
++        TorchSpec asks the target to emit the final pre-norm residual as an
++        additional auxiliary slot so it can be published with the training
++        sequence.  The native EAGLE3 drafter consumes only its configured
++        training slots, so keep the extra row out of the proposer input.
++        """
++        if aux_hidden_states is None or self.speculative_config is None:
++            return aux_hidden_states
++        if self.speculative_config.method != "eagle3":
++            return aux_hidden_states
++
++        expected = None
++        draft_model = self.get_draft_model()
++        if draft_model is not None:
++            expected = getattr(draft_model, "num_aux_layers", None)
++            if expected is None:
++                expected = getattr(draft_model, "num_aux_hidden_states", None)
++            draft_inner = getattr(draft_model, "model", None)
++            if expected is None and draft_inner is not None:
++                expected = getattr(draft_inner, "num_aux_layers", None)
++                if expected is None:
++                    expected = getattr(draft_inner, "num_aux_hidden_states", None)
++        if expected is None and self.speculative_config.draft_model_config is not None:
++            expected = getattr(
++                self.speculative_config.draft_model_config.hf_config,
++                "num_aux_hidden_states",
++                None,
++            )
++        if expected is None:
++            expected = max(len(aux_hidden_states) - 1, 1)
++        expected = int(expected)
++        if len(aux_hidden_states) <= expected:
++            return aux_hidden_states
++        return aux_hidden_states[:expected]
++
+     def reload_weights(self, *args, **kwargs) -> None:
+         # TODO(Wentao): Use full version instead of import when fully migrated to v2
+         from vllm.v1.worker.gpu_model_runner import GPUModelRunner as GPUModelRunnerV1
+ 
+         GPUModelRunnerV1.reload_weights(self, *args, **kwargs)  # type: ignore[arg-type]
+ 
++    def reload_draft_weights(self, weights_path: str) -> dict[str, Any]:
++        # Keep the draft reload implementation shared with the legacy runner
++        # while v2 is still migrating common weight-loading utilities.
++        from vllm.v1.worker.gpu_model_runner import GPUModelRunner as GPUModelRunnerV1
++
++        return GPUModelRunnerV1.reload_draft_weights(self, weights_path)  # type: ignore[arg-type]
++
+     def update_config(self, *args, **kwargs) -> None:
+         # TODO(Wentao): Use full version instead of import when fully migrated to v2
+         from vllm.v1.worker.gpu_model_runner import GPUModelRunner as GPUModelRunnerV1
+@@ -1774,6 +1839,45 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             aux_hidden_states = None
+             output_intermediate_tensors = model_output
+ 
++        if self.is_last_pp_rank:
++            method = self.speculative_config.method if self.speculative_config else None
++            if getattr(self, "target_hidden_state_layer_ids", ()) or method in (
++                "eagle",
++                "eagle3",
++                "dspark",
++            ):
++                # Capture only real scheduled rows, excluding CUDA-graph padding.
++                capture_rows = input_batch.num_tokens
++                scheduled_counts = {
++                    req_id: int(
++                        input_batch.query_start_loc_np[index + 1]
++                        - input_batch.query_start_loc_np[index]
++                    )
++                    for index, req_id in enumerate(input_batch.req_ids)
++                }
++                self.kv_connector.capture_hidden_states(
++                    scheduler_output=scheduler_output,
++                    req_ids=list(input_batch.req_ids),
++                    num_scheduled_tokens=scheduled_counts,
++                    target_positions=input_batch.positions[:capture_rows],
++                    aux_hidden_states=(
++                        [state[:capture_rows] for state in aux_hidden_states]
++                        if aux_hidden_states is not None
++                        else None
++                    ),
++                    last_hidden_states=(
++                        hidden_states[:capture_rows]
++                        if hidden_states is not None
++                        else None
++                    ),
++                )
++                # The final pre-norm state is a Mooncake training output, but
++                # native EAGLE3/DSpark draft model expects only its configured
++                # auxiliary training slots.
++                aux_hidden_states = self._aux_hidden_states_for_drafter(
++                    aux_hidden_states
++                )
++
+         routed_experts = None
+         if not dummy_run and (capturer := self.routed_experts_capturer) is not None:
+             assert slot_mappings is not None
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index 0c3509c8d2..9ff863be2e 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -12,6 +12,7 @@ from contextlib import AbstractContextManager, contextmanager, nullcontext
+ from copy import copy, deepcopy
+ from dataclasses import replace
+ from functools import reduce
++from pathlib import Path
+ from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias, cast
+ 
+ import numpy as np
+@@ -5346,6 +5347,37 @@ class GPUModelRunner(
+                 hidden_states = alt
+ 
+             num_rejected_tokens_gpu = None
++            capture_aux_hidden_states = None
++            capture_last_hidden_states = hidden_states
++            capture_num_scheduled_tokens = scheduler_output.num_scheduled_tokens
++
++            def _aux_states_for_drafter(
++                states: list[torch.Tensor],
++            ) -> list[torch.Tensor]:
++                """Drop the Mooncake-only final pre-norm state for EAGLE3."""
++                if spec_config.method != "eagle3":
++                    return states
++                draft_model = getattr(self.drafter, "model", None)
++                expected = getattr(draft_model, "num_aux_layers", None)
++                if expected is None:
++                    expected = getattr(draft_model, "num_aux_hidden_states", None)
++                if expected is None:
++                    draft_inner = getattr(draft_model, "model", None)
++                    expected = getattr(draft_inner, "num_aux_layers", None)
++                    if expected is None:
++                        expected = getattr(draft_inner, "num_aux_hidden_states", None)
++                if expected is None and spec_config.draft_model_config is not None:
++                    expected = getattr(
++                        spec_config.draft_model_config.hf_config,
++                        "num_aux_hidden_states",
++                        None,
++                    )
++                if expected is None:
++                    expected = max(len(states) - 1, 1)
++                if expected is None or len(states) <= expected:
++                    return states
++                return states[:expected]
++
+             if spec_decode_metadata is None:
+                 token_indices_to_sample = None
+                 # input_ids can be None for multimodal models.
+@@ -5353,11 +5385,16 @@ class GPUModelRunner(
+                 target_positions = self._get_positions(num_scheduled_tokens)
+                 if self.use_aux_hidden_state_outputs:
+                     assert aux_hidden_states is not None
++                    capture_aux_hidden_states = [
++                        h[:num_scheduled_tokens] for h in aux_hidden_states
++                    ]
+                     target_hidden_states = torch.cat(
+-                        [h[:num_scheduled_tokens] for h in aux_hidden_states], dim=-1
++                        _aux_states_for_drafter(capture_aux_hidden_states), dim=-1
+                     )
++                    capture_last_hidden_states = hidden_states[:num_scheduled_tokens]
+                 else:
+                     target_hidden_states = hidden_states[:num_scheduled_tokens]
++                    capture_last_hidden_states = target_hidden_states
+             else:
+                 if spec_config.disable_padded_drafter_batch:
+                     token_indices_to_sample = None
+@@ -5370,11 +5407,24 @@ class GPUModelRunner(
+                     target_positions = self._get_positions(token_indices)
+                     if self.use_aux_hidden_state_outputs:
+                         assert aux_hidden_states is not None
++                        capture_aux_hidden_states = [
++                            h[token_indices] for h in aux_hidden_states
++                        ]
+                         target_hidden_states = torch.cat(
+-                            [h[token_indices] for h in aux_hidden_states], dim=-1
++                            _aux_states_for_drafter(capture_aux_hidden_states), dim=-1
+                         )
++                        capture_last_hidden_states = hidden_states[token_indices]
+                     else:
+                         target_hidden_states = hidden_states[token_indices]
++                        capture_last_hidden_states = target_hidden_states
++                    query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
++                    capture_num_scheduled_tokens = {
++                        req_id: int(
++                            query_start_loc_cpu[index + 1]
++                            - query_start_loc_cpu[index]
++                        )
++                        for index, req_id in enumerate(self.input_batch.req_ids)
++                    }
+                 else:
+                     (
+                         common_attn_metadata,
+@@ -5391,11 +5441,41 @@ class GPUModelRunner(
+                     target_positions = self._get_positions(total_num_tokens)
+                     if self.use_aux_hidden_state_outputs:
+                         assert aux_hidden_states is not None
++                        capture_aux_hidden_states = [
++                            h[:total_num_tokens] for h in aux_hidden_states
++                        ]
+                         target_hidden_states = torch.cat(
+-                            [h[:total_num_tokens] for h in aux_hidden_states], dim=-1
++                            _aux_states_for_drafter(capture_aux_hidden_states), dim=-1
+                         )
++                        capture_last_hidden_states = hidden_states[:total_num_tokens]
+                     else:
+                         target_hidden_states = hidden_states[:total_num_tokens]
++                        capture_last_hidden_states = target_hidden_states
++                    query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
++                    capture_num_scheduled_tokens = {
++                        req_id: int(
++                            query_start_loc_cpu[index + 1]
++                            - query_start_loc_cpu[index]
++                        )
++                        for index, req_id in enumerate(self.input_batch.req_ids)
++                    }
++
++            if has_kv_transfer_group() and spec_config.method in (
++                "eagle",
++                "eagle3",
++                "dspark",
++            ):
++                # Native EAGLE/DSpark's proposer is the source of truth for the
++                # verified target rows. The connector stores them by absolute
++                # request position before the draft model starts.
++                get_kv_transfer_group().capture_hidden_states(
++                    scheduler_output=scheduler_output,
++                    req_ids=list(self.input_batch.req_ids),
++                    num_scheduled_tokens=capture_num_scheduled_tokens,
++                    target_positions=target_positions,
++                    aux_hidden_states=capture_aux_hidden_states,
++                    last_hidden_states=capture_last_hidden_states,
++                )
+ 
+             if self.supports_mm_inputs and self.drafter.supports_mm_inputs:
+                 mm_embed_inputs = self._gather_mm_embeddings(
+@@ -5759,6 +5839,75 @@ class GPUModelRunner(
+         self.reset_encoder_cache()
+         self.reset_mm_cache()
+ 
++    def reload_draft_weights(self, weights_path: str) -> dict[str, Any]:
++        """Reload native speculative draft weights from a HF checkpoint.
++
++        TorchSpec writes a serving checkpoint on the training side. Loading it
++        through vLLM's own loader keeps sharding and parameter-name mapping
++        identical to the initial EAGLE load and avoids restarting the Ray actor.
++        """
++        draft = self.get_draft_model()
++        if draft is None or self.speculative_config is None:
++            return {"success": True, "message": "no draft model on this worker"}
++
++        draft_config = self.speculative_config.draft_model_config
++        if draft_config is None:
++            return {"success": False, "message": "draft_model_config is missing"}
++        if not Path(weights_path).is_dir():
++            return {
++                "success": False,
++                "message": (
++                    f"Draft weight directory is not accessible on this worker: "
++                    f"{weights_path}. Use a filesystem shared by training and "
++                    "inference nodes."
++                ),
++            }
++        draft_config = copy(draft_config)
++        draft_config.model = weights_path
++        draft_config.revision = None
++        load_config = self.speculative_config.draft_load_config or self.load_config
++        model_loader = get_model_loader(load_config)
++        if not hasattr(model_loader, "get_all_weights"):
++            return {
++                "success": False,
++                "message": (
++                    "draft reload is unsupported for load format "
++                    f"{load_config.load_format}"
++                ),
++            }
++
++        weights_to_load = {name for name, _ in draft.named_parameters()}
++        # Finish checkpoint I/O before replacing any live tensors with Meta tensors.
++        weights = list(model_loader.get_all_weights(draft_config, draft))
++        initialize_layerwise_reload(draft)
++        try:
++            loaded_weights = draft.load_weights(iter(weights))
++        finally:
++            # A failed load is fatal to the training run, but must not leave
++            # shared target/draft parameters or cached buffers on Meta.
++            finalize_layerwise_reload(draft, draft_config)
++            draft_backbone = getattr(draft, "model", None)
++            if hasattr(draft_backbone, "_build_fused_kv_buffers"):
++                draft_backbone._build_fused_kv_buffers()
++        if torch.cuda.is_available():
++            torch.cuda.synchronize()
++        missing = (
++            weights_to_load - loaded_weights if loaded_weights is not None else set()
++        )
++        if missing:
++            logger.warning(
++                "Native EAGLE draft reload left %d parameters unmatched: %s",
++                len(missing),
++                sorted(missing)[:20],
++            )
++        return {
++            "success": True,
++            "message": (
++                f"reloaded {len(loaded_weights or ())} draft parameters "
++                f"from {weights_path}"
++            ),
++        }
++
+     def _get_prompt_logprobs_dict(
+         self,
+         hidden_states: torch.Tensor,
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index 2340b64aba..1a1ae6bf3a 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -457,6 +457,10 @@ class Worker(WorkerBase):
+         with set_current_vllm_config(self.vllm_config):
+             self.model_runner.reload_weights(*args, **kwargs)
+ 
++    def reload_draft_weights(self, weights_path: str) -> dict[str, Any]:
++        with set_current_vllm_config(self.vllm_config):
++            return self.model_runner.reload_draft_weights(weights_path)
++
+     @torch.inference_mode()
+     def determine_available_memory(self) -> int:
+         """Profiles the peak memory usage of the model to determine how much

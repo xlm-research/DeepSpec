@@ -1,0 +1,94 @@
+# Native vLLM EAGLE3 online speculative-decoding training.
+#
+# The target checkpoint is the local Qwen3.8-27B copy supplied for H800
+# debugging.  One vLLM engine uses four GPUs (TP=4) and the draft trainer uses
+# the other four GPUs on the node.
+
+model:
+  # h800conda.sh exports TARGET_MODEL_PATH for the current mount.  Keep the
+  # user-provided path as the fallback when this config is run elsewhere.
+  target_model_path: ${oc.env:TARGET_MODEL_PATH,/mnt/afs_agents/hongjiawei/delivery/sensenova-flash-lite-v42-20260830-dpo-mtp}
+  target_model_backend: vllm
+  draft_model_config: configs/ci/qwen3_8_27b_eagle3_draft.json
+  embedding_key: model.language_model.embed_tokens.weight
+  lm_head_key: lm_head.weight
+  norm_key: model.language_model.norm.weight
+  trust_remote_code: true
+
+dataset:
+  train_data_path: ../../examples/data/sample_conversations.jsonl
+  chat_template: qwen
+  prompt_key: conversations
+  shuffle_dataset: false
+  length_group_size: 1
+
+training:
+  attention_backend: flex_attention
+  micro_batch_size: 1
+  draft_accumulation_steps: 1
+  learning_rate: 1e-4
+  max_concurrent_batches: 1
+  max_grad_norm: 0.5
+  max_seq_length: 2048
+  num_epochs: 1
+  prefetch_depth: 1
+  save_interval: 0
+  save_per_epoch: false
+  seed: 42
+  train_with_decode: true
+  training_num_gpus_per_node: 4
+  training_num_nodes: 1
+  ttt_length: 2
+  warmup_ratio: 0.0
+
+inference:
+  inference_engine_type: vllm
+  store_last_hidden_states: true
+  inference_num_gpus: 4
+  inference_num_gpus_per_engine: 4
+  inference_num_gpus_per_node: 8
+  inference_batch_size: 1
+  inference_buffer_threshold: 2
+  max_sample_pool_size: 4
+  # Qwen3.8-27B has 64 target layers. These are post-layer IDs; vLLM shifts
+  # them internally and appends the final pre-norm slot (64).
+  aux_hidden_states_layers: [3, 31, 59]
+  vllm:
+    tp_size: 4
+    pp_size: 1
+    mem_fraction_static: 0.78
+    extra_args:
+      enforce_eager: true
+      language_model_only: true
+      max_model_len: 2048
+      max_num_batched_tokens: 4096
+
+decode:
+  max_new_tokens: 32
+  min_new_tokens: 2
+  temperature: 1.0
+  top_k: -1
+  top_p: 1.0
+  speculative_algorithm: EAGLE3
+  speculative_draft_model_path: null
+  speculative_num_draft_tokens: 5
+  weight_sync_enabled: true
+  weight_sync_interval: 15
+
+mooncake:
+  master_server_address: null
+  metadata_server: null
+  protocol: tcp
+  global_segment_size: 32GB
+  local_buffer_size: 4GB
+
+output_dir: ./outputs/qwen3_8_27b-vllm-decode
+cache_dir: ./cache/qwen3_8_27b-vllm-decode
+model_download_dir: null
+
+logging:
+  report_to: none
+
+debug:
+  enable_perf_metrics: true
+  save_debug_train_data: null

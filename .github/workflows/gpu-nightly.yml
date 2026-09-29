@@ -1,0 +1,165 @@
+name: Nightly GPU Integration
+
+on:
+  schedule:
+    # 01:00 PST / 02:00 PDT. GitHub schedules always use UTC.
+    - cron: "0 9 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly-gpu-integration
+  cancel-in-progress: false
+
+jobs:
+  changes:
+    name: Check recent code changes
+    runs-on: ubuntu-latest
+    outputs:
+      should_run: ${{ steps.detect.outputs.should_run }}
+    steps:
+      - name: Checkout main history
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Detect relevant changes in the preceding 24 hours
+        id: detect
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" == workflow_dispatch ]]; then
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+            echo "Manual dispatch forces the nightly integration." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          mapfile -t changed_files < <(
+            git log --since="24 hours ago" --name-only --pretty=format: -- \
+              torchspec configs tools tests docker pyproject.toml uv.lock \
+              .github/workflows/gpu-integration.yml \
+              .github/workflows/gpu-nightly.yml \
+              | sed "/^[[:space:]]*$/d" | sort -u
+          )
+          if ((${#changed_files[@]} == 0)); then
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+            echo "No relevant code changed in the preceding 24 hours; GPU integration skipped." \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          echo "should_run=true" >> "$GITHUB_OUTPUT"
+          {
+            echo "Relevant changes found in the preceding 24 hours:"
+            printf -- '- %s\n' "${changed_files[@]}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  integration:
+    name: Qwen3.8 Eagle3 + DSpark + DFlash2 GPU training
+    needs: changes
+    if: needs.changes.outputs.should_run == 'true'
+    runs-on: ${{ vars.TORCHSPEC_GPU_DISPATCHER_LABEL }}
+    timeout-minutes: 720
+    env:
+      TORCHSPEC_CI_MODEL: Qwen/Qwen3.8-27B
+      TORCHSPEC_CI_MODEL_REVISION: 1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0
+      TORCHSPEC_CI_SOURCE_SHA: ${{ github.sha }}
+      TORCHSPEC_SLURM_ROOT: ${{ secrets.TORCHSPEC_SLURM_ROOT }}
+      # ARM64 .sqsh built from lightseekorg/torchspec:nightly-vllm-pp.
+      TORCHSPEC_CI_IMAGE: ${{ secrets.TORCHSPEC_CI_IMAGE }}
+      TORCHSPEC_CI_MODEL_CACHE_HOST: ${{ secrets.TORCHSPEC_CI_MODEL_CACHE_HOST }}
+    steps:
+      - name: Checkout trusted dispatcher
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: trusted
+          persist-credentials: false
+
+      - name: Checkout nightly source without credentials
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5
+        with:
+          ref: ${{ github.sha }}
+          path: source
+          persist-credentials: false
+
+      - name: Submit and wait for Slurm integration
+        run: >-
+          trusted/tools/ci/dispatch_slurm.sh
+          "$GITHUB_WORKSPACE/source"
+          "$RUNNER_TEMP/slurm-report"
+
+      - name: Publish Slurm summary
+        if: always()
+        run: |
+          if [[ -f "$RUNNER_TEMP/slurm-report/summary.md" ]]; then
+            cat "$RUNNER_TEMP/slurm-report/summary.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Slurm dispatcher exited before producing a report." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload nightly artifacts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: nightly-gpu-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/slurm-report
+          if-no-files-found: warn
+
+  pp_convergence:
+    name: Nightly Eagle3 TP vs PP convergence (GB200, 4 GPUs)
+    needs: changes
+    if: needs.changes.outputs.should_run == 'true'
+    runs-on: ${{ vars.TORCHSPEC_GPU_DISPATCHER_LABEL }}
+    timeout-minutes: 720
+    env:
+      TORCHSPEC_CI_MODEL: Qwen/Qwen3.8-27B
+      TORCHSPEC_CI_MODEL_REVISION: 1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0
+      TORCHSPEC_CI_SOURCE_SHA: ${{ github.sha }}
+      TORCHSPEC_SLURM_ROOT: ${{ secrets.TORCHSPEC_SLURM_ROOT }}
+      TORCHSPEC_CI_IMAGE: ${{ secrets.TORCHSPEC_CI_IMAGE }}
+      TORCHSPEC_CI_MODEL_CACHE_HOST: ${{ secrets.TORCHSPEC_CI_MODEL_CACHE_HOST }}
+      TORCHSPEC_CI_GPU_COUNT: 4
+      TORCHSPEC_CI_RUN_SCRIPT: tools/ci/run_2gpu_training_smoke.sh
+      TORCHSPEC_CI_MODE: pp_convergence
+      TORCHSPEC_CI_PP_MAX_REL_LOSS_DIFF: 0.01
+    steps:
+      - name: Checkout trusted dispatcher
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: trusted
+          persist-credentials: false
+
+      - name: Checkout nightly source without credentials
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5
+        with:
+          ref: ${{ github.sha }}
+          path: source
+          persist-credentials: false
+
+      - name: Submit and wait for Slurm PP convergence test
+        run: >-
+          trusted/tools/ci/dispatch_slurm.sh
+          "$GITHUB_WORKSPACE/source"
+          "$RUNNER_TEMP/slurm-report"
+
+      - name: Publish Slurm summary
+        if: always()
+        run: |
+          if [[ -f "$RUNNER_TEMP/slurm-report/summary.md" ]]; then
+            cat "$RUNNER_TEMP/slurm-report/summary.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Slurm dispatcher exited before producing a report." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload PP convergence artifacts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: nightly-gpu-4gpu-pp-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/slurm-report
+          if-no-files-found: warn
