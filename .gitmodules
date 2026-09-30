@@ -1,3 +1,4 @@
 [submodule "vllm"]
 	path = vllm
 	url = git@gitlab.sh.sensetime.com:xlm/vllm.git
+	branch = dev/vllm_spec
