@@ -245,6 +245,38 @@ class TestDFlash2Config(unittest.TestCase):
         self.assertEqual(draft_config.selector_rank, 256)
         self.assertEqual(draft_config.selector_top_k, 16)
 
+        # Exercise the GQA sliding-attention recipe without allocating its weights.
+        self.assertEqual(draft_config.attention_mode, "gqa")
+        self.assertEqual(draft_config.target_layer_ids, [5, 19, 33, 47, 61])
+        self.assertEqual(draft_config.mask_token_id, 248070)
+        with torch.device("meta"):
+            draft = DFlash2DraftModel(draft_config)
+            model = DFlash2Model(draft, block_size=draft_config.block_size, num_anchors=1)
+        self.assertEqual(draft.layers[0].self_attn.q_proj.weight.shape, (4096, 5120))
+        self.assertEqual(draft.layers[0].mlp.gate_proj.weight.shape, (17408, 5120))
+        self.assertEqual(draft.context_proj.in_features, 5 * 5120)
+        self.assertEqual(
+            [model._block_mask_options_for_layer(i) for i in range(5)],
+            [{"is_causal": False, "sliding_window": 2048}] * 5,
+        )
+        exported = draft.config_for_serving()
+        self.assertEqual(exported["num_target_layers"], 64)
+        self.assertEqual(exported["rope_parameters"]["rope_theta"], 10000000.0)
+
+        example_path = ROOT / "examples" / "qwen3.8-27b-dflash2-3node" / "config.yaml"
+        example = load_config(str(example_path))
+        example_draft_config = AutoDraftModelConfig.from_file(example.model.draft_model_config)
+        self.assertEqual(example_draft_config.hidden_size, 5120)
+        self.assertEqual(example_draft_config.vocab_size, 248320)
+        self.assertEqual(example_draft_config.target_num_hidden_layers, 64)
+        self.assertEqual(example.training.dflash_block_size, example_draft_config.block_size)
+        self.assertEqual(
+            example.training.dflash_num_target_layers, example_draft_config.num_target_layers
+        )
+        self.assertEqual(
+            list(example.inference.aux_hidden_states_layers), example_draft_config.target_layer_ids
+        )
+
     def test_legacy_dflash_dispatch_is_unchanged(self):
         config = AutoDraftModelConfig.from_dict(
             {

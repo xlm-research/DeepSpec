@@ -1,6 +1,9 @@
-# Two-GPU CI lane: the same Qwen3.8-27B target on one GB200 and a
-# production-depth DFlash2 draft on the other. This exercises block diffusion,
-# grouped convolutions, candidate selection, and selector-loss training.
+# Two-GPU CI lane: the same Qwen3.8-27B target on one GB200 and the
+# Qwen DFlash2 GQA architecture with full attention on the other. This exercises
+# block diffusion, full attention, grouped convolutions, and selector loss.
+# Reference: https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2/blob/ac04198556d7e8867853cbc356807b969f311b05/config.json
+# The draft JSON follows configs/draft_models/kimi_k3_dflash2_mla_swa.json's
+# explicit attention-mode and RoPE configuration style.
 model:
   target_model_path: Qwen/Qwen3.8-27B
   target_model_backend: vllm
@@ -51,8 +54,9 @@ inference:
   inference_batch_size: 1
   inference_buffer_threshold: 2
   max_sample_pool_size: 4
-  # These must match dflash_config.target_layer_ids in the draft config.
-  aux_hidden_states_layers: [3, 15, 31, 47, 59]
+  # Official post-layer IDs, including linear/GDN layers. vLLM captures the
+  # decoder residual stream; these must match dflash_config.target_layer_ids.
+  aux_hidden_states_layers: [5, 19, 33, 47, 61]
   vllm:
     tp_size: 1
     mem_fraction_static: 0.55

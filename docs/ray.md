@@ -68,6 +68,15 @@ CUDA_VISIBLE_DEVICES=4,5,6,7 ./examples/qwen3-8b-single-node/run.sh
 
 ### Multi-node (local cluster)
 
+For the shared Qwen3.8-27B H800 setup, `bash run.sh` (DFlash2) or
+`bash run.sh dspark` automatically starts the head and missing workers over SSH,
+waits for three nodes with at least eight GPUs each, and launches training.
+Live nodes are reused and left running after training. See the
+[recipe instructions](../examples/qwen3.8-27b-dflash2-3node/README.md) for setup
+requirements and node overrides. `bash run.sh --dry-run` previews without SSH or Ray calls.
+
+For other recipes, follow the manual setup below.
+
 Start Ray manually before launching TorchSpec. Run these commands on each node:
 
 **1. Head node** (run first):

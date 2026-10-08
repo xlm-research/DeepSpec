@@ -11,10 +11,10 @@
 #   LOAD_PATH          Complete checkpoints directory; unset starts a new run
 #   CKPT_STEP          Checkpoint iteration; unset selects latest
 #   OUTPUT_DIR         Defaults to a new timestamped output directory
-#   CACHE_DIR          Defaults to cache/qwen3.8-27b-dflash2-3node
+#   CACHE_DIR          Defaults to cache/qwen3_8_27b-dflash2-vllm-decode-3node
 #   LOG_DIR            Defaults to running_logs
 #   TARGET_MODEL_PATH  Target checkpoint (default supplied by h800conda.sh)
-#   MOONCAKE_PROTOCOL  tcp (default), or rdma when configured on all nodes
+#   MOONCAKE_PROTOCOL  rdma (default, mlx5_0 on the validated cluster), or tcp
 #   RAY_ADDRESS        Existing Ray address, if not discovered locally
 #
 # --dry-run prints the command without contacting Ray or starting training.
@@ -38,7 +38,7 @@ ROOT_DIR="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
 cd "$ROOT_DIR"
 timestamp="$(date +%Y%m%d_%H%M%S)"
 OUTPUT_DIR="${OUTPUT_DIR:-$ROOT_DIR/outputs/qwen3.8-27b-dflash2-3node_$timestamp}"
-CACHE_DIR="${CACHE_DIR:-$ROOT_DIR/cache/qwen3.8-27b-dflash2-3node}"
+CACHE_DIR="${CACHE_DIR:-$ROOT_DIR/cache/qwen3_8_27b-dflash2-vllm-decode-3node}"
 LOG_DIR="${LOG_DIR:-$ROOT_DIR/running_logs}"
 export WANDB_NAME="${WANDB_NAME:-qwen3.8-27b-dflash2-3node_$timestamp}"
 

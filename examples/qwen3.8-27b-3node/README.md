@@ -9,7 +9,21 @@ final norm 保持冻结。vLLM 不加载训练中的 DSpark 草稿权重，不�
 副本。训练长度上限为 131072 tokens，global batch 为 `8 × 1 × 4 = 32`。
 数据默认使用 `mydata/sensenova-flash-lite-v42-text-1000000.jsonl`。
 
-在已有 Ray 集群的 head 节点执行：
+在仓库根目录一键启动（自动准备 Ray，再启动 DSpark 训练）：
+
+```bash
+bash run.sh dspark
+```
+
+默认训练/head 节点为 `10.120.0.211`，推理节点为 `10.120.0.218`、`10.120.0.187`。
+入口会复用已有 Ray 节点，并行启动缺少的 worker，等待三台机器各至少有 8 张 GPU 后
+开始训练。任一节点均可执行；从推理节点执行时会通过 SSH 转到 head。
+各节点需要共享当前仓库和 `h800conda.sh` 环境，并配置好免密 SSH 及已知主机密钥。
+可用 `TRAIN_NODE_IPS`、`INFERENCE_NODE_IPS`、`RAY_PORT`、`SSH_USER`、`SSH_PORT`
+覆盖连接配置。`bash run.sh dspark --dry-run` 可预览，训练参数和 `LOAD_PATH` 等
+环境变量继续透传给原脚本。省略 `dspark` 时根目录入口默认运行 DFlash2。
+
+原来的脚本仍可在已有 Ray 集群的 head 节点执行：
 
 ```bash
 bash examples/qwen3.8-27b-3node/run.sh

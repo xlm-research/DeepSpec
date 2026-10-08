@@ -94,7 +94,7 @@ decode:
 mooncake:
   master_server_address: null
   metadata_server: null
-  protocol: tcp
+  protocol: rdma
   global_segment_size: 512GB
   local_buffer_size: 4GB
 

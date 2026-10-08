@@ -3,7 +3,7 @@
 model:
   target_model_path: ${oc.env:TARGET_MODEL_PATH,/mnt/afs_agents/hongjiawei/delivery/sensenova-flash-lite-v42-20260830-dpo-mtp}
   target_model_backend: vllm
-  draft_model_config: configs/ci/qwen3_8_27b_dflash2_draft.json
+  draft_model_config: configs/draft_models/sensenova_flash_lite_v42_dflash2.json
   embedding_key: model.language_model.embed_tokens.weight
   lm_head_key: lm_head.weight
   norm_key: model.language_model.norm.weight
@@ -24,6 +24,8 @@ training:
   continual_training: false
   attention_backend: flex_attention
   fsdp_strategy: FULL_SHARD
+  placement_strategy: custom
+  training_node_ips: [10.120.0.211]
   gradient_checkpointing: true
   micro_batch_size: 1
   draft_accumulation_steps: 4
@@ -32,7 +34,7 @@ training:
   max_grad_norm: 0.5
   max_seq_length: 131072
   num_epochs: 1
-  prefetch_depth: 4
+  prefetch_depth: 1
   save_interval: 500
   save_per_epoch: true
   max_checkpoints: 2
@@ -58,14 +60,16 @@ inference:
   inference_num_gpus: 16
   inference_num_gpus_per_engine: 8
   inference_num_gpus_per_node: 8
-  inference_batch_size: 4
-  inference_buffer_threshold: 32
-  inference_fetch_batch: 32
-  max_sample_pool_size: 32
+  inference_node_ips: [10.120.0.218, 10.120.0.187]
+  inference_batch_size: 1
+  inference_buffer_threshold: 8
+  inference_fetch_batch: 2
+  # One dispatch needs 8 samples (one per training DP rank).
+  max_sample_pool_size: 8
   # CE + selector loss uses token labels and the five auxiliary hidden states.
   store_last_hidden_states: false
   # These must match dflash_config.target_layer_ids in the draft config.
-  aux_hidden_states_layers: [3, 15, 31, 47, 59]
+  aux_hidden_states_layers: [5, 19, 33, 47, 61]
   vllm:
     nnodes: 1
     tp_size: 8
@@ -95,12 +99,18 @@ decode:
 mooncake:
   master_server_address: null
   metadata_server: null
-  protocol: tcp
-  global_segment_size: 512GB
+  # Validated on these three nodes by a 10-step training run.
+  protocol: rdma
+  device_name: mlx5_0
+  enable_gpu_direct: false
+  global_segment_size: 256GB
   local_buffer_size: 16GB
+  host_buffer_size: 2GB
+  async_put_pool_size: 1
 
 output_dir: ./outputs/qwen3.8-27b-dflash2-3node
-cache_dir: ./cache/qwen3.8-27b-dflash2-3node
+# Reuse the existing tokenized dataset; its key includes preprocessing settings.
+cache_dir: ./cache/qwen3_8_27b-dflash2-vllm-decode-3node
 model_download_dir: null
 
 logging:

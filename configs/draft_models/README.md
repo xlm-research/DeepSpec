@@ -7,6 +7,7 @@ Architecture configurations for speculative draft models. These define the model
 | Config | Target model | Notes |
 |--------|-------------|-------|
 | `qwen3_8b_eagle3.json` | Qwen3-8B | 1-layer LlamaForCausalLMEagle3, hidden_size=4096 |
+| `sensenova_flash_lite_v42_dflash2.json` | SenseNova Flash Lite v42 DPO MTP | 5-layer GQA DFlash2, full attention, hidden_size=5120, block size 8 |
 | `kimi_k25_eagle3.json` | Kimi-K2.5 | 1-layer LlamaForCausalLMEagle3, hidden_size=7168 |
 | `kimi_k3_dflash2_mla_swa.json` | Kimi-K3 | 6-layer MLA DFlash2, SWA×5 + Full, block size 8 |
 | `kimi_k3_eagle3_mla.json` | Kimi-K3 | 1-layer MLA Eagle3, hidden_size=7168 |

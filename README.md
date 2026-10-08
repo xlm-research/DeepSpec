@@ -90,6 +90,20 @@ Override config values directly from the CLI:
 ./examples/qwen3-8b-single-node/run.sh training.learning_rate=5e-5 training.num_train_steps=500
 ```
 
+For the shared H800 three-node Qwen3.8-27B setup, start Ray and training together:
+
+```bash
+bash run.sh                   # DFlash2 (default)
+bash run.sh dspark            # DSpark
+bash run.sh --dry-run         # Preview without contacting SSH or Ray
+```
+
+This launcher reuses live Ray nodes and starts missing workers in parallel over SSH.
+It uses the existing `h800conda.sh` environment and defaults to training on
+`10.120.0.211`, with inference on `10.120.0.218` and `10.120.0.187`.
+See the [three-node recipe](examples/qwen3.8-27b-dflash2-3node/README.md)
+for SSH requirements, node overrides, and checkpoint resume options.
+
 ## Setup
 
 ### Quick Setup
