@@ -1,0 +1,15 @@
+model: /mnt/afs_agents/yankuihao/model_ckpts/1009_9b_mhc4_loop3_from50_zxh_glmv25_all16_16nodes/ckpt-225-bf16
+tensor-parallel-size: 8
+pipeline-parallel-size: 1
+data-parallel-size: 1
+max-model-len: 8192
+max-num-batched-tokens: 8192
+max-num-seqs: 1
+dtype: bfloat16
+load-format: safetensors
+language-model-only: true
+enforce-eager: true
+enable-prefix-caching: false
+enable-chunked-prefill: false
+mamba-ssm-cache-dtype: float32
+generation-config: auto
