@@ -126,7 +126,7 @@ def parse_config():
         config_path=args.config, cli_args=unknown if unknown else None, save_snapshot=True
     )
 
-    logger.info("Resolved config:\n%s", OmegaConf.to_yaml(config))
+    logger.info("Resolved config:\n%s", OmegaConf.to_yaml(config, resolve=True))
 
     if args.print_config_only:
         sys.exit(0)
@@ -296,6 +296,10 @@ def _validate_and_configure_dflash(args, draft_model_config) -> None:
             f"({block_size} != {draft_model_config.block_size})."
         )
     num_target_layers = getattr(args, "dflash_num_target_layers", 5)
+    if is_dspark:
+        num_target_layers = getattr(args, "dspark_num_target_layers", 5)
+        if num_target_layers != draft_model_config.num_target_layers:
+            raise ValueError("dspark_num_target_layers must match the draft configuration")
     if is_dflash2 and num_target_layers != draft_model_config.num_target_layers:
         raise ValueError(
             "training.dflash_num_target_layers must match the number of "
@@ -319,7 +323,9 @@ def _validate_and_configure_dflash(args, draft_model_config) -> None:
             target_layer_ids = build_target_layer_ids(num_target, target_num_hidden)
         args.aux_hidden_states_layers = target_layer_ids
         logger.info(f"{algo}: set aux_hidden_states_layers = {target_layer_ids}")
-    elif is_dflash2 and list(args.aux_hidden_states_layers) != list(target_layer_ids):
+    elif (is_dflash2 or is_dspark) and list(args.aux_hidden_states_layers) != list(
+        target_layer_ids
+    ):
         raise ValueError(
             "inference.aux_hidden_states_layers must match "
             f"dflash_config.target_layer_ids ({list(args.aux_hidden_states_layers)} != "
@@ -334,13 +340,10 @@ def train_async_no_generation(args):
     with speculative decoding. Uses distributed Ray actors with placement groups.
     Engines store tensors in mooncake and return keys to AsyncInferenceManager.
     """
-    if (
-        getattr(args, "train_with_decode", False)
-        and getattr(args, "inference_engine_type", "sgl") not in ("sgl", "vllm")
-    ):
-        raise ValueError(
-            "train_with_decode=True requires inference_engine_type=sgl or vllm"
-        )
+    if getattr(args, "train_with_decode", False) and getattr(
+        args, "inference_engine_type", "sgl"
+    ) not in ("sgl", "vllm"):
+        raise ValueError("train_with_decode=True requires inference_engine_type=sgl or vllm")
 
     if getattr(args, "inference_engine_type", None) == "offline":
         from torchspec.offline.dataset import (

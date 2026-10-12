@@ -39,6 +39,8 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
+
+from torchspec.utils.logging import logger as training_logger
 from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
@@ -198,6 +200,14 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
         spec_config = self._vllm_config.speculative_config
         extra_config = self._vllm_config.kv_transfer_config.kv_connector_extra_config or {}
         target_layer_ids = extra_config.get("target_hidden_state_layer_ids", [])
+        self._num_target_layers = extra_config.get(
+            "target_num_hidden_layers", vllm_config.model_config.get_total_num_hidden_layers()
+        )
+        self._separate_final_state = "final_hidden_states_prenorm" in extra_config
+        if self._separate_final_state and extra_config["final_hidden_states_prenorm"] is not False:
+            raise ValueError("Direct final hidden states must be post-norm")
+        if self._separate_final_state and self._num_target_layers in target_layer_ids:
+            raise ValueError("Auxiliary capture collides with the separate final hidden state")
         if spec_config is None and not target_layer_ids:
             raise ValueError(
                 "MooncakeHiddenStatesConnector requires target_hidden_state_layer_ids "
@@ -222,7 +232,9 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
             )
         self.cache_layers: list[str] = []
 
-        draft_hf_config = getattr(getattr(spec_config, "draft_model_config", None), "hf_config", None)
+        draft_hf_config = getattr(
+            getattr(spec_config, "draft_model_config", None), "hf_config", None
+        )
         self._layer_ids = list(
             target_layer_ids or getattr(draft_hf_config, "eagle_aux_hidden_state_layer_ids", [])
         )
@@ -231,7 +243,7 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
             # training layers. The target's final pre-norm row arrives as
             # ``last_hidden_states`` from the model runner and is added to
             # the Mooncake manifest here.
-            target_layers = vllm_config.model_config.get_total_num_hidden_layers()
+            target_layers = self._num_target_layers
             if self._layer_ids[-1] != target_layers:
                 self._layer_ids.append(target_layers)
         self.num_hidden_states = len(self._layer_ids)
@@ -255,7 +267,6 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
         self._tp_rank: int | None = None
         self._pp_rank: int | None = None
         self._pp_size = vllm_config.parallel_config.pipeline_parallel_size
-        self._num_target_layers = vllm_config.model_config.get_total_num_hidden_layers()
         self._kv_cache: torch.Tensor | None = None
         self._cache_gpu_direct_registered = False
         self._check_layer_layout()
@@ -266,6 +277,13 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
             raise ValueError(
                 "MooncakeHiddenStatesConnector requires a non-empty "
                 "target_hidden_state_layer_ids or eagle_aux_hidden_state_layer_ids"
+            )
+        if any(
+            type(slot) is not int or not 0 <= slot <= self._num_target_layers
+            for slot in self._layer_ids
+        ):
+            raise ValueError(
+                f"Capture slots must be in [0, {self._num_target_layers}]: {self._layer_ids}"
             )
         if any(a >= b for a, b in zip(self._layer_ids, self._layer_ids[1:])):
             raise ValueError(
@@ -314,7 +332,7 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
         return kv_cache_config.kv_cache_groups[group_id].kv_cache_spec.block_size
 
     def _get_tp_rank(self) -> int:
-        if self._tp_rank is None:
+        if getattr(self, "_tp_rank", None) is None:
             try:
                 from vllm.distributed import get_tensor_model_parallel_rank
 
@@ -417,6 +435,11 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
         if not getattr(self, "_direct_capture_mode", False):
             return
         states = list(aux_hidden_states or [])
+        if getattr(self, "_separate_final_state", False):
+            if len(states) != len(self._layer_ids) - 1 or last_hidden_states is None:
+                raise RuntimeError(
+                    "Direct capture requires all auxiliary states and a separate final state"
+                )
         if len(states) < len(self._layer_ids) and last_hidden_states is not None:
             states.append(last_hidden_states)
         if len(states) != len(self._layer_ids):
@@ -424,6 +447,19 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
                 "Native speculative hidden-state count does not match Mooncake metadata: "
                 f"got {len(states)}, expected {len(self._layer_ids)}"
             )
+        if any(
+            state.ndim != 2 or state.shape[1] != getattr(self, "_hidden_size", state.shape[-1])
+            for state in states
+        ):
+            raise RuntimeError(
+                "Captured hidden states must have shape [tokens, target_hidden_size]"
+            )
+        if self._get_tp_rank() != 0:
+            return
+        if getattr(self, "_separate_final_state", False) and any(
+            not torch.isfinite(state).all().item() for state in states
+        ):
+            raise RuntimeError("Direct capture contains non-finite target hidden states")
 
         positions = target_positions
         if positions.dim() > 1:
@@ -434,6 +470,11 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
         counts = kwargs.get("num_scheduled_tokens")
         if counts is None:
             counts = getattr(scheduler_output, "num_scheduled_tokens", {}) or {}
+        # Copy whole chunks once; per-token device transfers make 128K capture
+        # prohibitively expensive. Clone CPU inputs too: runners reuse buffers.
+        states_cpu = [
+            state.detach().to(device="cpu", dtype=torch.bfloat16, copy=True) for state in states
+        ]
         offset = 0
         for req_id in req_ids:
             count = int(counts.get(req_id, 0))
@@ -448,18 +489,18 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
                     f"{[state.shape[0] for state in states]}"
                 )
             req_capture = self._captured_hidden_states.setdefault(req_id, {})
-            for row_index, absolute_position in enumerate(
-                positions_cpu[offset:end], start=offset
-            ):
+            training_logger.debug(
+                "Direct capture request=%s rows=%d positions=%s..%s slots=%s",
+                req_id,
+                count,
+                positions_cpu[offset],
+                positions_cpu[end - 1],
+                self._layer_ids,
+            )
+            for row_index, absolute_position in enumerate(positions_cpu[offset:end], start=offset):
                 # vLLM reuses these forward buffers on the next engine step;
                 # Mooncake publication happens after that step has completed.
-                req_capture[int(absolute_position)] = [
-                    state[row_index]
-                    .detach()
-                    .to(device="cpu", dtype=torch.bfloat16)
-                    .contiguous()
-                    for state in states
-                ]
+                req_capture[int(absolute_position)] = [state[row_index] for state in states_cpu]
             offset = end
 
         if offset != len(positions_cpu):
@@ -647,10 +688,7 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
     def _publish_direct_pending_saves(self, pending_saves: list[_PendingSave]) -> None:
         local_positions = self._local_layer_positions()
         if not local_positions or not self._ensure_mooncake_store():
-            # Only TP rank 0 owns the Mooncake store. Other ranks still run
-            # the target forward and therefore hold CPU copies of the rows;
-            # release those copies once the rank has reached the completion
-            # barrier so long-running online jobs do not grow without bound.
+            # Only TP rank 0 owns captured rows and the Mooncake store.
             for pending in pending_saves:
                 self._captured_hidden_states.pop(pending.req_id, None)
             return

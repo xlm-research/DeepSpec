@@ -142,6 +142,7 @@ def _build_engine_with_mock_vllm():
 
     args = MagicMock()
     args.target_model_path = "mock-model"
+    args.vllm_direct_hidden_state_capture = False
     args.trust_remote_code = True
     engine = VllmEngine.__new__(VllmEngine)
     engine.args = args
@@ -562,6 +563,7 @@ class TestAuxLayerIdResolution:
 
         args = MagicMock()
         args.target_model_path = "mock-model"
+        args.vllm_direct_hidden_state_capture = False
         args.aux_hidden_states_layers = aux_layers
         args.trust_remote_code = True
         args.vllm_pp_size = 1

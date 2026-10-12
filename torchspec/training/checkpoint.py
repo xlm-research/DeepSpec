@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import time
 from pathlib import Path
@@ -40,6 +41,31 @@ from torch.distributed.checkpoint.stateful import Stateful
 from torchspec.models.draft.keymap import to_internal_keys
 from torchspec.utils.distributed import get_gloo_group
 from torchspec.utils.logging import logger
+
+
+def training_contract(args: Any) -> dict[str, Any] | None:
+    """Identity of direct-capture training data and the model consuming it."""
+    if not getattr(args, "vllm_direct_hidden_state_capture", False):
+        return None
+    target = Path(args.target_model_path).resolve()
+    draft = getattr(args, "draft_model_config_obj", None)
+    draft_config = (
+        draft.to_dict()
+        if draft is not None
+        else json.loads(Path(args.draft_model_config).read_text())
+    )
+    return {
+        "version": 1,
+        "target_model": str(target),
+        "target_config_sha256": hashlib.sha256((target / "config.json").read_bytes()).hexdigest(),
+        # Match JSON's normalization of tuples and integer dictionary keys.
+        "draft_config": json.loads(json.dumps(draft_config)),
+        "aux_execution_layers": list(args.aux_hidden_states_layers),
+        "final_hidden_states_prenorm": args.last_hidden_states_prenorm,
+        "last_turn_loss_only": args.last_turn_loss_only,
+        "chat_template": args.chat_template,
+        "train_with_decode": args.train_with_decode,
+    }
 
 
 class ModelState(Stateful):
@@ -221,6 +247,13 @@ def load(actor: Any) -> dict[str, Any] | None:
         return None
 
     checkpoint_dir = model_dir.parent
+    metadata = _read_checkpoint_metadata(checkpoint_dir / "meta.json")
+    expected_contract = training_contract(actor.args)
+    saved_contract = (metadata or {}).get("training_contract")
+    if saved_contract != expected_contract:
+        raise ValueError(
+            "Checkpoint training contract differs from the target, draft, capture or supervision configuration"
+        )
     target_step = int(checkpoint_dir.name.removeprefix("iter_"))
     optimizer_dir = checkpoint_dir / "optimizer"
     lr_scheduler_dir = checkpoint_dir / "lr_scheduler"
@@ -298,8 +331,6 @@ def load(actor: Any) -> dict[str, Any] | None:
     rng_path = checkpoint_dir / "rng.pt"
     if rng_path.exists():
         rng_state = torch.load(rng_path, map_location="cpu")
-
-    metadata = _read_checkpoint_metadata(checkpoint_dir / "meta.json")
 
     return {
         "rng": rng_state,
@@ -443,6 +474,9 @@ def save(actor: Any, step: int) -> None:
             "world_size": dist.get_world_size(),
             "timestamp": time.time(),
         }
+        contract = training_contract(actor.args)
+        if contract is not None:
+            metadata["training_contract"] = contract
         _write_checkpoint_metadata(checkpoint_dir / "meta.json", metadata)
 
         tracker_file = base_dir / "latest_checkpointed_iteration.txt"

@@ -19,15 +19,16 @@
   "num_target_layers": 64,
   "fc_norm": false,
   "layer_types": [
-    "full_attention",
-    "full_attention",
-    "full_attention",
-    "full_attention",
+    "sliding_attention",
+    "sliding_attention",
+    "sliding_attention",
+    "sliding_attention",
     "full_attention"
   ],
   "is_causal": false,
-  "use_sliding_window": false,
-  "sliding_window": null,
+  "use_sliding_window": true,
+  "sliding_window": 2048,
+  "max_window_layers": 5,
   "rope_parameters": {
     "rope_type": "default",
     "rope_theta": 10000000.0

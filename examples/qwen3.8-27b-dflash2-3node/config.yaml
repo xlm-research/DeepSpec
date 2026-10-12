@@ -65,7 +65,7 @@ inference:
   inference_buffer_threshold: 8
   inference_fetch_batch: 2
   # One dispatch needs 8 samples (one per training DP rank).
-  max_sample_pool_size: 8
+  max_sample_pool_size: 64
   # CE + selector loss uses token labels and the five auxiliary hidden states.
   store_last_hidden_states: false
   # These must match dflash_config.target_layer_ids in the draft config.
@@ -103,9 +103,9 @@ mooncake:
   protocol: rdma
   device_name: mlx5_0
   enable_gpu_direct: false
-  global_segment_size: 256GB
-  local_buffer_size: 16GB
-  host_buffer_size: 2GB
+  global_segment_size: 768GB
+  local_buffer_size: 64GB
+  host_buffer_size: 10GB
   async_put_pool_size: 1
 
 output_dir: ./outputs/qwen3.8-27b-dflash2-3node

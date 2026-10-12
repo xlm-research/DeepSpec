@@ -272,6 +272,16 @@ def _validate_vllm_config(config: DictConfig) -> None:
     if OmegaConf.select(config, "inference.vllm.enable_multimodal"):
         raise NotImplementedError("enable_multimodal is not yet supported with the vllm backend")
 
+    if config.inference.vllm.direct_hidden_state_capture:
+        if config.training.train_with_decode or config.inference.vllm.pp_size != 1:
+            raise ValueError(
+                "Direct prefill capture requires train_with_decode=false and pp_size=1"
+            )
+        if config.inference.last_hidden_states_prenorm is not False:
+            raise ValueError("Direct capture requires last_hidden_states_prenorm=false (post-norm)")
+        if config.decode.weight_sync_enabled or config.decode.speculative_draft_model_path:
+            raise ValueError("Direct prefill capture does not load or synchronize a draft model")
+
     if not config.training.train_with_decode:
         return
     if engine_type != "vllm":

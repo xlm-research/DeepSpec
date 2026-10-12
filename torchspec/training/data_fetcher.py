@@ -346,7 +346,9 @@ class MooncakeDataset(IterableDataset):
                 logger.debug("__iter__: received None sentinel, stopping iteration")
                 break
 
-            logger.debug(f"__iter__: got item, mooncake_key={item.mooncake_key}")
+            logger.debug(
+                f"__iter__: got item, data_id={item.data_id}, mooncake_key={item.mooncake_key}"
+            )
             data = self._load_from_mooncake(item)
 
             neutralized_count = self._resolve_and_neutralize_loss_mask(

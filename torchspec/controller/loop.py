@@ -20,6 +20,7 @@
 
 """Pipeline training loop: main training loop with sync training and async inference."""
 
+import os
 import re
 import shutil
 import tempfile
@@ -41,7 +42,7 @@ from torchspec.utils.logging import get_tb_writer, logger
 
 def _write_training_metrics(metrics: dict, train_step: int, inference_step: int) -> None:
     loss = metrics.get("train/avg_loss")
-    if isinstance(loss, (int, float)):
+    if os.environ.get("TORCHSPEC_CI_STEP_LOGS") == "1" and isinstance(loss, (int, float)):
         logger.info(f"TRAIN_STEP step={train_step} loss={loss:.6f}")
 
     if getattr(wandb, "run", None) is not None:
@@ -265,7 +266,13 @@ def training_loop(
     queued_batches = 0
     last_saved_step: int | None = None
     previous_dispatch_wait: float | None = None
-    progress = tqdm(total=num_steps, desc="Training", unit="step", initial=start_step)
+    progress = tqdm(
+        total=num_steps,
+        desc="Training",
+        unit="step",
+        initial=start_step,
+        disable=os.environ.get("TORCHSPEC_CI_STEP_LOGS") == "1",
+    )
     while completed_steps < num_steps:
         remaining_steps = min(
             num_steps - completed_steps,
@@ -427,10 +434,10 @@ def training_loop(
             if _is_save_interval_step(completed_steps, args.save_interval):
                 eval_metrics = run_eval(completed_steps, train_group, eval_enabled)
                 logger.info(f"Saving checkpoint at step {completed_steps}...")
-                train_group.save_model(completed_steps)
+                train_group.save_model(completed_steps - 1)
                 last_saved_step = completed_steps
                 best_eval_score = update_checkpoint_eval_meta(
-                    args.checkpoint_dir, completed_steps, eval_metrics, best_eval_score
+                    args.checkpoint_dir, completed_steps - 1, eval_metrics, best_eval_score
                 )
                 max_ckpts = getattr(args, "max_checkpoints", 0)
                 if max_ckpts > 0:
@@ -455,10 +462,10 @@ def training_loop(
                         f"Saving checkpoint at end of epoch {current_epoch} "
                         f"(step {completed_steps})..."
                     )
-                    train_group.save_model(completed_steps)
+                    train_group.save_model(completed_steps - 1)
                     last_saved_step = completed_steps
                     best_eval_score = update_checkpoint_eval_meta(
-                        args.checkpoint_dir, completed_steps, eval_metrics, best_eval_score
+                        args.checkpoint_dir, completed_steps - 1, eval_metrics, best_eval_score
                     )
                     max_ckpts = getattr(args, "max_checkpoints", 0)
                     if max_ckpts > 0:
@@ -498,9 +505,9 @@ def training_loop(
     if args.checkpoint_dir and last_saved_step != completed_steps:
         eval_metrics = run_eval(completed_steps, train_group, eval_enabled)
         logger.info(f"Saving final checkpoint at step {completed_steps}...")
-        train_group.save_model(completed_steps, force_sync=True)
+        train_group.save_model(completed_steps - 1, force_sync=True)
         best_eval_score = update_checkpoint_eval_meta(
-            args.checkpoint_dir, completed_steps, eval_metrics, best_eval_score
+            args.checkpoint_dir, completed_steps - 1, eval_metrics, best_eval_score
         )
         max_ckpts = getattr(args, "max_checkpoints", 0)
         if max_ckpts > 0:

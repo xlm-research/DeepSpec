@@ -53,7 +53,7 @@ def test_request_finished_all_groups_selects_hidden_state_group():
     assert connector._pending_saves["req"].block_ids == [7, 11]
 
 
-@pytest.mark.parametrize("method", [None, "eagle3", "dspark"])
+@pytest.mark.parametrize("method", [None, "eagle3", "dspark", "loop_prefill"])
 def test_target_only_and_speculative_decode_publish_aligned_hidden_states(monkeypatch, method):
     """Both decode modes publish all computed rows using their own layer manifests."""
     from vllm.distributed.kv_transfer.kv_connector.v1.base import (
@@ -69,7 +69,13 @@ def test_target_only_and_speculative_decode_publish_aligned_hidden_states(monkey
     monkeypatch.setenv("MOONCAKE_MASTER_HOST", "localhost")
     spec_config = None
     extra_config = {"target_hidden_state_layer_ids": [1, 4]}
-    if method is not None:
+    if method == "loop_prefill":
+        extra_config = {
+            "target_hidden_state_layer_ids": [1],
+            "target_num_hidden_layers": 80,
+            "final_hidden_states_prenorm": False,
+        }
+    elif method is not None:
         extra_config = {}
         spec_config = SimpleNamespace(
             method=method,
@@ -97,7 +103,7 @@ def test_target_only_and_speculative_decode_publish_aligned_hidden_states(monkey
             scheduler_output=SimpleNamespace(num_scheduled_tokens={"req": len(positions)}),
             req_ids=["req"],
             target_positions=torch.tensor(positions),
-            aux_hidden_states=[rows] if method == "dspark" else [rows, rows + 10],
+            aux_hidden_states=[rows] if method in ("dspark", "loop_prefill") else [rows, rows + 10],
             last_hidden_states=rows + 10,
         )
     request = SimpleNamespace(
@@ -112,6 +118,44 @@ def test_target_only_and_speculative_decode_publish_aligned_hidden_states(monkey
     assert metadata["tensor_shapes"]["last_hidden_states"] == (4, 2)
     assert tensors[0][1].tolist() == [[0, 0], [1, 1], [2, 2], [3, 3]]
     assert tensors[2][1].tolist() == [[10, 10], [11, 11], [12, 12], [13, 13]]
+    if method == "loop_prefill":
+        assert metadata["pp_layer_manifest"][-1]["layer_id"] == 80
+        assert metadata["pp_layer_manifest"][-1]["role"] == "last_hidden_states"
+
+
+def test_direct_capture_copies_reused_buffers_and_rejects_incomplete_rows():
+    connector = _scheduler_connector()
+    connector._direct_capture_mode = True
+    connector._separate_final_state = True
+    connector._layer_ids = [4, 80]
+    connector._hidden_size = 2
+    connector._captured_hidden_states = {}
+    rows = torch.ones(2, 2, dtype=torch.bfloat16)
+    connector.capture_hidden_states(
+        scheduler_output=SimpleNamespace(num_scheduled_tokens={"req": 2}),
+        req_ids=["req"],
+        target_positions=torch.tensor([0, 1]),
+        aux_hidden_states=[rows],
+        last_hidden_states=rows * 2,
+    )
+    rows.zero_()
+    tensors = connector._direct_pending_save_tensors(
+        _PendingSave("req", torch.tensor([5, 6]), []), [0, 1]
+    )
+    torch.testing.assert_close(tensors[0][1], torch.ones_like(rows))
+    torch.testing.assert_close(tensors[2][1], torch.ones_like(rows) * 2)
+    with pytest.raises(RuntimeError, match="incomplete"):
+        connector._direct_pending_save_tensors(
+            _PendingSave("req", torch.tensor([5, 6, 7]), []), [0, 1]
+        )
+    with pytest.raises(RuntimeError, match="separate final"):
+        connector.capture_hidden_states(
+            scheduler_output=SimpleNamespace(num_scheduled_tokens={"req": 2}),
+            req_ids=["req"],
+            target_positions=torch.tensor([0, 1]),
+            aux_hidden_states=[rows, rows],
+            last_hidden_states=rows,
+        )
 
 
 def test_build_connector_meta_moves_pending_saves_to_worker():

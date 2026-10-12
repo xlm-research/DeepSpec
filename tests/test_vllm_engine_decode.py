@@ -42,6 +42,7 @@ def _engine():
 @pytest.fixture
 def draft_reload_state(monkeypatch):
     import torch
+
     from vllm.model_executor.model_loader.reload.layerwise import record_metadata_for_reloading
     from vllm.model_executor.model_loader.weight_utils import default_weight_loader
     from vllm.model_executor.models.qwen3_dflash import DFlashQwen3Model
@@ -95,6 +96,7 @@ def draft_reload_state(monkeypatch):
 def test_draft_reload_refreshes_fused_rope_cache(draft_reload_state, tmp_path):
     """DFlash/DSpark must not retain Meta buffers after layerwise reload."""
     import torch
+
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
     runner, draft, _ = draft_reload_state
@@ -176,6 +178,33 @@ def test_native_decode_config_uses_real_eagle3_method():
     ]
 
 
+def test_direct_prefill_initializes_without_a_draft_and_keeps_final_separate(monkeypatch):
+    import sys
+    from types import ModuleType
+
+    engine = _engine()
+    engine._decode_mode = False
+    engine.args = _args(vllm_direct_hidden_state_capture=True, train_with_decode=False)
+    engine._num_target_layers = 80
+    engine.aux_hidden_state_layer_ids = [4, 28, 52, 76, 79]
+    engine.base_gpu_id = None
+    engine.node_rank = 0
+    vllm_stub = ModuleType("vllm")
+    vllm_stub.LLM = MagicMock()
+    monkeypatch.setitem(sys.modules, "vllm", vllm_stub)
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+
+    engine._init_engine(4, 1, 1, 0.8, None)
+
+    kwargs = vllm_stub.LLM.call_args.kwargs
+    assert kwargs["speculative_config"] is None
+    assert kwargs["kv_transfer_config"]["kv_connector_extra_config"] == {
+        "target_hidden_state_layer_ids": [4, 28, 52, 76, 79],
+        "target_num_hidden_layers": 80,
+        "final_hidden_states_prenorm": False,
+    }
+
+
 def test_native_decode_config_uses_dspark_layers_without_final_capture_slot():
     engine = _engine()
     engine.args = _args(
@@ -187,9 +216,11 @@ def test_native_decode_config_uses_dspark_layers_without_final_capture_slot():
 
     assert config["method"] == "dspark"
     assert config["num_speculative_tokens"] == 7
-    assert config["draft_model_config"]["hf_config"][
-        "eagle_aux_hidden_state_layer_ids"
-    ] == [4, 32, 60]
+    assert config["draft_model_config"]["hf_config"]["eagle_aux_hidden_state_layer_ids"] == [
+        4,
+        32,
+        60,
+    ]
 
 
 @pytest.mark.parametrize(
@@ -240,6 +271,7 @@ def test_prefill_initialization_admits_qwen_128k_cache(monkeypatch):
     from types import ModuleType
 
     import torch
+
     from vllm.config import KVTransferConfig
     from vllm.v1.core import kv_cache_utils
     from vllm.v1.kv_cache_interface import FullAttentionSpec, HiddenStateCacheSpec, MambaSpec
@@ -290,6 +322,7 @@ def test_runner_keeps_draft_loading_and_rejection_sampling_for_speculation(monke
     from contextlib import nullcontext
 
     import torch
+
     from vllm.model_executor.models.interfaces import SupportsEagle3
     from vllm.v1.worker.gpu import model_runner as mrv2
 

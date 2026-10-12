@@ -50,6 +50,21 @@ def test_load_config_accepts_positive_micro_batch_size():
     assert config.training.micro_batch_size == 2
 
 
+@pytest.mark.parametrize("prenorm", [False, True, None])
+def test_direct_prefill_requires_postnorm_final_state(prenorm):
+    base = OmegaConf.structured(Config)
+    base.inference.inference_engine_type = "vllm"
+    base.inference.vllm.direct_hidden_state_capture = True
+    base.inference.vllm.pp_size = 1
+    base.inference.last_hidden_states_prenorm = prenorm
+    base.decode.weight_sync_enabled = False
+    if prenorm is False:
+        assert load_config(base_config=base).inference.vllm.direct_hidden_state_capture
+    else:
+        with pytest.raises(ValueError, match="post-norm"):
+            load_config(base_config=base)
+
+
 @pytest.mark.parametrize("algorithm", [None, "EAGLE3", "dspark"])
 def test_legacy_speculative_config_still_accepts_a_draft_and_weight_sync(algorithm):
     base = OmegaConf.structured(Config)

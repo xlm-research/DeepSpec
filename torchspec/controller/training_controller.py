@@ -498,7 +498,8 @@ class AsyncTrainingController:
         self._training_monitor.record(self.dispatch_batch_size)
         logger.debug(
             f"Dispatched batch {self.batch_id} with {self.dispatch_batch_size} samples "
-            f"to {self.dp_size} queues at t={time.time():.3f}"
+            f"to {self.dp_size} queues at t={time.time():.3f}; "
+            f"data_ids={[result.data_id for result in batch_results]}"
         )
         self.batch_id += 1
         return True

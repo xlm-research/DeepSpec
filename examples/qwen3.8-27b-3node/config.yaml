@@ -93,8 +93,8 @@ mooncake:
   master_server_address: null
   metadata_server: null
   protocol: tcp
-  global_segment_size: 512GB
-  local_buffer_size: 16GB
+  global_segment_size: 768GB
+  local_buffer_size: 128GB
 
 output_dir: ./outputs/qwen3.8-27b-3node
 cache_dir: ./cache/qwen3.8-27b-3node

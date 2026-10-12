@@ -9,14 +9,23 @@ from torchspec.controller import eval as eval_utils
 from torchspec.controller import loop
 
 
-def test_write_training_metrics_logs_each_step_loss():
+@pytest.mark.parametrize("ci_step_logs", [False, True])
+def test_write_training_metrics_logs_each_step_loss_only_in_ci(monkeypatch, ci_step_logs):
+    if ci_step_logs:
+        monkeypatch.setenv("TORCHSPEC_CI_STEP_LOGS", "1")
+    else:
+        monkeypatch.delenv("TORCHSPEC_CI_STEP_LOGS", raising=False)
     with (
         mock.patch("torchspec.controller.loop.logger.info") as mock_log,
+        mock.patch("torchspec.controller.loop.wandb.run", None),
         mock.patch("torchspec.controller.loop.get_tb_writer", return_value=None),
     ):
         loop._write_training_metrics({"train/avg_loss": 1.23456789}, train_step=2, inference_step=3)
 
-    mock_log.assert_called_once_with("TRAIN_STEP step=2 loss=1.234568")
+    if ci_step_logs:
+        mock_log.assert_called_once_with("TRAIN_STEP step=2 loss=1.234568")
+    else:
+        mock_log.assert_not_called()
 
 
 def test_draft_weight_sync_uses_shared_output_directory(tmp_path, monkeypatch):
@@ -145,6 +154,10 @@ def _run_mock_training_loop(
     num_steps: int,
     steps_per_epoch: int,
     dispatch_results=None,
+    train_metrics=None,
+    checkpoint_dir=None,
+    save_interval=0,
+    save_per_epoch=False,
 ):
     args = SimpleNamespace(
         training_num_nodes=1,
@@ -157,9 +170,9 @@ def _run_mock_training_loop(
         per_dp_rank_batch_size=1,
         prefetch_depth=prefetch_depth,
         enable_perf_metrics=False,
-        save_interval=0,
-        checkpoint_dir=None,
-        save_per_epoch=False,
+        save_interval=save_interval,
+        checkpoint_dir=checkpoint_dir,
+        save_per_epoch=save_per_epoch,
         train_with_decode=False,
     )
     events = []
@@ -189,11 +202,12 @@ def _run_mock_training_loop(
     def train(*, step, num_batches):
         assert num_batches == 1
         events.append(f"train:{step}")
-        return {}
+        return dict(train_metrics or {})
 
     actor.train_from_queue.remote.side_effect = train
     train_group = mock.MagicMock()
     train_group._actor_handlers = [actor]
+    train_group.save_model.side_effect = lambda step, **kwargs: events.append(f"save:{step + 1}")
 
     eval_state = eval_utils.EvalSetupState(
         eval_interval=0,
@@ -210,7 +224,7 @@ def _run_mock_training_loop(
         mock.patch("torchspec.controller.loop.setup_eval", return_value=eval_state),
         mock.patch("torchspec.controller.loop.ray.get", side_effect=lambda value: value),
         mock.patch("torchspec.controller.loop.time.sleep") as mock_sleep,
-        mock.patch("torchspec.controller.loop.tqdm"),
+        mock.patch("torchspec.controller.loop.tqdm", wraps=loop.tqdm),
     ):
         loop.training_loop(
             args,
@@ -222,6 +236,58 @@ def _run_mock_training_loop(
         )
 
     return events, controller, mock_sleep
+
+
+@pytest.mark.parametrize("save_per_epoch", [False, True])
+def test_checkpoint_iterations_match_completed_optimizer_steps(tmp_path, save_per_epoch):
+    with mock.patch.object(loop, "update_checkpoint_eval_meta", return_value=0.0) as update_meta:
+        events, _, _ = _run_mock_training_loop(
+            prefetch_depth=1,
+            num_steps=5,
+            steps_per_epoch=5,
+            checkpoint_dir=str(tmp_path),
+            save_interval=2,
+            save_per_epoch=save_per_epoch,
+        )
+
+    assert [event for event in events if event.startswith("save:")] == [
+        "save:2",
+        "save:4",
+        "save:5",
+    ]
+    assert [call.args[1] for call in update_meta.call_args_list] == [1, 3, 4]
+
+
+@pytest.mark.parametrize("ci_step_logs", [False, True])
+def test_training_loop_emits_only_one_step_log_format(monkeypatch, capsys, ci_step_logs):
+    if ci_step_logs:
+        monkeypatch.setenv("TORCHSPEC_CI_STEP_LOGS", "1")
+    else:
+        monkeypatch.delenv("TORCHSPEC_CI_STEP_LOGS", raising=False)
+    with (
+        mock.patch("torchspec.controller.loop.logger.info") as mock_log,
+        mock.patch("torchspec.controller.loop.wandb.run", None),
+        mock.patch("torchspec.controller.loop.get_tb_writer", return_value=None),
+    ):
+        _run_mock_training_loop(
+            prefetch_depth=0,
+            num_steps=3,
+            steps_per_epoch=3,
+            train_metrics={"train/avg_loss": 1.25},
+        )
+
+    step_logs = [
+        call.args[0] for call in mock_log.call_args_list if call.args[0].startswith("TRAIN_STEP")
+    ]
+    progress_output = capsys.readouterr().err
+    if ci_step_logs:
+        assert step_logs == [f"TRAIN_STEP step={step} loss=1.250000" for step in range(1, 4)]
+        assert "Training:" not in progress_output
+    else:
+        assert not step_logs
+        assert "Training:" in progress_output
+        assert "3/3" in progress_output
+        assert "loss=1.250" in progress_output
 
 
 def test_training_loop_prefills_and_refills_controller_queue():

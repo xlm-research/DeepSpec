@@ -24,8 +24,11 @@ sample pool 为 8，训练 prefetch depth 为 1。脚本默认复用
 
 草稿模型使用专用配置 `configs/draft_models/sensenova_flash_lite_v42_dflash2.json`：
 5 层 GQA、32 个 query heads / 8 个 KV heads、head dim 128，hidden size 5120，
-FFN intermediate size 17408；每层均使用非因果 `full_attention`，不限制滑动窗口。
-每个草稿块可读取其 anchor 之前的全部目标特征，块内保持双向注意力。
+FFN intermediate size 17408。`layer_types` 明确指定前 4 层为 `sliding_attention`，
+窗口大小为 2048；第 5 层为 `full_attention`，不限制滑动窗口。
+前 4 层只读取窗口范围内且位于 anchor 之前的目标特征，第 5 层可读取 anchor
+之前的全部目标特征。所有层均设置 `is_causal: false`，草稿块内保持双向注意力，
+不同草稿块之间互不可见。
 采集目标层 `[5, 19, 33, 47, 61]`，使用完整的 248320 词表和 mask token 248070。
 该 ID 在目标 tokenizer 中为 `<|audio_start|>`，本配置在 `language_model_only: true`
 的文本训练中将其复用为 MASK 占位，训练和部署须保持一致。block size 为 8

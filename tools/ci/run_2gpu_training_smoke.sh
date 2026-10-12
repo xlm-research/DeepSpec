@@ -22,6 +22,8 @@ profile_step_end="${TORCHSPEC_CI_PROFILE_STEP_END:-}"
 mkdir -p "${artifact_dir}" "${model_cache}" "${compile_cache}"
 export HF_HOME="${model_cache}"
 export TORCHSPEC_LOG_LEVEL=INFO
+# Use machine-readable step logs instead of the interactive progress bar.
+export TORCHSPEC_CI_STEP_LOGS=1
 export TORCHINDUCTOR_CACHE_DIR="${compile_cache}"
 node_ip="$(hostname -i | awk '{print $1}')"
 export TORCHSPEC_PIN_NODE_IP="${node_ip}"

@@ -102,6 +102,9 @@ class VllmConfig:
     dist_timeout: int = 60
     init_timeout: int = 300
 
+    # MRV2 captures auxiliary outputs and the post-norm final state directly.
+    direct_hidden_state_capture: bool = False
+
     # Passthrough: forwarded as-is to vLLM LLM.
     # Use this for any vLLM kwarg that TorchSpec doesn't need to
     # inspect (e.g. quantization, max_model_len, trust_remote_code, ...).

@@ -21,7 +21,7 @@
 """
 vLLM Ray actor engine for distributed deployment.
 
-The prefill-only path uses vLLM's ``extract_hidden_states`` method. Decode
+Prefill uses ``extract_hidden_states`` or explicit MRV2 direct capture. Decode
 training can use the target alone or a native ``eagle3``/``dspark`` proposer.
 The Mooncake connector receives target hidden states directly from the model
 runner in both decode modes.
@@ -85,8 +85,8 @@ _PER_STAGE_AUX_CAPTURE_ARCHITECTURES = frozenset(
 class VllmEngine(InferenceEngine, RayActor):
     """Ray actor wrapper for vLLM LLM engine with distributed deployment support.
 
-    Prefill uses vLLM's ``extract_hidden_states`` method. Decode training uses
-    EAGLE3 or DSpark speculation unless target-only generation is explicit.
+    Prefill uses ``extract_hidden_states`` or explicit MRV2 direct capture.
+    Decode uses EAGLE3 or DSpark unless target-only generation is explicit.
     Both paths publish selected layers through ``MooncakeHiddenStatesConnector``.
     """
 
@@ -201,6 +201,32 @@ class VllmEngine(InferenceEngine, RayActor):
         # [0, num_hidden_layers]; we keep ids up to num_hidden_layers
         # (the pre-`norm` slot, see final-layer block below).
         num_layers = _cfg.num_hidden_layers
+        if "Qwen3_5LoopForConditionalGeneration" in (
+            getattr(_outer_cfg, "architectures", None) or []
+        ):
+            loop = _outer_cfg.loop_settings
+            num_layers += (loop["end"] - loop["start"]) * (loop["eval_count"] - 1)
+            if not getattr(self.args, "vllm_direct_hidden_state_capture", False):
+                raise ValueError("Loop training requires vllm.direct_hidden_state_capture=true")
+        self._num_target_layers = num_layers
+        direct_capture = getattr(self.args, "vllm_direct_hidden_state_capture", False)
+        if direct_capture and any(
+            type(lid) is not int or not 0 <= lid < num_layers
+            for lid in self.aux_hidden_state_layer_ids
+        ):
+            raise ValueError(
+                f"Auxiliary execution layers must be in [0, {num_layers}): {self.aux_hidden_state_layer_ids}"
+            )
+        if direct_capture and any(
+            a >= b
+            for a, b in zip(self.aux_hidden_state_layer_ids, self.aux_hidden_state_layer_ids[1:])
+        ):
+            raise ValueError("Auxiliary execution layers must be unique and strictly ascending")
+        if (
+            getattr(self.args, "vllm_direct_hidden_state_capture", False)
+            and num_layers - 1 in self.aux_hidden_state_layer_ids
+        ):
+            raise ValueError("Auxiliary execution layer collides with the independent final state")
         self.aux_hidden_state_layer_ids = [
             lid + 1 for lid in self.aux_hidden_state_layer_ids if lid < num_layers
         ]
@@ -215,7 +241,10 @@ class VllmEngine(InferenceEngine, RayActor):
         # is vllm's reserved post-last-layer / pre-`norm` slot, so training
         # can apply the model's final norm itself on top of this.
         final_layer_id = num_layers
-        if final_layer_id not in self.aux_hidden_state_layer_ids:
+        if (
+            not getattr(self.args, "vllm_direct_hidden_state_capture", False)
+            and final_layer_id not in self.aux_hidden_state_layer_ids
+        ):
             self.aux_hidden_state_layer_ids.append(final_layer_id)
             if self.rank == 0:
                 logger.info(
@@ -258,25 +287,28 @@ class VllmEngine(InferenceEngine, RayActor):
     def _build_speculative_config(self) -> dict | None:
         """Build the vLLM speculative config for this TorchSpec engine.
 
-        ``extract_hidden_states`` is retained for prefill. Target-only generation
-        is opt-in; an omitted algorithm retains the EAGLE3 default.
+        Direct prefill and target-only generation do not construct a proposer.
+        Other prefill requests retain ``extract_hidden_states``; an omitted
+        decode algorithm retains the EAGLE3 default.
         """
+        if getattr(self.args, "vllm_direct_hidden_state_capture", False):
+            return None
         if not self._decode_mode:
             return {
                 "method": "extract_hidden_states",
                 "num_speculative_tokens": 1,
                 "draft_model_config": {
                     "hf_config": {
-                        "eagle_aux_hidden_state_layer_ids": list(
-                            self.aux_hidden_state_layer_ids
-                        )
+                        "eagle_aux_hidden_state_layer_ids": list(self.aux_hidden_state_layer_ids)
                     }
                 },
             }
 
         if getattr(self.args, "decode_target_only", False):
             return None
-        algorithm = str(getattr(self.args, "decode_speculative_algorithm", None) or "eagle3").lower()
+        algorithm = str(
+            getattr(self.args, "decode_speculative_algorithm", None) or "eagle3"
+        ).lower()
         if algorithm not in ("eagle3", "dspark"):
             raise NotImplementedError(
                 "vLLM online decode training currently supports only "
@@ -314,9 +346,7 @@ class VllmEngine(InferenceEngine, RayActor):
             "model": draft_path,
             "num_speculative_tokens": num_draft_tokens,
             "draft_model_config": {
-                "hf_config": {
-                    "eagle_aux_hidden_state_layer_ids": draft_layer_ids
-                }
+                "hf_config": {"eagle_aux_hidden_state_layer_ids": draft_layer_ids}
             },
         }
 
@@ -366,15 +396,20 @@ class VllmEngine(InferenceEngine, RayActor):
             engine_kwargs["kv_transfer_config"]["kv_connector_extra_config"] = {
                 "separate_hidden_state_pages": True
             }
-        if self._decode_mode and engine_kwargs["speculative_config"] is None:
+        if engine_kwargs["speculative_config"] is None:
             # MRV2 can capture target layers directly without a draft model or
             # a synthetic hidden-state cache. The connector shares this manifest.
             if os.environ.get("VLLM_USE_V2_MODEL_RUNNER", "1") != "1":
-                raise ValueError("Target-only decode requires VLLM_USE_V2_MODEL_RUNNER=1")
+                raise ValueError("Direct hidden-state capture requires VLLM_USE_V2_MODEL_RUNNER=1")
             os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "1"
             engine_kwargs["kv_transfer_config"]["kv_connector_extra_config"] = {
                 "target_hidden_state_layer_ids": list(self.aux_hidden_state_layer_ids)
             }
+            if getattr(self.args, "vllm_direct_hidden_state_capture", False):
+                engine_kwargs["kv_transfer_config"]["kv_connector_extra_config"].update(
+                    target_num_hidden_layers=self._num_target_layers,
+                    final_hidden_states_prenorm=False,
+                )
 
         extra_args = getattr(self.args, "vllm_extra_args", None)
         if extra_args:
@@ -509,12 +544,11 @@ class VllmEngine(InferenceEngine, RayActor):
         second EngineCore on each follower and makes it issue control-plane
         collective RPCs without the leader message queue.
         """
+        from vllm import EngineArgs
         from vllm.config import CompilationConfig
         from vllm.config.kv_transfer import KVTransferConfig
         from vllm.usage.usage_lib import UsageContext
         from vllm.v1.executor.multiproc_executor import MultiprocExecutor
-
-        from vllm import EngineArgs
 
         headless_kwargs = dict(engine_kwargs)
 
@@ -572,9 +606,7 @@ class VllmEngine(InferenceEngine, RayActor):
         # Prefill extraction materialises a large temporary GPU tensor. Native
         # decode copies each verified row directly to a bounded CPU map, so it
         # does not need the hidden-state KV-cache reservation.
-        connector_bytes = (
-            0 if self._decode_mode else max_len * num_aux_layers * hidden_size * 2
-        )
+        connector_bytes = 0 if self._decode_mode else max_len * num_aux_layers * hidden_size * 2
         # 2x safety for PyTorch allocator fragmentation + small extras
         reserved_bytes = int(connector_bytes * 2)
 
@@ -662,6 +694,8 @@ class VllmEngine(InferenceEngine, RayActor):
 
             kv_params = getattr(output, "kv_transfer_params", None)
             if kv_params is None:
+                if getattr(self.args, "vllm_direct_hidden_state_capture", False):
+                    raise RuntimeError(f"Direct capture returned no metadata for data_id={did}")
                 logger.error(
                     f"VllmEngine rank {self.rank}: No kv_transfer_params for data_id={did}. "
                     f"The MooncakeHiddenStatesConnector may not have stored this request."
@@ -671,6 +705,27 @@ class VllmEngine(InferenceEngine, RayActor):
             mooncake_key = kv_params.get("mooncake_key", did)
             tensor_shapes = kv_params.get("tensor_shapes", {})
             tensor_dtypes = kv_params.get("tensor_dtypes", {})
+
+            if getattr(self.args, "vllm_direct_hidden_state_capture", False):
+                expected_shapes = {
+                    "hidden_states": (
+                        seq_len,
+                        len(self.aux_hidden_state_layer_ids) * self._hidden_size,
+                    ),
+                    "last_hidden_states": (seq_len, self._hidden_size),
+                    "input_ids": (seq_len,),
+                }
+                if any(
+                    tuple(tensor_shapes.get(key, ())) != shape
+                    for key, shape in expected_shapes.items()
+                ):
+                    raise RuntimeError(
+                        f"Direct capture returned incomplete shapes: {tensor_shapes}; expected {expected_shapes}"
+                    )
+                if kv_params.get("input_ids_list") != list(output.prompt_token_ids):
+                    raise RuntimeError(
+                        "Direct prefill capture must publish exactly the original input tokens"
+                    )
 
             result: dict[str, Any] = {
                 "mooncake_key": mooncake_key,
@@ -774,9 +829,7 @@ class VllmEngine(InferenceEngine, RayActor):
         if self._engine is None:
             raise RuntimeError("VllmEngine not initialized. Call init() first.")
         if not self._decode_mode:
-            raise RuntimeError(
-                "generate_with_decode() requires training.train_with_decode=true"
-            )
+            raise RuntimeError("generate_with_decode() requires training.train_with_decode=true")
         if (input_ids_ref is None) == (formatted_prompts is None):
             raise ValueError("Exactly one of input_ids_ref or formatted_prompts must be set")
 
@@ -785,7 +838,9 @@ class VllmEngine(InferenceEngine, RayActor):
             batch_size = len(formatted_prompts)
         else:
             input_ids_list = (
-                ray.get(input_ids_ref) if isinstance(input_ids_ref, ray.ObjectRef) else input_ids_ref
+                ray.get(input_ids_ref)
+                if isinstance(input_ids_ref, ray.ObjectRef)
+                else input_ids_ref
             )
             if input_ids_list is None:
                 raise ValueError("input_ids_ref resolved to None")
@@ -854,9 +909,7 @@ class VllmEngine(InferenceEngine, RayActor):
                 else None
             ),
             input_ids_list=(
-                [input_ids_list[i] for i in active_indices]
-                if input_ids_list is not None
-                else None
+                [input_ids_list[i] for i in active_indices] if input_ids_list is not None else None
             ),
             multimodal_inputs=(
                 [multimodal_inputs[i] for i in active_indices]
@@ -884,9 +937,9 @@ class VllmEngine(InferenceEngine, RayActor):
             prompt_token_ids = list(getattr(output, "prompt_token_ids", None) or [])
             prompt_tokens = len(prompt_token_ids)
             output_objects = getattr(output, "outputs", None) or []
-            completion_token_ids = list(
-                getattr(output_objects[0], "token_ids", None) or []
-            ) if output_objects else []
+            completion_token_ids = (
+                list(getattr(output_objects[0], "token_ids", None) or []) if output_objects else []
+            )
             completion_tokens = len(completion_token_ids)
             if completion_tokens <= 1:
                 logger.warning(
@@ -952,7 +1005,8 @@ class VllmEngine(InferenceEngine, RayActor):
                 kwargs={"weights_path": model_path},
             )
             failures = [
-                item for item in worker_results
+                item
+                for item in worker_results
                 if isinstance(item, dict) and not item.get("success", False)
             ]
             success = not failures
@@ -967,9 +1021,7 @@ class VllmEngine(InferenceEngine, RayActor):
             )
             return {"success": success, "message": message}
         except Exception as exc:
-            logger.exception(
-                f"VllmEngine rank {self.rank}: draft weight reload failed"
-            )
+            logger.exception(f"VllmEngine rank {self.rank}: draft weight reload failed")
             return {"success": False, "message": f"{type(exc).__name__}: {exc}"}
 
     def _normalize_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
