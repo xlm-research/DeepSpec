@@ -42,6 +42,7 @@ class DatasetConfig:
     last_turn_loss_only: Any = "auto"  # bool or "auto"
     length_group_size: int = 32
     min_loss_tokens: int = 0  # DFlash: skip sequences with < N supervised tokens (use 2*block_size)
+    num_proc: int = 64  # dataset preprocessing workers; 1 runs in the driver
     prompt_key: str = "conversations"
     renderer: Optional[str] = None  # registered ConversationRenderer; overrides chat_template
     shuffle_dataset: bool = True
@@ -52,6 +53,7 @@ class DatasetConfig:
 @dataclass
 class DebugConfig:
     enable_perf_metrics: bool = True
+    verify_parameter_updates: bool = False
     max_dump_steps: int = 5
     memory_recorder: str = "torch"
     memory_snapshot_dir: str = "."

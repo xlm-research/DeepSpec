@@ -42,7 +42,7 @@ import ray
 import torch
 from omegaconf import DictConfig, OmegaConf
 
-from torchspec.data.utils import serialize_packed_loss_mask
+from torchspec.data.utils import pack_loss_mask, serialize_packed_loss_mask
 from torchspec.inference.engine.base import InferenceEngine
 from torchspec.ray.ray_actor import RayActor
 from torchspec.utils.logging import logger, setup_file_logging
@@ -112,6 +112,7 @@ class VllmEngine(InferenceEngine, RayActor):
         self._mooncake_config = None
         self._hidden_size = None
         self.local_gpu_id = None
+        self._prefill_mask_renderer = None
         self._decode_mode = bool(getattr(args, "train_with_decode", False))
 
         setup_file_logging("inference", self.rank, group=engine_group)
@@ -691,6 +692,17 @@ class VllmEngine(InferenceEngine, RayActor):
         outputs = self._engine.generate(prompts, sampling_params, use_tqdm=False)
         generate_elapsed = time.perf_counter() - generate_started
 
+        renderer_name = getattr(self.args, "renderer", None)
+        if isinstance(renderer_name, str) and getattr(self, "_prefill_mask_renderer", None) is None:
+            from torchspec.data.renderers import RENDERER_REGISTRY
+            from torchspec.utils.processing import load_tokenizer
+
+            renderer_cls = RENDERER_REGISTRY.get(renderer_name)
+            if getattr(renderer_cls, "RECOMPUTE_PREFILL_MASK", False):
+                self._prefill_mask_renderer = renderer_cls(
+                    load_tokenizer(self.args.target_model_path, trust_remote_code=True)
+                )
+
         results = []
         for i, output in enumerate(outputs):
             seq_len = len(output.prompt_token_ids)
@@ -756,6 +768,16 @@ class VllmEngine(InferenceEngine, RayActor):
                 result["input_ids_list"] = input_ids_from_kv
             else:
                 result["input_ids_list"] = list(output.prompt_token_ids)
+
+            if getattr(self, "_prefill_mask_renderer", None) is not None:
+                mask = self._prefill_mask_renderer.compute_loss_mask(
+                    result["input_ids_list"],
+                    last_turn_only=getattr(self.args, "last_turn_loss_only", False),
+                )
+                result["packed_loss_mask"] = serialize_packed_loss_mask(
+                    pack_loss_mask(torch.tensor(mask, dtype=torch.long))
+                )
+                result["prefill_completion_token_ids"] = list(output.outputs[0].token_ids)
 
             request_metrics = getattr(output, "metrics", None)
             if request_metrics is not None:

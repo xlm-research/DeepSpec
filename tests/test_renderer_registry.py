@@ -348,6 +348,135 @@ def test_cached_masks_survive_when_dynamic_masking_is_off():
     assert prompts[0]["packed_loss_mask"] == "2,1"
 
 
+def test_qwen_multimodal_renderer_supervises_all_answers_but_excludes_vision():
+    class Tokenizer:
+        def encode(self, text, **kwargs):
+            return {
+                "<|im_start|>assistant": [10, 20],
+                "<|im_start|>assistant\n": [10, 20, 21],
+                "<|im_end|>": [30],
+            }[text]
+
+        def convert_tokens_to_ids(self, token):
+            return {
+                "<|vision_start|>": 90,
+                "<|image_pad|>": 91,
+                "<|vision_end|>": 92,
+                "<|video_pad|>": 93,
+            }[token]
+
+    renderer = RENDERER_REGISTRY.create("qwen3.5-multimodal", Tokenizer())
+    # Two assistant bodies, with expanded image tokens inside the first body.
+    ids = [
+        5,
+        90,
+        91,
+        91,
+        92,
+        10,
+        20,
+        21,
+        40,
+        90,
+        91,
+        91,
+        92,
+        41,
+        30,
+        5,
+        50,
+        30,
+        10,
+        20,
+        21,
+        42,
+        43,
+        30,
+    ]
+    assert renderer.compute_loss_mask(ids) == [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        1,
+        0,
+    ]
+
+
+def test_qwen_multimodal_dataset_keeps_structured_images_tools_and_reasoning(tmp_path, monkeypatch):
+    class Tokenizer:
+        def __init__(self):
+            self.calls = []
+
+        def apply_chat_template(self, messages, **kwargs):
+            self.calls.append((messages, kwargs))
+            return "native-prompt"
+
+        def encode(self, text, **kwargs):
+            return {
+                "<|im_start|>assistant": [10, 20],
+                "<|im_start|>assistant\n": [10, 20, 21],
+                "<|im_end|>": [30],
+                "native-prompt": [5, 90, 91, 92, 30, 10, 20, 21, 40, 41, 30],
+            }[text]
+
+        def convert_tokens_to_ids(self, token):
+            return {
+                "<|vision_start|>": 90,
+                "<|image_pad|>": 91,
+                "<|vision_end|>": 92,
+                "<|video_pad|>": 93,
+            }[token]
+
+    tokenizer = Tokenizer()
+    sample = _multimodal_sample()
+    sample["tools"] = [{"type": "function", "function": {"name": "inspect"}}]
+    sample["conversations"][-1].update(
+        reasoning_content="look at the picture", tool_calls=[{"function": {"name": "inspect"}}]
+    )
+    monkeypatch.setattr(dataset_module, "load_hf_dataset", lambda _path: [sample])
+    monkeypatch.setattr(dataset_module, "load_tokenizer", lambda *_a, **_kw: tokenizer)
+    source = tmp_path / "native.jsonl"
+    source.write_text("{}\n")
+    prompts = dataset_module.load_conversation_dataset(
+        _renderer_args(
+            tmp_path,
+            source,
+            renderer="qwen3.5-multimodal",
+            last_turn_loss_only=False,
+            dynamic_loss_mask=True,
+        )
+    )
+    messages, options = tokenizer.calls[-1]
+    assert isinstance(messages[0]["content"], list)
+    assert messages[-1]["reasoning_content"] == "look at the picture"
+    assert messages[-1]["tool_calls"]
+    assert options["tools"] == sample["tools"]
+    assert options["preserve_thinking"] is True
+    assert options["add_generation_prompt"] is False
+    assert prompts[0]["input_ids"].tolist() == [5, 90, 91, 92, 30, 10, 20, 21, 40, 41, 30]
+    assert prompts[0]["multimodal_inputs"]["images"] == ["example.png"]
+    assert "packed_loss_mask" not in prompts[0]
+
+
 def test_assistant_matcher_comes_from_the_renderer(stub_renderer, monkeypatch):
     from torchspec.utils import processing
 

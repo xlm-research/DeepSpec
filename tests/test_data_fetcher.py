@@ -1,7 +1,9 @@
 """Tests for MooncakeDataFetcher and create_mooncake_dataloader."""
 
 import queue
+import runpy
 import time
+from pathlib import Path
 from typing import Dict, List, Tuple
 from unittest.mock import MagicMock
 
@@ -39,6 +41,42 @@ class MockTargetOutput:
 
     def to_tensor_dict(self) -> Dict[str, torch.Tensor]:
         return dict(self._tensors)
+
+
+def test_image_text_prefill_reader_consumes_layer_manifest_even_without_pipeline_parallelism():
+    script = Path(__file__).parents[1] / "examples/qwen3.8-27b-image-text-1node/prefill.py"
+    read_capture = runpy.run_path(str(script))["read_capture"]
+    ids = torch.tensor([90, 91, 91, 92, 40, 41])
+
+    class Store:
+        def get(self, key, **kwargs):
+            # Packed request keys do not exist; only the manifest's layer keys do.
+            assert key in {"request_layer4", "request_layer64"}
+            value = 4.0 if key.endswith("layer4") else 64.0
+            return MockTargetOutput({"hidden_states": torch.full((6, 2), value), "input_ids": ids})
+
+        def remove_eagle3_tensors(self, *args, **kwargs):
+            pass
+
+    result = {
+        "mooncake_key": "request",
+        "tensor_shapes": {"hidden_states": (6, 2), "last_hidden_states": (6, 2), "input_ids": (6,)},
+        "tensor_dtypes": {"hidden_states": "float32", "input_ids": "int64"},
+        "packed_loss_mask": "4,2",
+        "data_id": "image-text",
+        "metadata": {
+            "vllm_pp_complete": True,
+            "vllm_pp_layer_manifest": [
+                {"mooncake_key": "request_layer4", "role": "hidden_states"},
+                {"mooncake_key": "request_layer64", "role": "last_hidden_states"},
+            ],
+        },
+    }
+    capture = read_capture(Store(), result)
+    assert capture["hidden_states"].tolist() == [[4.0, 4.0]] * 6
+    assert capture["last_hidden_states"].tolist() == [[64.0, 64.0]] * 6
+    assert capture["input_ids"].tolist() == ids.tolist()
+    assert capture["loss_mask"].tolist() == [0, 0, 0, 0, 1, 1]
 
 
 def test_clone_fragment_synchronizes_cuda_before_receive_buffer_reuse(monkeypatch):

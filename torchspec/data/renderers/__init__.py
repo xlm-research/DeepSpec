@@ -20,9 +20,11 @@
 
 from torchspec.data.renderers.base import DEFAULT_CACHE_VERSION, ConversationRenderer
 from torchspec.data.renderers.kimi_k3 import K3Renderer
+from torchspec.data.renderers.qwen3_5_multimodal import Qwen35MultimodalRenderer
 from torchspec.data.renderers.registry import RENDERER_REGISTRY, RendererRegistry
 
 RENDERER_REGISTRY.register("kimi-k3", K3Renderer)
+RENDERER_REGISTRY.register("qwen3.5-multimodal", Qwen35MultimodalRenderer)
 
 __all__ = [
     "DEFAULT_CACHE_VERSION",

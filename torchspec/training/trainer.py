@@ -24,6 +24,7 @@ import dataclasses
 import itertools
 import json
 import logging
+import math
 import os
 import time
 from argparse import Namespace
@@ -37,6 +38,7 @@ from torch.distributed.checkpoint.state_dict import (
     get_model_state_dict,
 )
 from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.tensor import DTensor
 
 from torchspec.config.mooncake_config import MooncakeConfig
 from torchspec.data.utils import DataCollatorWithPadding
@@ -454,10 +456,30 @@ class Trainer(abc.ABC):
 
             if is_last:
                 self._maybe_dump(batch, step_metrics, step, batch_idx)
+                verify_updates = getattr(self.args, "verify_parameter_updates", False)
+                if verify_updates:
+                    parameter = self.optimizer.fp32_params[0]
+                    local = parameter.to_local() if isinstance(parameter, DTensor) else parameter
+                    probe = local.detach().reshape(-1)[:2048]
+                    before = probe.clone()
+                    learning_rate = self.optimizer.get_learning_rate()
                 _evt_opt_s = torch.cuda.Event(enable_timing=True)
                 _evt_opt_e = torch.cuda.Event(enable_timing=True)
                 _evt_opt_s.record()
                 grad_norm = self.optimizer.step()
+                if verify_updates:
+                    delta = (probe - before).abs().max().item()
+                    if not math.isfinite(delta) or delta == 0:
+                        raise RuntimeError("Optimizer did not make a finite nonzero draft update")
+                    logger.info(
+                        "[Rank %s] update_probe step=%s lr=%.12g delta=%.12g before_sum=%.17g after_sum=%.17g",
+                        self.dp_rank,
+                        step + 1,
+                        learning_rate,
+                        delta,
+                        before.double().sum().item(),
+                        probe.double().sum().item(),
+                    )
                 _evt_opt_e.record()
                 step_metrics["_opt_events"] = (_evt_opt_s, _evt_opt_e)
 

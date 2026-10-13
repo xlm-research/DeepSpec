@@ -160,6 +160,47 @@ def _build_engine_with_mock_vllm():
 class TestGenerateWithExtractHiddenStates:
     """Test that generate() reads kv_transfer_params from outputs."""
 
+    def test_native_prefill_publishes_mask_for_expanded_tokens_not_the_completion(
+        self, monkeypatch
+    ):
+        from types import SimpleNamespace
+
+        from torchspec.data.renderers import RENDERER_REGISTRY
+        from torchspec.data.utils import deserialize_packed_loss_mask, unpack_loss_mask
+        from torchspec.utils import processing
+
+        class CaptureRenderer:
+            RECOMPUTE_PREFILL_MASK = True
+
+            def __init__(self, tokenizer):
+                pass
+
+            def compute_loss_mask(self, ids, *, last_turn_only):
+                assert ids == [90, 91, 91, 92, 40, 41]
+                assert last_turn_only is False
+                return [0, 0, 0, 0, 1, 1]
+
+        RENDERER_REGISTRY.register("capture-test", CaptureRenderer, override=True)
+        monkeypatch.setattr(processing, "load_tokenizer", lambda *_a, **_kw: object())
+        engine, mock_llm = _build_engine_with_mock_vllm()
+        engine.args = SimpleNamespace(
+            renderer="capture-test", target_model_path="stub", last_turn_loss_only=False
+        )
+        output = _make_mock_output(
+            "r", [90, 91, 91, 92, 40, 41], {"mooncake_key": "k", "tensor_shapes": {}}
+        )
+        output.outputs = [SimpleNamespace(token_ids=[99])]
+        mock_llm.generate.return_value = [output]
+        try:
+            result = engine.generate(["sample"], [torch.tensor([90, 91, 92, 40, 41])])[0]
+        finally:
+            RENDERER_REGISTRY.renderers.pop("capture-test")
+        mask = unpack_loss_mask(deserialize_packed_loss_mask(result["packed_loss_mask"]))
+        assert mask.tolist() == [0, 0, 0, 0, 1, 1]
+        assert result["seq_len"] == 6
+        assert result["prefill_completion_token_ids"] == [99]
+        assert result["completion_tokens"] == 0
+
     def test_prefill_timing_preserves_clock_domains_and_internal_token_count(self, monkeypatch):
         import json
         from types import SimpleNamespace
