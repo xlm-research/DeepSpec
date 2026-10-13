@@ -3,6 +3,9 @@
 目标 checkpoint、草稿结构及四卡 FSDP + 四卡 TP=4 布局沿用
 `../qwen3.8-27b-1node`。原文本示例保持独立。
 
+2026-10-13 已通过三条图文 prefill、10 步训练及恢复第 11 步、原文本 GPU 回归。
+实际结果及测试范围见 [验收记录](../../docs/qwen3_8_27b_multimodal_results.md)。
+
 本例使用原生 Qwen3.5 模板保留结构化图片、顶层 tools、各轮 reasoning 和
 tool_calls。所有 assistant 回答参与监督；user/tool 和视觉 token 不计算回答 loss。
 vLLM 读取完整已有会话，执行 prefill 并生成 1 token；新增 token 不用于训练。
@@ -27,6 +30,14 @@ python examples/qwen3.8-27b-image-text-1node/prepare_data.py
 ```bash
 bash examples/qwen3.8-27b-image-text-1node/prefill.sh
 ```
+
+使用原文本示例的配置、loader 和默认仅最后 thinking 轮次监督规则做真实回归：
+
+```bash
+bash examples/qwen3.8-27b-image-text-1node/prefill.sh --legacy-text-only
+```
+
+此回归报告单独写入 `outputs/qwen3.8-27b-image-text-1node-text-prefill/`。
 
 默认使用 GPU 0–3。报告写入 `outputs/qwen3.8-27b-image-text-1node-prefill/`，
 包含每条请求的展开长度、单 token 生成、有效监督数、捕获槽及张量形状。

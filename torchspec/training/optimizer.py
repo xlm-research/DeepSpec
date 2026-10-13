@@ -18,12 +18,14 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import math
+
 import torch
 import torch.distributed as dist
 from torch.distributed.tensor import DTensor
 
 from torchspec.training.lr_scheduler import LRSchedulerWithWarmup
-from torchspec.utils.logging import print_on_rank0
+from torchspec.utils.logging import logger, print_on_rank0
 
 
 def _copy_tensors_(destinations, sources):
@@ -79,7 +81,7 @@ class BF16Optimizer:
             wsd_decay_style=wsd_decay_style,
         )
 
-    def step(self, closure=None):
+    def step(self, closure=None, *, verify_update=False):
         """Perform optimizer step with gradient clipping.
 
         Args:
@@ -101,6 +103,18 @@ class BF16Optimizer:
             if grad_destinations:
                 _copy_tensors_(grad_destinations, grad_sources)
 
+        snapshots = []
+        if verify_update:
+            for master in self.fp32_params:
+                if master.grad is not None:
+                    local = master.to_local() if isinstance(master, DTensor) else master
+                    snapshots.append((local, local.detach().clone()))
+            first = self.fp32_params[0]
+            first = first.to_local() if isinstance(first, DTensor) else first
+            probe = first.detach().reshape(-1)[:2048]
+            before_sum = probe.double().sum().item()
+            learning_rate = self.get_learning_rate()
+
         grad_norm = torch.nn.utils.clip_grad_norm_(self.fp32_params, self.max_grad_norm)
 
         # Fused AdamW consumes this device scalar through the same path used by
@@ -116,6 +130,25 @@ class BF16Optimizer:
             dist.all_reduce(collective_found_inf, op=dist.ReduceOp.MAX)
         self.optimizer.found_inf = found_inf
         self.optimizer.step()
+
+        if verify_update:
+            deltas = [(local - before).abs().max() for local, before in snapshots if local.numel()]
+            delta = torch.stack(deltas).max() if deltas else grad_norm.new_zeros(())
+            if dist.is_available() and dist.is_initialized():
+                dist.all_reduce(delta, op=dist.ReduceOp.MAX)
+            update = delta.item()
+            if not math.isfinite(update) or update == 0:
+                raise RuntimeError("Optimizer did not make a finite nonzero draft update")
+            logger.info(
+                "[Rank %s] update_probe step=%s lr=%.12g delta=%.12g before_sum=%.17g after_sum=%.17g",
+                dist.get_rank() if dist.is_initialized() else 0,
+                self.scheduler.last_epoch + 1,
+                learning_rate,
+                update,
+                before_sum,
+                probe.double().sum().item(),
+            )
+            del snapshots
 
         self.optimizer.zero_grad()
         self.scheduler.step()

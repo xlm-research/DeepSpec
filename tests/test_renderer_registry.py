@@ -1,3 +1,6 @@
+import os
+import re
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -346,6 +349,91 @@ def test_cached_masks_survive_when_dynamic_masking_is_off():
     dataset_module._drop_stale_multimodal_masks(prompts, dynamic_loss_mask=False)
 
     assert prompts[0]["packed_loss_mask"] == "2,1"
+
+
+def test_real_qwen35_template_masks_every_message_and_complete_tool_arguments():
+    model = os.environ.get("TARGET_MODEL_PATH")
+    if not model or not (Path(model) / "chat_template.jinja").is_file():
+        pytest.skip("Set TARGET_MODEL_PATH to a local Qwen3.5 multimodal checkpoint")
+    from PIL import Image
+    from transformers import AutoProcessor, AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
+    processor = AutoProcessor.from_pretrained(model, trust_remote_code=True)
+    renderer = RENDERER_REGISTRY.create("qwen3.5-multimodal", tokenizer)
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "description": "lookup",
+                "parameters": {"type": "object", "properties": {"query": {"type": "string"}}},
+            },
+        }
+    ]
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "USER_ONE"},
+                {"type": "image_url", "image_url": {"url": "first"}},
+            ],
+        },
+        {
+            "role": "assistant",
+            "content": "ANSWER_ONE",
+            "reasoning_content": "REASON_ONE",
+            "tool_calls": [
+                {"function": {"name": "lookup", "arguments": {"query": "ARG_ONE"}}},
+                {"function": {"name": "lookup", "arguments": {"query": "ARG_TWO"}}},
+            ],
+        },
+        {
+            "role": "tool",
+            "content": [
+                {"type": "text", "text": "TOOL_CONTEXT"},
+                {"type": "image_url", "image_url": {"url": "second"}},
+            ],
+        },
+        {"role": "assistant", "content": "ANSWER_TWO", "reasoning_content": "REASON_TWO"},
+        {"role": "user", "content": "USER_TWO"},
+        {"role": "assistant", "content": "ANSWER_THREE", "reasoning_content": "REASON_THREE"},
+    ]
+    text = renderer.format(messages, tools)
+    ids = processor(text=text, images=[Image.new("RGB", (64, 64))] * 2, return_tensors="pt")[
+        "input_ids"
+    ][0].tolist()
+    mask = renderer.compute_loss_mask(ids)
+    # Character spans from the real template form an independent token-mask oracle.
+    expanded_text = tokenizer.decode(ids, skip_special_tokens=False)
+    encoded = tokenizer(expanded_text, add_special_tokens=False, return_offsets_mapping=True)
+    assert encoded["input_ids"] == ids
+    blocks = list(
+        re.finditer(
+            r"<\|im_start\|>(system|user|assistant)\n(.*?)<\|im_end\|>", expanded_text, re.DOTALL
+        )
+    )
+    bodies = [block.group(2) for block in blocks if block.group(1) == "assistant"]
+    assert len(bodies) == 3
+    assert all(
+        value in bodies[0]
+        for value in (
+            "ANSWER_ONE",
+            "REASON_ONE",
+            "<parameter=query>\nARG_ONE\n</parameter>",
+            "<parameter=query>\nARG_TWO\n</parameter>",
+        )
+    )
+    assert "ANSWER_TWO" in bodies[1] and "REASON_TWO" in bodies[1]
+    assert "ANSWER_THREE" in bodies[2] and "REASON_THREE" in bodies[2]
+    expected = []
+    for token, (start, end) in zip(ids, encoded["offset_mapping"]):
+        supervised = any(
+            block.group(1) == "assistant" and start >= block.start(2) and end <= block.end(2)
+            for block in blocks
+        )
+        expected.append(int(supervised and token not in renderer.visual_token_ids))
+    assert mask == expected
 
 
 def test_qwen_multimodal_renderer_supervises_all_answers_but_excludes_vision():

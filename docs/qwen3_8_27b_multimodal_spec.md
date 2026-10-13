@@ -59,4 +59,6 @@
 
 ## 当前状态
 
-用户已确认修订方案，Q9 采用 160 条独立 ID 的重复记录，Q10 使用 114、217、231。实现与运行已启动；采用注册的原生 renderer 直接构造未展开 token IDs，保留结构化内容和 tools，再由 vLLM processor 展开图片并重算 packed mask，无需启用原有延迟分词路径。真实 processor 预检长度分别为 11296、18792、77523，全部保留完整会话。
+用户已确认修订方案，Q9 采用 160 条独立 ID 的重复记录，Q10 使用 114、217、231。实现与 GPU 验收已完成：三条图文 prefill 各生成 1 token，单机 DSpark 完成 10 个 optimizer steps，保存后恢复并完成第 11 步，原文本配置/loader/default mask 的 GPU 回归通过。所有推理与训练目标特征提取使用当前项目的本地 vLLM。
+
+采用注册的原生 renderer 直接构造未展开 token IDs，保留结构化内容和 tools，再由 vLLM processor 展开图片并重算 packed mask，无需启用原有延迟分词路径。真实展开长度分别为 11296、18792、77523，全部保留完整会话。监督、参数更新、恢复连续性、各损失项及测试结果见 [验收记录](qwen3_8_27b_multimodal_results.md)。

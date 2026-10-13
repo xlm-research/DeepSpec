@@ -54,6 +54,22 @@ def _make_optimizer() -> BF16Optimizer:
     )
 
 
+def test_update_verification_accepts_changes_outside_the_checksum_slice():
+    model = torch.nn.Module()
+    model.register_parameter(
+        "weight", torch.nn.Parameter(torch.ones(2049, dtype=torch.bfloat16, device="cuda"))
+    )
+    optimizer = BF16Optimizer(
+        model, lr=0.01, weight_decay=0.0, total_steps=2, warmup_ratio=0.0, decay_style="constant"
+    )
+    model.weight.grad = torch.zeros_like(model.weight)
+    model.weight.grad[-1] = 1.0
+    grad_norm = optimizer.step(verify_update=True)
+    assert torch.isfinite(grad_norm)
+    assert torch.equal(model.weight[:2048], torch.ones_like(model.weight[:2048]))
+    assert model.weight[-1] < 1.0
+
+
 def _set_grad(optimizer: BF16Optimizer, first_value: float) -> None:
     optimizer.model_params[0].grad = torch.tensor(
         [[first_value, 0.25]],

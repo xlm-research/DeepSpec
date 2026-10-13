@@ -743,6 +743,7 @@ class VllmEngine(InferenceEngine, RayActor):
                         "Direct prefill capture must publish exactly the original input tokens"
                     )
 
+            completions = getattr(output, "outputs", ())
             result: dict[str, Any] = {
                 "mooncake_key": mooncake_key,
                 "tensor_shapes": tensor_shapes,
@@ -751,6 +752,9 @@ class VllmEngine(InferenceEngine, RayActor):
                 "seq_len": seq_len,
                 "prompt_tokens": seq_len,
                 "completion_tokens": 0,
+                "prefill_completion_token_ids": (
+                    list(completions[0].token_ids) if completions else []
+                ),
             }
             pp_layer_manifest = kv_params.get("pp_layer_manifest")
             if pp_layer_manifest is not None:
@@ -777,7 +781,6 @@ class VllmEngine(InferenceEngine, RayActor):
                 result["packed_loss_mask"] = serialize_packed_loss_mask(
                     pack_loss_mask(torch.tensor(mask, dtype=torch.long))
                 )
-                result["prefill_completion_token_ids"] = list(output.outputs[0].token_ids)
 
             request_metrics = getattr(output, "metrics", None)
             if request_metrics is not None:
