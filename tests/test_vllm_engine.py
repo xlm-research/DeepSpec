@@ -127,6 +127,7 @@ def _make_mock_output(request_id: str, prompt_token_ids: list[int], kv_transfer_
     out.request_id = request_id
     out.prompt_token_ids = prompt_token_ids
     out.kv_transfer_params = kv_transfer_params
+    out.metrics = None
     return out
 
 
@@ -158,6 +159,42 @@ def _build_engine_with_mock_vllm():
 
 class TestGenerateWithExtractHiddenStates:
     """Test that generate() reads kv_transfer_params from outputs."""
+
+    def test_prefill_timing_preserves_clock_domains_and_internal_token_count(self, monkeypatch):
+        import json
+        from types import SimpleNamespace
+
+        from torchspec.inference.engine import vllm_engine
+
+        engine, mock_llm = _build_engine_with_mock_vllm()
+        output = _make_mock_output("req-0", [10, 20, 30], {"mooncake_key": "sample"})
+        output.metrics = SimpleNamespace(
+            arrival_time=1_800_000_000.0,
+            queued_ts=100.0,
+            scheduled_ts=100.25,
+            first_token_ts=102.25,
+            first_token_latency=2.5,
+            num_generation_tokens=1,
+            is_corrupted=False,
+        )
+        output.num_cached_tokens = 0
+        output.finished = True
+        mock_llm.generate.return_value = [output]
+        log = MagicMock()
+        monkeypatch.setattr(vllm_engine.logger, "info", log)
+
+        result = engine.generate(data_id=["sample"], input_ids_ref=[torch.tensor([10, 20, 30])])[0]
+
+        timing = json.loads(log.call_args.args[1])
+        assert timing["ttft_seconds"] == 2.5
+        assert timing["scheduled_prefill_seconds"] == 2.0
+        assert timing["queue_seconds"] == 0.25
+        assert timing["prompt_tokens"] == 3
+        assert timing["generated_tokens"] == 1
+        assert timing["num_cached_tokens"] == 0
+        assert timing["finished"] is True
+        # The internal output token still does not become training supervision.
+        assert result["completion_tokens"] == 0
 
     def test_input_ids_path_returns_mooncake_metadata(self):
         ids_a = torch.tensor([10, 20, 30])

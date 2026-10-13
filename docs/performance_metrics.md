@@ -48,6 +48,20 @@ though the training loss mask excludes that position. Dropped or invalid results
 are excluded, so these rates describe usable training data production rather than
 all work performed inside vLLM.
 
+For fixed-length prefill comparisons, set
+`inference.vllm.extra_args.disable_log_stats=false` to log one JSON
+`PREFILL_METRICS` record per valid request. It includes vLLM's `ttft_seconds`,
+`scheduled_prefill_seconds` (first scheduling to first token), queue time,
+batch `generate` wall time, input/internal output token counts, cache hits and
+completion status. The internal output token remains excluded from training
+supervision and `completion_tokens`.
+
+These request times include the enabled capture path; they are neither pure
+GPU kernel time nor a guarantee that all Mooncake keys are already readable.
+The `generate` time is shared by every request in that batch, so it is a
+per-request latency only at batch size 1. Compare a fixed set of requests after
+warmup instead of averaging the moving-window throughput snapshots.
+
 ### Pipeline Health Metrics
 
 | Metric | Unit | Source | Description |

@@ -9,6 +9,9 @@
 bash examples/qwen3.5-loop-mhc-dspark/run.sh --dry-run
 bash examples/qwen3.5-loop-mhc-dspark/run.sh --print-config-only
 bash examples/qwen3.5-loop-mhc-dspark/run.sh
+
+# 启用目标模型 mHC Triton 融合
+VLLM_QWEN3_5_MHC_BACKEND=triton bash examples/qwen3.5-loop-mhc-dspark/run.sh
 ```
 
 启动脚本使用已有 `.venv` 和 `h800conda.sh`，开启 V2 runner。默认输出目录带时间戳；可通过 `OUTPUT_DIR`、`CACHE_DIR`、`TRAIN_DATA_PATH`、`TARGET_MODEL_PATH` 指定路径，或追加 `key=value` 配置覆盖。设置 `TORCHSPEC_LOG_LEVEL=DEBUG` 可记录采集分块、训练样本标识和分项指标。
@@ -26,7 +29,7 @@ bash examples/qwen3.5-loop-mhc-dspark/run.sh
 
 五份条件特征来自零基执行层 `[3, 27, 51, 75, 78]`，对应辅助槽 `[4, 28, 52, 76, 79]`；独立最终槽为 80，保存实际进入目标 LM head 的 post-norm 状态。原 checkpoint 保留 32 个物理层。草稿为五层、隐藏宽度 4096、Q heads 16、KV heads 4、head dimension 256、Markov rank 256，从头初始化可训练参数。
 
-当前 attention 头数与维度已按用户要求对齐目标 full attention。旧的 32/8/128 草稿 checkpoint 不能直接恢复到新配置，Q/K norm 参数也由 `[128]` 变为 `[256]`；下述 GPU 验收记录属于旧结构，新结构需另行训练验收。
+当前 attention 头数与维度已按用户要求对齐目标 full attention。旧的 32/8/128 草稿 checkpoint 不能直接恢复到新配置，Q/K norm 参数也由 `[128]` 变为 `[256]`。2026-10-12 已用当前 16/4/256 结构和 Triton 融合完成默认 20 条数据、五次训练更新，并验证 checkpoint 参数与 optimizer 状态；见[单机八卡训练验收](../../docs/qwen3_5_loop_mhc_8gpu_revalidation_plan.md)。下述 2026-10-10 的恢复与满长记录仍属于旧结构。
 
 128K 表示输入与内部生成 token 合计上限 131072，因此训练输入最多 131071。分块 prefill 的单步预算为 8192，每次仅一个请求；prefix caching 关闭。满长样本六份 BF16 表示约 6 GiB，配置使用 8 GiB host buffer、64 GiB Mooncake segment 和最多四样本的等待池。直接采集仅在 TP rank 0 保存 CPU 副本。
 

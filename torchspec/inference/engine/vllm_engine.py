@@ -31,9 +31,11 @@ and requires the direct-capture support in this repository's local MRV2.
 """
 
 import gc
+import json
 import os
 import socket
 import threading
+import time
 from typing import Any
 
 import ray
@@ -685,7 +687,9 @@ class VllmEngine(InferenceEngine, RayActor):
                 if i < len(packed_loss_mask_list):
                     packed_loss_mask_map[did] = packed_loss_mask_list[i]
 
+        generate_started = time.perf_counter()
         outputs = self._engine.generate(prompts, sampling_params, use_tqdm=False)
+        generate_elapsed = time.perf_counter() - generate_started
 
         results = []
         for i, output in enumerate(outputs):
@@ -752,6 +756,29 @@ class VllmEngine(InferenceEngine, RayActor):
                 result["input_ids_list"] = input_ids_from_kv
             else:
                 result["input_ids_list"] = list(output.prompt_token_ids)
+
+            request_metrics = getattr(output, "metrics", None)
+            if request_metrics is not None:
+                # Core timestamps are monotonic; arrival_time is wall-clock.
+                # Use vLLM's TTFT rather than subtracting across clock domains.
+                timing = {
+                    "engine_rank": self.rank,
+                    "request_id": output.request_id,
+                    "data_id": did,
+                    "prompt_tokens": seq_len,
+                    "generated_tokens": request_metrics.num_generation_tokens,
+                    "num_cached_tokens": output.num_cached_tokens,
+                    "ttft_seconds": request_metrics.first_token_latency,
+                    "scheduled_prefill_seconds": (
+                        request_metrics.first_token_ts - request_metrics.scheduled_ts
+                    ),
+                    "queue_seconds": request_metrics.scheduled_ts - request_metrics.queued_ts,
+                    "generate_batch_seconds": generate_elapsed,
+                    "batch_size": batch_size,
+                    "finished": output.finished,
+                    "is_corrupted": request_metrics.is_corrupted,
+                }
+                logger.info("PREFILL_METRICS %s", json.dumps(timing, sort_keys=True))
 
             results.append(result)
 
