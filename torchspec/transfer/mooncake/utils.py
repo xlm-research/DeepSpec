@@ -126,14 +126,30 @@ class MooncakeMaster(RayActor):
         self._start_log_thread(self._process.stdout, "stdout")
         self._start_log_thread(self._process.stderr, "stderr")
 
-        time.sleep(2)
-
         if self._process.poll() is not None:
             raise RuntimeError(
                 f"mooncake master failed to start (exit code: {self._process.returncode})"
             )
-
         host = self.get_node_ip()
+        deadline = time.monotonic() + 120
+        while True:
+            if self._process.poll() is not None:
+                raise RuntimeError(
+                    f"mooncake master failed to start (exit code: {self._process.returncode})"
+                )
+            try:
+                check_mooncake_master_available(
+                    f"{host}:{port}", f"http://{host}:{http_port}/metadata", timeout=0.5
+                )
+            except RuntimeError as error:
+                if time.monotonic() >= deadline:
+                    self.shutdown()
+                    raise RuntimeError(
+                        f"Mooncake master did not become ready within 120 seconds: {error}"
+                    ) from error
+                time.sleep(0.1)
+            else:
+                break
         self._info = {
             "master_addr": f"{host}:{port}",
             "metadata_port": http_port,

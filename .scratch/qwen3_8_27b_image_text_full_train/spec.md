@@ -222,3 +222,20 @@ tokens using independent assistant-body character spans, tokenizer offsets, and 
 message identities. A regression rejects supervision leaking into overlapping history.
 Both reviewers confirmed their findings were resolved; all 22 focused workflow tests,
 the affected typecheck, and applicable pre-commit hooks passed.
+
+### 2026-10-14 — Preparation accepted; GPU startup race fixed
+
+The complete source prepares as 610 unique supervision windows. An independent audit
+against original messages confirms all 327 sources and 28,872 assistant segments are
+assigned exactly once, with intact assistant/system content and no future messages in
+earlier windows. Inputs range from 11,296 to 131,071 expanded tokens; the largest window
+contains 20 images. This requires 39 optimizer steps and 14 zero-loss tail entries.
+The audit is saved in `cache/qwen3.8-27b-image-text-1node/full-data/independent_audit.json`.
+
+The first GPU preflight exposed an existing Mooncake startup race: the master returned
+after a fixed two-second delay before its gRPC port accepted connections. Startup now
+waits for both gRPC and metadata TCP readiness with a bounded timeout and cleanup.
+A delayed-service regression reproduced the failure before the fix; all 18 Mooncake
+tests and the affected typecheck now pass. Both reviewers confirmed no remaining
+findings. First-attempt diagnostics are preserved under the run's `preflight_attempt1/`;
+the retry has reached target-model initialization. Full GPU acceptance is still pending.

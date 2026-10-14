@@ -1,7 +1,9 @@
 """Tests for mooncake master Ray actor and launcher."""
 
 import os
+import socket
 import subprocess
+import sys
 import tempfile
 from argparse import Namespace
 from unittest import mock
@@ -35,6 +37,40 @@ class TestResolveMooncakeMasterBin:
 class TestMooncakeMaster:
     """Tests for the MooncakeMaster class (tested as plain class, no Ray)."""
 
+    def test_start_waits_until_delayed_services_are_reachable(self, tmp_path, monkeypatch):
+        binary = tmp_path / "mooncake-store/src/mooncake_master"
+        binary.parent.mkdir(parents=True)
+        binary.write_text(
+            f"#!{sys.executable}\n"
+            "import argparse, socket, time\n"
+            "parser = argparse.ArgumentParser()\n"
+            "parser.add_argument('--port', type=int)\n"
+            "parser.add_argument('--http_metadata_server_port', type=int)\n"
+            "args, _ = parser.parse_known_args()\n"
+            "time.sleep(3)\n"
+            "listeners = []\n"
+            "for port in (args.port, args.http_metadata_server_port):\n"
+            "    listener = socket.socket()\n"
+            "    listener.bind(('0.0.0.0', port))\n"
+            "    listener.listen()\n"
+            "    listeners.append(listener)\n"
+            "while True:\n"
+            "    time.sleep(1)\n"
+        )
+        binary.chmod(0o755)
+        monkeypatch.setenv("MOONCAKE_BUILD_DIR", str(tmp_path))
+        monkeypatch.setattr("torchspec.ray.ray_actor.get_current_node_ip", lambda: "127.0.0.1")
+        actor = MooncakeMaster()
+        try:
+            info = actor.start(actor.find_free_port(51135), actor.find_free_port(8763))
+            host, port = info["master_addr"].rsplit(":", 1)
+            with socket.create_connection((host, int(port)), timeout=1):
+                pass
+            with socket.create_connection((host, info["metadata_port"]), timeout=1):
+                pass
+        finally:
+            actor.shutdown()
+
     def test_start_launches_subprocess(self):
         actor = MooncakeMaster()
         mock_process = mock.MagicMock()
@@ -51,6 +87,7 @@ class TestMooncakeMaster:
             mock.patch("os.path.exists", return_value=True),
             mock.patch("subprocess.Popen", return_value=mock_process) as mock_popen,
             mock.patch("time.sleep"),
+            mock.patch("socket.create_connection"),
             mock.patch("torchspec.ray.ray_actor.get_current_node_ip", return_value="10.0.0.1"),
         ):
             info = actor.start(50051, 8090, "0.0.0.0")
@@ -307,6 +344,7 @@ class TestMooncakeMasterIntegration:
                     return_value=script_path,
                 ),
                 mock.patch("torchspec.ray.ray_actor.get_current_node_ip", return_value="127.0.0.1"),
+                mock.patch("socket.create_connection"),
             ):
                 info = actor.start(50051, 8090, "0.0.0.0")
 
