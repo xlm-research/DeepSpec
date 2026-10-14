@@ -302,3 +302,31 @@ configuration regression failed before the fix; all 23 focused tests, the affect
 typecheck, applicable hooks and both review axes now pass. A real H800 allocation
 snapshot confirms expandable segments are supported. A separate fresh full-data run
 has started; runtime resolution and complete-pass acceptance remain pending.
+
+### 2026-10-14 — Complete GPU pass accepted
+
+The fresh run completed all 39 optimizer steps and exited successfully. Its final
+coverage reconciles all 610 real windows, all 327 original sources, and all 28,872
+assistant supervision segments exactly once. Enqueued, submitted, received,
+dispatched, and committed window ID sets match; missing, duplicate, failed, and
+in-flight sets are empty. The final partial batch contains two real windows and
+fourteen zero-loss entries, with no dummy source or segment credit.
+
+Independent verification against the original source and its SHA-256 passed. All 39
+actual optimizer metric steps are finite, reproduce the configured weighted loss
+identity, and agree with local TensorBoard component scalars. Weighted total loss is
+3.698109745979309 at step one and 2.7390774577856067 at step thirty-nine. Draft update
+probes confirm finite updates on every step on all four FSDP ranks. The allocator
+retry committed the entire previously failing batch while exactly reproducing the
+first nine loss-component and weighted-total values, confirming that regression is
+resolved.
+
+The final four-panel PNG was visually inspected. Checkpoint metadata, tracker,
+four model shards, four optimizer shards, four scheduler shards, and saved RNG state
+reconcile at iteration 39. Artifacts are under `outputs/image-text-full-20261014/`:
+`loss.png`, `metrics.jsonl`, `coverage.json`, `independent_acceptance.json`, `runs/`,
+`training.log`, `actor_logs/`, and `checkpoints/iter_0000039/`. The native seventeen-window
+GPU prefill, legacy text regression, and distributed padded-tail training preflight
+remain separately recorded under `preflight/`. Earlier incomplete attempts remain
+archived separately. This accepts one complete data pass; existing anchor sampling
+does not establish exhaustive target-token sampling or draft decoding quality.

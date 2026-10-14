@@ -57,6 +57,13 @@ python -m torchspec.utils.dspark_metrics \
   --output outputs/image-text-full/loss.png
 ```
 
+2026-10-14 已完成真实八卡全量验收：327 条源会话、610 个监督窗口、
+28,872 个 assistant 监督段，39 个 optimizer steps，尾步 14 个零 loss padding。
+独立对账确认没有缺失或重复；精确指标覆盖 step 1–39，TensorBoard 分项一致，
+最终 checkpoint 为 `iter_0000039`。本地曲线、覆盖、独立验收报告和原始日志位于
+`outputs/image-text-full-20261014/`；完整执行记录见
+[全量训练规格](../../.scratch/qwen3_8_27b_image_text_full_train/spec.md)。
+
 以下保留原三条源会话 smoke 示例的使用方式。
 
 目标 checkpoint、草稿结构及四卡 FSDP + 四卡 TP=4 布局沿用
