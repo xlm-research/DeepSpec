@@ -215,33 +215,23 @@ class _WindowBuilder:
         cursor = 0
         while cursor < len(assistants):
             first = assistants[cursor]
-            fit = self.fit(source, first, assistants[-1])
-            last = len(assistants) - 1
-            if fit is None:
-                low, high = cursor, len(assistants) - 1
-                last = cursor - 1
-                while low <= high:
-                    middle = (low + high) // 2
-                    candidate = self.fit(source, first, assistants[middle])
-                    if candidate is not None:
-                        fit, last = candidate, middle
-                        low = middle + 1
-                    else:
-                        high = middle - 1
-            if fit is None:
+            fit = None
+            for shorten in (False, True):
                 last = len(assistants) - 1
-                fit = self.fit(source, first, assistants[last], shorten=True)
+                fit = self.fit(source, first, assistants[last], shorten=shorten)
                 if fit is None:
                     low, high = cursor, last
                     last = cursor - 1
                     while low <= high:
                         middle = (low + high) // 2
-                        candidate = self.fit(source, first, assistants[middle], shorten=True)
+                        candidate = self.fit(source, first, assistants[middle], shorten=shorten)
                         if candidate is not None:
                             fit, last = candidate, middle
                             low = middle + 1
                         else:
                             high = middle - 1
+                if fit is not None:
+                    break
             if fit is None:
                 raise ValueError(
                     f"Source {source_index}, assistant message {first}: cannot fit an intact "

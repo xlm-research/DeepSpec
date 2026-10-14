@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import queue
+import re
 from pathlib import Path
 
 import torch
@@ -17,6 +18,41 @@ from torchspec.data.utils import DataCollatorWithPadding, unpack_loss_mask
 from torchspec.inference.engine.vllm_engine import VllmEngine
 from torchspec.training.data_fetcher import MooncakeDataFetcher, TrainSample
 from torchspec.transfer.mooncake import EagleMooncakeStore, MooncakeMaster
+
+
+def validate_supervision_capture(tokenizer, input_ids, loss_mask, row):
+    """Check captured weights using source identities and independent character spans."""
+    ids = input_ids.tolist() if hasattr(input_ids, "tolist") else list(input_ids)
+    actual = loss_mask.tolist() if hasattr(loss_mask, "tolist") else list(loss_mask)
+    text = tokenizer.decode(ids, skip_special_tokens=False)
+    encoded = tokenizer(text, add_special_tokens=False, return_offsets_mapping=True)
+    assert encoded["input_ids"] == ids, "Captured input IDs must round-trip with offsets"
+    blocks = list(re.finditer(r"<\|im_start\|>assistant\n(.*?)<\|im_end\|>", text, re.DOTALL))
+    window = row["metadata"]["supervision_window"]
+    assistants = [
+        index
+        for index, message in zip(window["message_indices"], row["messages"], strict=True)
+        if message["role"] == "assistant"
+    ]
+    assert len(blocks) == len(assistants), "Captured assistant spans must match retained messages"
+    selected_indices = set(window["supervised_message_indices"])
+    selected = [
+        block for index, block in zip(assistants, blocks, strict=True) if index in selected_indices
+    ]
+    assert len(selected) == len(selected_indices), "Every selected source segment must be present"
+    visual_ids = {
+        tokenizer.convert_tokens_to_ids(token)
+        for token in ("<|vision_start|>", "<|image_pad|>", "<|vision_end|>", "<|video_pad|>")
+    }
+    expected = [
+        int(
+            token not in visual_ids
+            and start < end
+            and any(start >= block.start(1) and end <= block.end(1) for block in selected)
+        )
+        for token, (start, end) in zip(ids, encoded["offset_mapping"], strict=True)
+    ]
+    assert actual == expected, f"{row['data_id']}: mask disagrees with independent assistant spans"
 
 
 def read_capture(store, result):
@@ -104,6 +140,11 @@ def main():
         AutoTokenizer.from_pretrained(args.target_model_path, trust_remote_code=True),
     )
     prompts = load_conversation_dataset(args)
+    source_rows = (
+        {row["data_id"]: row for row in map(json.loads, Path(data).read_text().splitlines())}
+        if getattr(args, "complete_data_pass", False)
+        else {}
+    )
     # Include a text-only request through the same public prefill interface.
     if not cli.legacy_text_only and not getattr(args, "complete_data_pass", False):
         prompts.append(
@@ -166,11 +207,12 @@ def main():
             if cli.legacy_text_only:
                 assert torch.equal(mask, unpack_loss_mask(prompt["packed_loss_mask"]))
             if getattr(args, "complete_data_pass", False):
-                expected = renderer.compute_loss_mask(
+                validate_supervision_capture(
+                    renderer.tokenizer,
                     tensors["input_ids"],
-                    supervision_window=prompt["metadata"]["supervision_window"],
+                    mask,
+                    source_rows[prompt["data_id"]],
                 )
-                assert mask.tolist() == expected
             entry = {
                 "data_id": prompt["data_id"],
                 "prompt_tokens": length,
@@ -181,6 +223,8 @@ def main():
                 "all_finite": True,
                 "capture_slots": engine.aux_hidden_state_layer_ids,
             }
+            if getattr(args, "complete_data_pass", False):
+                entry["independent_supervision_verified"] = True
             torch.save(
                 {"input_ids": tensors["input_ids"], "loss_mask": mask},
                 output / f"{prompt['data_id']}_tokens.pt",

@@ -211,3 +211,14 @@ MyPy; the broader eight-module check reports the same 16 diagnostics as the star
 
 Full-source preparation and real-GPU acceptance are still in progress. No completed
 full-data training run is claimed by this record.
+
+### 2026-10-14 — Review findings resolved
+
+The Standards review found no documented-rule violations. Its duplicated window-search
+heuristic was resolved by sharing the search across the unchanged context-shortening
+phases. The Spec review found one GPU verification gap: the expected supervision mask
+used the same renderer implementation as the engine. GPU preflight now checks retrieved
+tokens using independent assistant-body character spans, tokenizer offsets, and original
+message identities. A regression rejects supervision leaking into overlapping history.
+Both reviewers confirmed their findings were resolved; all 22 focused workflow tests,
+the affected typecheck, and applicable pre-commit hooks passed.

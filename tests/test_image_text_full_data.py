@@ -136,6 +136,8 @@ def test_full_data_mask_supervises_selected_segments_and_excludes_overlapping_hi
     tokenizer = AutoTokenizer.from_pretrained(checkpoint, trust_remote_code=True)
     processor = AutoProcessor.from_pretrained(checkpoint, trust_remote_code=True)
     renderer = RENDERER_REGISTRY.create("qwen3.5-full-data", tokenizer)
+    prefill_script = Path(__file__).parents[1] / "examples/qwen3.8-27b-image-text-1node/prefill.py"
+    validate_capture = runpy.run_path(str(prefill_script))["validate_supervision_capture"]
     observed_context = False
     for row in rows:
         window = row["metadata"]["supervision_window"]
@@ -162,6 +164,18 @@ def test_full_data_mask_supervises_selected_segments_and_excludes_overlapping_hi
             for start, end in offsets["offset_mapping"]
         ]
         assert mask == expected
+        validate_capture(tokenizer, ids, mask, row)
+        if len(selected) < len(blocks):
+            context = next(block for block in blocks if block not in selected)
+            context_token = next(
+                i
+                for i, (start, end) in enumerate(offsets["offset_mapping"])
+                if start >= context.start(1) and end <= context.end(1)
+            )
+            wrong_mask = list(mask)
+            wrong_mask[context_token] = 1
+            with pytest.raises(AssertionError, match="independent assistant spans"):
+                validate_capture(tokenizer, ids, wrong_mask, row)
         observed_context |= len(selected) < len(blocks)
     assert observed_context
 
