@@ -283,3 +283,22 @@ capture. Capture-read exceptions now identify the real supervision window and pr
 their original cause. All 23 focused tests, both affected typechecks, applicable hooks,
 and both review axes pass. A separate fresh run has mounted the 256 GiB segment and
 started its 39-step training loop; complete-pass acceptance remains pending.
+
+### 2026-10-14 — Variable-window CUDA allocation adjusted
+
+The 256 GiB-store retry committed nine optimizer steps, 144 real windows, and 7,729
+assistant segments without a capture-read failure. Step ten then failed in the L1
+distribution loss on a training GPU: a 3.32 GiB allocation could not be satisfied with
+64.08 GiB live allocations and 10.52 GiB reserved but unused. This is consistent with
+fragmentation under varying window lengths; prefetched captures are CPU-staged and
+micro-batch metrics detach their backward graphs. The incomplete coverage, exact
+metrics, PNG and logs are preserved under `outputs/image-text-full-20261014/full_attempt2/`.
+
+The full-data recipe now enables `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`
+through the existing training-actor runtime environment before CUDA initialization.
+Other configured training environment entries are preserved. The 512-anchor sampling,
+loss formula, supervision, batch shape, and legacy recipes are unchanged. The public
+configuration regression failed before the fix; all 23 focused tests, the affected
+typecheck, applicable hooks and both review axes now pass. A real H800 allocation
+snapshot confirms expandable segments are supported. A separate fresh full-data run
+has started; runtime resolution and complete-pass acceptance remain pending.

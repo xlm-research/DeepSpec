@@ -408,6 +408,10 @@ def test_full_data_configuration_replaces_smoke_horizon_and_restoration(tmp_path
     assert config.inference.inference_batch_size == 1
     assert config.inference.vllm.extra_args.max_num_seqs == 1
     assert config.inference.vllm.mem_fraction_static == 0.7
+    assert (
+        json.loads(config.training.train_env_vars).get("PYTORCH_CUDA_ALLOC_CONF")
+        == "expandable_segments:True"
+    )
     # Six 5120-wide BF16 feature layers plus per-layer input IDs for each
     # queued optimizer window, pooled result, and in-flight target request.
     capture_bytes = 131072 * 6 * (5120 * 2 + 8)

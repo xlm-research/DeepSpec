@@ -35,6 +35,7 @@ HTTPS 图片先缓存并实际解码；GIF 沿用静态首帧、EXIF 方向及�
 使用四卡 FSDP + 四卡 TP=4，global batch 为 16；
 目标推理每次处理一个监督窗口，并为长窗口的隐藏态传输保留显存。
 Mooncake 的 256 GiB 存储覆盖已排队的累积批次、待分发结果和在途捕获。
+训练 actor 默认启用 `expandable_segments`，降低不同窗口长度下的 CUDA 显存碎片。
 M 个真实监督窗口对应 `ceil(M/16)` 个 optimizer steps。
 全量模式拒绝旧 smoke 的十步终点、十一学习率步数和 checkpoint 恢复参数；
 零 loss padding 不计入源会话、监督段、样本或损失分母。
