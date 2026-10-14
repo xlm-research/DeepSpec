@@ -13,6 +13,10 @@ from torchspec.data.utils import extract_media_urls
 
 
 def prepare(args):
+    if getattr(args, "full_data", False):
+        from torchspec.data.supervision_windows import prepare_full_data
+
+        return prepare_full_data(args)
     indices = [int(value) for value in args.indices.split(",")]
     selected = {}
     with open(args.source) as source:
@@ -117,5 +121,10 @@ if __name__ == "__main__":
     parser.add_argument("--indices", default="114,217,231")
     parser.add_argument("--rows", type=int, default=160)
     parser.add_argument("--max-length", type=int, default=131072)
+    parser.add_argument(
+        "--full-data", action="store_true", help="Prepare every source without repeats"
+    )
+    parser.add_argument("--expected-sources", type=int, default=327)
+    parser.add_argument("--min-loss-tokens", type=int, default=14)
     parser.add_argument("--output", default="cache/qwen3.8-27b-image-text-1node/data")
     prepare(parser.parse_args())

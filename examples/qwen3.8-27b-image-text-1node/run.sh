@@ -26,10 +26,14 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   exit 0
 fi
 dry_run=false
-if [[ "${1:-}" == "--dry-run" ]]; then
-  dry_run=true
+full_data=false
+while [[ "${1:-}" == "--dry-run" || "${1:-}" == "--full-data" ]]; do
+  case "$1" in
+    --dry-run) dry_run=true ;;
+    --full-data) full_data=true ;;
+  esac
   shift
-fi
+done
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
@@ -88,6 +92,17 @@ launch=(
   decode.weight_sync_enabled=false
   decode.weight_sync_interval=0
 )
+if [[ "$full_data" == true ]]; then
+  if [[ -n "${LOAD_PATH:-}" || -n "${CKPT_STEP:-}" ]]; then
+    echo "ERROR: full-data training must start fresh without checkpoint restore." >&2
+    exit 1
+  fi
+  launch=(
+    python "$SCRIPT_DIR/full_train.py"
+    --output-dir "$OUTPUT_DIR" --cache-dir "$CACHE_DIR"
+    "${overrides[@]}" "$@"
+  )
+fi
 if [[ "$dry_run" == true ]]; then
   printf '%q ' "${launch[@]}"
   printf '\n'

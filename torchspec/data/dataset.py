@@ -373,6 +373,7 @@ def _iter_conversation_samples(dataset, prompt_key, custom_template):
             multimodal_inputs,
             sample.get("tools"),
             sample.get("generation_config"),
+            sample.get("metadata") or {},
         )
 
 
@@ -552,8 +553,19 @@ def load_conversation_dataset(args):
             )
 
             work_items = [
-                (messages, tools, generation_config, max_length, train_with_decode)
-                for _, messages, _, tools, generation_config in raw_samples
+                (
+                    messages,
+                    tools,
+                    {
+                        **(generation_config or {}),
+                        "supervision_window": metadata["supervision_window"],
+                    }
+                    if "supervision_window" in metadata
+                    else generation_config,
+                    max_length,
+                    train_with_decode,
+                )
+                for _, messages, _, tools, generation_config, metadata in raw_samples
             ]
             if pool is None:
                 results = [worker_fn(item) for item in tqdm(work_items, desc=desc)]
@@ -566,7 +578,9 @@ def load_conversation_dataset(args):
                     )
                 )
 
-            for (data_id, _, multimodal_inputs, _, _), result in zip(raw_samples, results):
+            for (data_id, _, multimodal_inputs, _, _, source_metadata), result in zip(
+                raw_samples, results
+            ):
                 if result is None:
                     skipped += 1
                     continue
@@ -578,7 +592,7 @@ def load_conversation_dataset(args):
                     and has_unbalanced_thinking_tags(formatted_prompt)
                 ):
                     unbalanced_think += 1
-                metadata = {}
+                metadata = dict(source_metadata)
                 if "has_thinking" in result:
                     metadata["has_thinking"] = result["has_thinking"]
 

@@ -158,7 +158,16 @@ class MooncakeDataset(IterableDataset):
 
         metadata = sample.metadata or {}
         pp_manifest = metadata.get("vllm_pp_layer_manifest")
-        if pp_manifest is not None:
+        if metadata.get("zero_loss_dummy"):
+            result = {
+                key: torch.zeros(
+                    shape,
+                    dtype=dtypes.get(key, torch.long if key == "input_ids" else torch.bfloat16),
+                    device=self.device,
+                )
+                for key, shape in sample.tensor_shapes.items()
+            }
+        elif pp_manifest is not None:
             result = self._load_vllm_pp_layers(sample, pp_manifest, dtypes)
         else:
             tensors = self.mooncake_store.get(
@@ -351,9 +360,14 @@ class MooncakeDataset(IterableDataset):
             )
             data = self._load_from_mooncake(item)
 
+            before_neutralization = neutralized_count
             neutralized_count = self._resolve_and_neutralize_loss_mask(
                 data, item.mooncake_key, neutralized_count
             )
+            if (item.metadata or {}).get(
+                "supervision_window"
+            ) is not None and neutralized_count != before_neutralization:
+                raise RuntimeError(f"Invalid real supervision window: {item.data_id}")
 
             # Note: target is computed in the collator from last_hidden_states for sglang mode
 

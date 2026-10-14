@@ -49,6 +49,7 @@ def read_capture(store, result):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data")
+    parser.add_argument("--config")
     parser.add_argument("--output")
     parser.add_argument("--legacy-text-only", action="store_true")
     cli = parser.parse_args()
@@ -61,7 +62,7 @@ def main():
         )
     )
     output.mkdir(parents=True, exist_ok=True)
-    recipe = Path(__file__).with_name("config.yaml")
+    recipe = Path(cli.config) if cli.config else Path(__file__).with_name("config.yaml")
     if cli.legacy_text_only:
         recipe = recipe.parent.parent / "qwen3.8-27b-1node" / "config.yaml"
         fixture = output / "legacy_text.jsonl"
@@ -99,12 +100,12 @@ def main():
     hidden_size = getattr(model_config, "text_config", model_config).hidden_size
     layer_count = len(args.aux_hidden_states_layers)
     renderer = RENDERER_REGISTRY.create(
-        "qwen3.5-multimodal",
+        args.renderer or "qwen3.5-multimodal",
         AutoTokenizer.from_pretrained(args.target_model_path, trust_remote_code=True),
     )
     prompts = load_conversation_dataset(args)
     # Include a text-only request through the same public prefill interface.
-    if not cli.legacy_text_only:
+    if not cli.legacy_text_only and not getattr(args, "complete_data_pass", False):
         prompts.append(
             {
                 "data_id": "text_regression",
@@ -137,6 +138,11 @@ def main():
                 [prompt["input_ids"]],
                 packed_loss_mask_list=[prompt.get("packed_loss_mask")],
                 multimodal_inputs=[prompt.get("multimodal_inputs")],
+                **(
+                    {"supervision_windows": [prompt["metadata"]["supervision_window"]]}
+                    if getattr(args, "complete_data_pass", False)
+                    else {}
+                ),
             )
             if len(results) != 1:
                 raise RuntimeError("Prefill did not return exactly one complete capture")
@@ -159,6 +165,12 @@ def main():
                     assert mask[tensors["input_ids"] == token].sum() == 0
             if cli.legacy_text_only:
                 assert torch.equal(mask, unpack_loss_mask(prompt["packed_loss_mask"]))
+            if getattr(args, "complete_data_pass", False):
+                expected = renderer.compute_loss_mask(
+                    tensors["input_ids"],
+                    supervision_window=prompt["metadata"]["supervision_window"],
+                )
+                assert mask.tolist() == expected
             entry = {
                 "data_id": prompt["data_id"],
                 "prompt_tokens": length,

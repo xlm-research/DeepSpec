@@ -100,6 +100,17 @@ def auto_calculate_training_steps(args, dataset_size: int):
 
     global_batch_size = args.global_batch_size
     steps_per_epoch = dataset_size // global_batch_size
+    if getattr(args, "complete_data_pass", False):
+        if dataset_size <= 0 or getattr(args, "num_epochs", 1) != 1:
+            raise ValueError("A complete data pass requires nonempty data and one epoch")
+        steps_per_epoch = math.ceil(dataset_size / global_batch_size)
+        for key in ("num_train_steps", "lr_total_steps"):
+            override = getattr(args, key, None)
+            if override is not None and override != steps_per_epoch:
+                raise ValueError(
+                    f"Full-data {key}={override} conflicts with the derived "
+                    f"complete-pass endpoint {steps_per_epoch}"
+                )
 
     if steps_per_epoch == 0:
         logger.warning(

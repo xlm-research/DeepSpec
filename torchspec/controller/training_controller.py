@@ -49,10 +49,12 @@ Batch Size Design:
 """
 
 import copy
+import json
 import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import ray
 from ray.util.queue import Queue
@@ -167,6 +169,16 @@ class AsyncTrainingController:
         self._training_monitor = SpeedMonitor(window_seconds=10.0)
         self._last_dispatch_log_time = 0.0
         self._inference_error: str | None = None
+        self._data_pass = None
+        self._last_full_data_output = None
+        if getattr(args, "complete_data_pass", False):
+            from torchspec.controller.data_pass import CompleteDataPass
+
+            self._data_pass = CompleteDataPass(
+                args.supervision_manifest_path,
+                self.dispatch_batch_size,
+                args.draft_accumulation_steps,
+            )
 
     def _generate_data_id(self) -> str:
         self._data_id_counter += 1
@@ -207,6 +219,8 @@ class AsyncTrainingController:
                         data_id=self._generate_data_id(),
                         prompt=sample,
                     )
+                if self._data_pass is not None:
+                    self._data_pass.enqueue(entry.data_id)
                 self.prompt_buffer.append(entry)
             return len(dataset)
 
@@ -257,6 +271,8 @@ class AsyncTrainingController:
                 f"and chat_template settings."
             )
         logger.info(f"Controller loaded dataset: {len(self._stored_dataset)} samples")
+        if self._data_pass is not None:
+            self._data_pass.validate_dataset(self._stored_dataset)
         return len(self._stored_dataset)
 
     def _prepare_dataset(self, skip: int = 0) -> list:
@@ -305,6 +321,8 @@ class AsyncTrainingController:
 
     def reload_dataset(self) -> int:
         """Re-add the stored dataset to the prompt buffer (epoch reload)."""
+        if self._data_pass is not None:
+            raise RuntimeError("A complete data pass cannot reload or repeat source windows")
         assert self._stored_dataset is not None, "No stored dataset to reload"
         self._dataset_epoch += 1
         return self.add_dataset(self._prepare_dataset())
@@ -371,7 +389,10 @@ class AsyncTrainingController:
         with self._prompt_lock:
             entries = []
             for _ in range(min(num_prompts, len(self.prompt_buffer))):
-                entries.append(self.prompt_buffer.popleft())
+                entry = self.prompt_buffer.popleft()
+                if self._data_pass is not None and entry.data_id not in self._eval_data_ids:
+                    self._data_pass.submit(entry.data_id)
+                entries.append(entry)
             return entries
 
     def push_inference_results(self, results: list[InferenceOutput]) -> int:
@@ -394,6 +415,17 @@ class AsyncTrainingController:
             if result.data_id in self._eval_data_ids:
                 eval_results.append(result)
             else:
+                if self._data_pass is not None:
+                    try:
+                        self._data_pass.receive(result)
+                    except RuntimeError as error:
+                        self.fail_training_windows([result.data_id], str(error))
+                        raise
+                    result.metadata = {
+                        **(result.metadata or {}),
+                        "supervision_window": self._data_pass.windows[result.data_id],
+                    }
+                    self._last_full_data_output = result
                 train_results.append(result)
 
         if eval_results:
@@ -451,6 +483,41 @@ class AsyncTrainingController:
     def set_inference_error(self, msg: str) -> None:
         """Called by the inference manager when a fatal error occurs."""
         self._inference_error = msg
+        if self._data_pass is not None:
+            self._data_pass.fail(msg)
+            self.write_coverage_report()
+
+    def fail_training_windows(self, data_ids: list[str], message: str) -> None:
+        if self._data_pass is None:
+            raise RuntimeError("Window failures require complete_data_pass")
+        self._data_pass.fail(message, data_ids)
+        self.set_inference_error(message)
+
+    def commit_training_step(self, step: int, num_batches: int) -> None:
+        if self._data_pass is None:
+            raise RuntimeError("Window commits require complete_data_pass")
+        self._data_pass.commit(step, num_batches)
+        self.write_coverage_report()
+
+    def get_coverage_report(self) -> dict:
+        if self._data_pass is None:
+            raise RuntimeError("Coverage reporting requires complete_data_pass")
+        return self._data_pass.report()
+
+    def write_coverage_report(self, *, complete: bool = False, error: str | None = None) -> dict:
+        if self._data_pass is None:
+            raise RuntimeError("Coverage reporting requires complete_data_pass")
+        if error is not None:
+            self._data_pass.fail(error)
+        if complete:
+            self._data_pass.finalize()
+        report = self._data_pass.report()
+        output = Path(self.args.output_dir)
+        output.mkdir(parents=True, exist_ok=True)
+        temporary = output / "coverage.json.tmp"
+        temporary.write_text(json.dumps(report, indent=2) + "\n")
+        temporary.replace(output / "coverage.json")
+        return report
 
     def try_dispatch_batch(self) -> bool:
         """Try to dispatch one batch to training queues.
@@ -470,9 +537,14 @@ class AsyncTrainingController:
 
         with self._pool_lock:
             pool_size = len(self.sample_pool)
+            tail_ready = (
+                self._data_pass is not None
+                and self._data_pass.all_received
+                and self._data_pass.dispatched_slots < self._data_pass.dispatch_slots
+            )
             now = time.time()
             should_log = (now - self._last_dispatch_log_time) >= 2.0
-            if pool_size < self.dispatch_batch_size:
+            if pool_size < self.dispatch_batch_size and not tail_ready:
                 if should_log:
                     self._last_dispatch_log_time = now
                     logger.debug(
@@ -487,15 +559,38 @@ class AsyncTrainingController:
                 )
 
             batch_results = []
-            for _ in range(self.dispatch_batch_size):
+            for _ in range(min(pool_size, self.dispatch_batch_size)):
                 result = self.sample_pool.popleft()
                 sample_bytes = self._sample_bytes.pop(result.mooncake_key, 0)
                 self._pool_bytes -= sample_bytes
                 batch_results.append(result)
+            if self._data_pass is not None:
+                real_ids = [result.data_id for result in batch_results]
+                while len(batch_results) < self.dispatch_batch_size:
+                    template = self._last_full_data_output
+                    if template is None:
+                        raise RuntimeError("Cannot pad a data pass without a real target capture")
+                    length = max(16, 2 * getattr(self.args, "ttt_length", 7))
+                    shapes = {
+                        key: (length, *shape[1:]) for key, shape in template.tensor_shapes.items()
+                    }
+                    batch_results.append(
+                        InferenceOutput(
+                            data_id=f"padding_{self.batch_id}_{len(batch_results)}",
+                            mooncake_key="",
+                            tensor_shapes=shapes,
+                            tensor_dtypes=template.tensor_dtypes,
+                            packed_loss_mask=str(length),
+                            metadata={"zero_loss_dummy": True},
+                        )
+                    )
+                self._data_pass.dispatch(real_ids, len(batch_results))
 
         self._dispatch_to_queues(batch_results, self.train_queues)
 
-        self._training_monitor.record(self.dispatch_batch_size)
+        self._training_monitor.record(
+            len(real_ids) if self._data_pass is not None else self.dispatch_batch_size
+        )
         logger.debug(
             f"Dispatched batch {self.batch_id} with {self.dispatch_batch_size} samples "
             f"to {self.dp_size} queues at t={time.time():.3f}; "
@@ -691,12 +786,20 @@ class AsyncTrainingController:
 
     def get_status(self) -> dict:
         """Get current status of controller."""
-        return {
+        status = {
             "prompt_buffer_size": len(self.prompt_buffer),
             "sample_pool_size": len(self.sample_pool),
             "batches_dispatched": self.batch_id,
             "dispatch_batch_size": self.dispatch_batch_size,
         }
+        if self._data_pass is not None:
+            status.update(
+                pass_expected=len(self._data_pass.windows),
+                pass_received=len(self._data_pass.received),
+                pass_submitted=len(self._data_pass.submitted),
+                pass_committed=len(self._data_pass.committed),
+            )
+        return status
 
     def get_speeds(self) -> dict:
         """Get current throughput speeds in entries/sec."""

@@ -48,6 +48,7 @@ class DatasetConfig:
     shuffle_dataset: bool = True
     tokenization_batch_size: int = 0  # raw samples per preprocessing batch; 0 loads all at once
     train_data_path: str = ""
+    supervision_manifest_path: Optional[str] = None
 
 
 @dataclass
@@ -104,6 +105,7 @@ class TrainingConfig:
     ckpt_step: Optional[int] = None
     colocate: bool = False
     continual_training: bool = False
+    complete_data_pass: bool = False
     distributed_backend: str = "nccl"
     distributed_timeout_minutes: int = 10
     draft_accumulation_steps: int = 1
@@ -223,6 +225,7 @@ _ALWAYS_LOCAL_PATH_KEYS = (
     "model_download_dir",
     "inference.offline.data_path",
     "model.initial_draft_model_path",
+    "dataset.supervision_manifest_path",
 )
 _DATA_PATH_KEYS = ("dataset.train_data_path", "dataset.eval_data_path")
 
@@ -382,6 +385,29 @@ def _validate_training_numeric_config(config: DictConfig) -> None:
         )
 
 
+def _validate_complete_data_pass(config: DictConfig) -> None:
+    if not config.training.complete_data_pass:
+        return
+    if (
+        config.training.num_epochs != 1
+        or config.training.train_with_decode
+        or config.inference.inference_engine_type != "vllm"
+        or config.dataset.renderer != "qwen3.5-full-data"
+        or not config.dataset.supervision_manifest_path
+    ):
+        raise ValueError(
+            "complete_data_pass requires one epoch, native full-data windows, "
+            "a supervision manifest, and vLLM prefill"
+        )
+    if (
+        config.training.load_path
+        or config.training.ckpt_step is not None
+        or config.training.continual_training
+        or config.model.initial_draft_model_path
+    ):
+        raise ValueError("complete_data_pass must start fresh without checkpoint or draft restore")
+
+
 def _save_config_snapshot(config: DictConfig) -> None:
     """Save the resolved config to output_dir/config.yaml if output_dir is set."""
     output_dir = OmegaConf.select(config, "output_dir", default=None)
@@ -431,6 +457,7 @@ def load_config(
     _validate_dataset_config(config)
     _validate_training_batch_config(config)
     _validate_training_numeric_config(config)
+    _validate_complete_data_pass(config)
     _validate_inference_batch_config(config)
 
     if save_snapshot:

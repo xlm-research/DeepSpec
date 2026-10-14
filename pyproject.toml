@@ -54,6 +54,13 @@ fa = [
     "nvidia-cutlass-dsl-libs-base>=4.4.2",
 ]
 
+full-data = [
+    "matplotlib",
+    "tensorboard",
+    "requests",
+    "pillow",
+]
+
 
 [tool.setuptools.dynamic]
 version = {file = "version.txt"}

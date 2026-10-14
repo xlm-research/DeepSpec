@@ -37,10 +37,16 @@ from torchspec.controller.eval import (
     setup_eval,
     update_checkpoint_eval_meta,
 )
+from torchspec.utils.dspark_metrics import LocalDSparkMetrics
 from torchspec.utils.logging import get_tb_writer, logger
 
 
-def _write_training_metrics(metrics: dict, train_step: int, inference_step: int) -> None:
+def _write_training_metrics(
+    metrics: dict,
+    train_step: int,
+    inference_step: int,
+    local_recorder: LocalDSparkMetrics | None = None,
+) -> None:
     loss = metrics.get("train/avg_loss")
     if os.environ.get("TORCHSPEC_CI_STEP_LOGS") == "1" and isinstance(loss, (int, float)):
         logger.info(f"TRAIN_STEP step={train_step} loss={loss:.6f}")
@@ -54,6 +60,8 @@ def _write_training_metrics(metrics: dict, train_step: int, inference_step: int)
             if isinstance(value, (int, float)):
                 scalar_step = inference_step if key.startswith("inference/") else train_step
                 tb_writer.add_scalar(key, value, scalar_step)
+    if local_recorder is not None:
+        local_recorder.record(metrics, train_step)
 
 
 def _maybe_sync_draft_weights(args, completed_steps, train_group, inference_engines):
@@ -230,6 +238,15 @@ def training_loop(
         getattr(args, "dp_size", None) or args.training_num_nodes * args.training_num_gpus_per_node
     )
     num_steps = args.num_train_steps
+    complete_data_pass = getattr(args, "complete_data_pass", False)
+    local_recorder = None
+    if complete_data_pass:
+        local_recorder = LocalDSparkMetrics(
+            args.output_dir,
+            getattr(args, "dspark_ce_loss_alpha", 0.1),
+            getattr(args, "dspark_l1_loss_alpha", 0.9),
+            getattr(args, "dspark_confidence_head_alpha", 1.0),
+        )
     accumulation_steps = getattr(args, "draft_accumulation_steps", 1)
     # steps_per_epoch in optimizer steps, pre-computed in auto_calculate_training_steps
     steps_per_epoch = getattr(args, "steps_per_epoch", dataset_size // args.global_batch_size)
@@ -242,6 +259,8 @@ def training_loop(
     # Resume is best-effort: completed optimizer steps determine epoch/skip, but
     # async prompt/result buffers can still lose or replay a small tail.
     start_step = ray.get(train_group._actor_handlers[0].get_global_step.remote())
+    if complete_data_pass and start_step != 0:
+        raise RuntimeError("A complete data pass must start from a fresh optimizer state")
     resume_epoch = start_step // steps_per_epoch if steps_per_epoch > 0 else 0
     resume_skip = (start_step % steps_per_epoch) * args.global_batch_size if start_step > 0 else 0
     ray.get(controller.submit_training_dataset.remote(epoch=resume_epoch, skip=resume_skip))
@@ -285,6 +304,8 @@ def training_loop(
         if enable_perf:
             t_dispatch = time.time()
         status = None
+        wait_start = time.monotonic()
+        received_count = -1
         while queued_batches < target_queued_batches:
             dispatch_attempts += 1
 
@@ -313,11 +334,25 @@ def training_loop(
                         f"need={status['dispatch_batch_size']}"
                     )
 
+                if complete_data_pass and status is not None:
+                    arrived = status["pass_received"]
+                    if arrived != received_count:
+                        received_count = arrived
+                        wait_start = time.monotonic()
+                    timeout = getattr(args, "distributed_timeout_minutes", 60) * 60
+                    if time.monotonic() - wait_start > timeout:
+                        coverage = ray.get(controller.get_coverage_report.remote())
+                        raise RuntimeError(
+                            "Full-data inference stopped making progress; missing windows: "
+                            + ", ".join(coverage["missing_window_ids"])
+                        )
+
                 should_reload = False
                 if steps_in_current_epoch >= steps_per_epoch:
                     should_reload = True
                 elif (
-                    consecutive_failures >= 500
+                    not complete_data_pass
+                    and consecutive_failures >= 500
                     and (completed_steps > 0 or queued_batches > 0)
                     and status is not None
                     and status["sample_pool_size"] < status["dispatch_batch_size"]
@@ -363,6 +398,13 @@ def training_loop(
             train_results = ray.get(train_futures)
             queued_batches -= accumulation_steps
             completed_steps += 1
+            if complete_data_pass:
+                ray.get(
+                    controller.commit_training_step.remote(
+                        step=completed_steps,
+                        num_batches=accumulation_steps,
+                    )
+                )
 
             # Log metrics from training (use rank 0's metrics - they're already all-reduced)
             metrics = train_results[0] if train_results and train_results[0] else {}
@@ -403,7 +445,12 @@ def training_loop(
                             f"dispatch={metric_dispatch_wait:.3f}s"
                         )
 
-                _write_training_metrics(metrics, metric_step, completed_steps)
+                _write_training_metrics(
+                    metrics,
+                    metric_step,
+                    completed_steps,
+                    **({"local_recorder": local_recorder} if local_recorder is not None else {}),
+                )
 
             # ── Eval at explicit interval (if configured) ─────────
             # Skip if a checkpoint save is about to run (it will eval anyway)
@@ -434,7 +481,10 @@ def training_loop(
             if _is_save_interval_step(completed_steps, args.save_interval):
                 eval_metrics = run_eval(completed_steps, train_group, eval_enabled)
                 logger.info(f"Saving checkpoint at step {completed_steps}...")
-                train_group.save_model(completed_steps - 1)
+                train_group.save_model(
+                    completed_steps - 1,
+                    **({"force_sync": True} if complete_data_pass else {}),
+                )
                 last_saved_step = completed_steps
                 best_eval_score = update_checkpoint_eval_meta(
                     args.checkpoint_dir, completed_steps - 1, eval_metrics, best_eval_score
@@ -462,7 +512,10 @@ def training_loop(
                         f"Saving checkpoint at end of epoch {current_epoch} "
                         f"(step {completed_steps})..."
                     )
-                    train_group.save_model(completed_steps - 1)
+                    train_group.save_model(
+                        completed_steps - 1,
+                        **({"force_sync": True} if complete_data_pass else {}),
+                    )
                     last_saved_step = completed_steps
                     best_eval_score = update_checkpoint_eval_meta(
                         args.checkpoint_dir, completed_steps - 1, eval_metrics, best_eval_score
@@ -497,9 +550,16 @@ def training_loop(
             step_time = final_metrics.get("perf/step_time", 0)
             if step_time > 0:
                 final_metrics["perf/train_capacity"] = args.global_batch_size / step_time
-        _write_training_metrics(final_metrics, final_metric_step, completed_steps)
+        _write_training_metrics(
+            final_metrics,
+            final_metric_step,
+            completed_steps,
+            **({"local_recorder": local_recorder} if local_recorder is not None else {}),
+        )
 
     progress.close()
+    if local_recorder is not None:
+        local_recorder.finalize(completed_steps)
 
     # Always save a final checkpoint unless saved.
     if args.checkpoint_dir and last_saved_step != completed_steps:
@@ -514,6 +574,8 @@ def training_loop(
             _cleanup_old_checkpoints(args.checkpoint_dir, max_ckpts)
 
     final_status = ray.get(controller.get_full_status.remote())
+    if complete_data_pass:
+        ray.get(controller.write_coverage_report.remote(complete=True))
     logger.info(
         f"Training completed: {completed_steps} steps in {final_status['elapsed_seconds']:.1f}s | "
         f"avg inference={final_status['avg_inference_speed']:.1f} entries/s | "
@@ -541,6 +603,13 @@ def run_training_loop(
             dataset_size=dataset_size,
             eval_dataset_size=eval_dataset_size,
         )
+    except Exception as error:
+        if getattr(args, "complete_data_pass", False):
+            try:
+                ray.get(controller.write_coverage_report.remote(error=str(error)))
+            except Exception as report_error:
+                logger.error(f"Could not persist incomplete coverage: {report_error}")
+        raise
     finally:
         _safe_training_cleanup(
             args=args,

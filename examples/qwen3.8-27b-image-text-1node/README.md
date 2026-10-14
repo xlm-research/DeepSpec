@@ -1,5 +1,61 @@
 # Sensenova Flash Lite v42 单机图文 DSpark
 
+全量模式使用全部 327 条不同训练源会话，从零训练 DSpark 草稿模型，
+先进行真实 GPU 图文预填充验证、原文本回归和 17 个不同监督窗口的两步
+训练预检（尾步包含 1 个真实窗口及 15 个零 loss padding），再完整遍历
+全量 DSpark 监督窗口一次：
+
+```bash
+source h800conda.sh
+pip install matplotlib tensorboard requests pillow
+OUTPUT_DIR="$PWD/outputs/image-text-full" \
+  bash examples/qwen3.8-27b-image-text-1node/run.sh --full-data
+```
+
+先检查启动命令、仅准备数据或仅运行 GPU 预检：
+
+```bash
+bash examples/qwen3.8-27b-image-text-1node/run.sh --full-data --dry-run
+bash examples/qwen3.8-27b-image-text-1node/run.sh --full-data --prepare-only
+bash examples/qwen3.8-27b-image-text-1node/run.sh --full-data --preflight-only
+```
+
+全量准备结果保存在独立的 `cache/qwen3.8-27b-image-text-1node/full-data/`，
+包含真实监督窗口、源会话/assistant 监督段映射、图片内容指纹及上下文缩短范围。
+保持 128K 总请求上限，为预填充验证生成的 1 token 预留位置。
+所有选中的 assistant 正文、reasoning 和 tool calls 完整保留，
+每段只在一个窗口中作为监督；重叠历史仅作为上下文。
+超长上下文先移除可省略的历史；单个 user/tool 上下文无法容纳时，
+按同一保留比例缩短文本前缀，并优先将完整监督段组合进可容纳的窗口。
+图片与标记保持对应，中途 system 按原角色和顺序保留。
+无法准备的记录明确报出源行，不静默跳过。
+
+HTTPS 图片先缓存并实际解码；GIF 沿用静态首帧、EXIF 方向及白底转换行为。
+仅优化 DSpark，目标模型、视觉编码器及共享 embedding/head/norm 保持冻结。
+使用四卡 FSDP + 四卡 TP=4，global batch 为 16；
+M 个真实监督窗口对应 `ceil(M/16)` 个 optimizer steps。
+全量模式拒绝旧 smoke 的十步终点、十一学习率步数和 checkpoint 恢复参数；
+零 loss padding 不计入源会话、监督段、样本或损失分母。
+
+运行目录包含 `loss.png`、每个真实 optimizer metric step 的
+`metrics.jsonl`、本地 TensorBoard 指标、`training.log`、actor 日志、
+`coverage.json` 和最终 `checkpoints/`。
+PNG 同时展示加权总 loss、CE、L1 和 confidence；`train/avg_loss` 继续表示
+原有 CE 汇总值。完整遍历的依据是窗口 ID 与成功 optimizer 提交的对账，
+并非日志步数或重复重载。运行失败时保留不完整覆盖报告。
+DSpark 仍使用原有 anchor 抽样，不保证每个目标 token 在单轮都被抽中，
+也不把一轮完成视为草稿质量验证。
+
+从精确指标重新生成曲线：
+
+```bash
+python -m torchspec.utils.dspark_metrics \
+  --input outputs/image-text-full/metrics.jsonl \
+  --output outputs/image-text-full/loss.png
+```
+
+以下保留原三条源会话 smoke 示例的使用方式。
+
 目标 checkpoint、草稿结构及四卡 FSDP + 四卡 TP=4 布局沿用
 `../qwen3.8-27b-1node`。原文本示例保持独立。
 

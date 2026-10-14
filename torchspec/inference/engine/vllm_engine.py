@@ -634,6 +634,7 @@ class VllmEngine(InferenceEngine, RayActor):
         return_last_hidden_states: bool = False,
         return_logits: bool = True,
         multimodal_inputs: list[dict] | None = None,
+        supervision_windows: list[dict] | None = None,
     ) -> list[dict]:
         """Generate hidden states for training data.
 
@@ -667,6 +668,10 @@ class VllmEngine(InferenceEngine, RayActor):
             multimodal_inputs=multimodal_inputs,
             batch_size=batch_size,
         )
+        if supervision_windows is not None and len(supervision_windows) != batch_size:
+            raise ValueError("supervision_windows must match the input batch size")
+        if getattr(self.args, "complete_data_pass", False) is True and supervision_windows is None:
+            raise ValueError("Full-data prefill requires supervision-window metadata")
 
         if isinstance(data_id, str):
             data_ids = [f"{data_id}_{i}" for i in range(batch_size)]
@@ -774,10 +779,18 @@ class VllmEngine(InferenceEngine, RayActor):
                 result["input_ids_list"] = list(output.prompt_token_ids)
 
             if getattr(self, "_prefill_mask_renderer", None) is not None:
+                selection = supervision_windows[i] if supervision_windows is not None else None
+                if selection is not None and (
+                    selection["window_id"] != did or selection["expanded_tokens"] != seq_len
+                ):
+                    raise ValueError(f"Prefill disagrees with prepared window {did}")
                 mask = self._prefill_mask_renderer.compute_loss_mask(
                     result["input_ids_list"],
                     last_turn_only=getattr(self.args, "last_turn_loss_only", False),
+                    **({"supervision_window": selection} if selection is not None else {}),
                 )
+                if selection is not None and sum(mask) != selection["supervised_tokens"]:
+                    raise ValueError(f"Prefill supervision disagrees with prepared window {did}")
                 result["packed_loss_mask"] = serialize_packed_loss_mask(
                     pack_loss_mask(torch.tensor(mask, dtype=torch.long))
                 )

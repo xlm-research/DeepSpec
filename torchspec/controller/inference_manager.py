@@ -491,6 +491,15 @@ class AsyncInferenceManager:
                     return_last_hidden_states=kwargs["return_last_hidden_states"],
                     return_logits=kwargs["return_logits"],
                     multimodal_inputs=kwargs["multimodal_inputs"],
+                    **(
+                        {
+                            "supervision_windows": [
+                                entry.metadata["supervision_window"] for entry in entries
+                            ]
+                        }
+                        if getattr(self.args, "complete_data_pass", False)
+                        else {}
+                    ),
                 )
                 if self._enable_perf_metrics:
                     now = time.perf_counter()
@@ -526,7 +535,13 @@ class AsyncInferenceManager:
                         logger.critical(
                             f"Inference engine died, terminating inference manager: {e}"
                         )
-                        await self.controller.set_inference_error.remote(str(cause))
+                        if getattr(self.args, "complete_data_pass", False):
+                            await self.controller.fail_training_windows.remote(
+                                [entry.data_id for entry in entries],
+                                str(cause),
+                            )
+                        else:
+                            await self.controller.set_inference_error.remote(str(cause))
                     raise
 
                 import traceback
@@ -561,14 +576,29 @@ class AsyncInferenceManager:
     async def _forward_results(self, results: list[tuple[InferenceInput, Any | Exception]]) -> int:
         """Parse results and forward to controller. Returns success count."""
         inference_results = []
+        failed_windows = []
 
         for entry, result in results:
             if isinstance(result, Exception):
+                failed_windows.append((entry.data_id, str(result)))
                 continue
 
             inference_result = self._parse_engine_output(entry, result)
             if inference_result is not None:
                 inference_results.append(inference_result)
+            else:
+                failed_windows.append((entry.data_id, "invalid target capture"))
+
+        if failed_windows and getattr(self.args, "complete_data_pass", False):
+            message = "Full-data inference failed: " + "; ".join(
+                f"{data_id}: {reason}" for data_id, reason in failed_windows
+            )
+            self._running = False
+            await self.controller.fail_training_windows.remote(
+                [data_id for data_id, _ in failed_windows],
+                message,
+            )
+            raise RuntimeError(message)
 
         if inference_results:
             await self.controller.push_inference_results.remote(inference_results)
