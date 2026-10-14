@@ -239,3 +239,19 @@ A delayed-service regression reproduced the failure before the fix; all 18 Moonc
 tests and the affected typecheck now pass. Both reviewers confirmed no remaining
 findings. First-attempt diagnostics are preserved under the run's `preflight_attempt1/`;
 the retry has reached target-model initialization. Full GPU acceptance is still pending.
+
+### 2026-10-14 — Native GPU checks passed; capture staging headroom adjusted
+
+All 17 selected image-text captures passed with finite aligned features, exactly one
+prefill-check token, and independently verified supervision masks. They cover 1,486,624
+expanded input tokens, including the 131,071-token limit and 20-image case. The legacy
+text-only GPU regression also passed (100 input tokens, 39 supervised tokens).
+
+The first training preflight failed before an optimizer commit: concurrent long captures
+exhausted target GPU memory during Mooncake's `tensor.contiguous()` staging. Its incomplete
+coverage and logs are preserved under `preflight/training_attempt1/` and
+`preflight/training_attempt1.log`. The full-data recipe now uses one target request at a
+time and a 0.7 target memory fraction to leave capture staging space. The four-GPU TP=4
+inference/four-GPU FSDP layout and global training batch of 16 are unchanged. All 22
+focused workflow tests, typechecking, hooks, and both review axes pass. A fresh training
+preflight is running; no full-data optimizer completion is claimed yet.

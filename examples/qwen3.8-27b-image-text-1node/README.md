@@ -33,6 +33,7 @@ bash examples/qwen3.8-27b-image-text-1node/run.sh --full-data --preflight-only
 HTTPS 图片先缓存并实际解码；GIF 沿用静态首帧、EXIF 方向及白底转换行为。
 仅优化 DSpark，目标模型、视觉编码器及共享 embedding/head/norm 保持冻结。
 使用四卡 FSDP + 四卡 TP=4，global batch 为 16；
+目标推理每次处理一个监督窗口，并为长窗口的隐藏态传输保留显存。
 M 个真实监督窗口对应 `ceil(M/16)` 个 optimizer steps。
 全量模式拒绝旧 smoke 的十步终点、十一学习率步数和 checkpoint 恢复参数；
 零 loss padding 不计入源会话、监督段、样本或损失分母。

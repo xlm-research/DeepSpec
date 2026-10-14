@@ -405,6 +405,9 @@ def test_full_data_configuration_replaces_smoke_horizon_and_restoration(tmp_path
     assert config.model.initial_draft_model_path is None
     assert config.dataset.renderer == "qwen3.5-full-data"
     assert config.inference.vllm.extra_args.limit_mm_per_prompt.image == 1
+    assert config.inference.inference_batch_size == 1
+    assert config.inference.vllm.extra_args.max_num_seqs == 1
+    assert config.inference.vllm.mem_fraction_static == 0.7
     assert config.logging.report_to == "tensorboard"
 
 
