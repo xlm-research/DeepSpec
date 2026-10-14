@@ -358,7 +358,14 @@ class MooncakeDataset(IterableDataset):
             logger.debug(
                 f"__iter__: got item, data_id={item.data_id}, mooncake_key={item.mooncake_key}"
             )
-            data = self._load_from_mooncake(item)
+            try:
+                data = self._load_from_mooncake(item)
+            except Exception as error:
+                if (item.metadata or {}).get("supervision_window") is not None:
+                    raise RuntimeError(
+                        f"Full-data window {item.data_id}: target capture read failed: {error}"
+                    ) from error
+                raise
 
             before_neutralization = neutralized_count
             neutralized_count = self._resolve_and_neutralize_loss_mask(

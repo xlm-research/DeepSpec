@@ -255,3 +255,31 @@ time and a 0.7 target memory fraction to leave capture staging space. The four-G
 inference/four-GPU FSDP layout and global training batch of 16 are unchanged. All 22
 focused workflow tests, typechecking, hooks, and both review axes pass. A fresh training
 preflight is running; no full-data optimizer completion is claimed yet.
+
+### 2026-10-14 — GPU preflight accepted; fresh complete pass started
+
+The fresh serial-inference training preflight passed both optimizer steps. Its complete
+coverage reconciles all 17 real windows and 608 selected assistant segments, with 15
+zero-loss dummy entries and no missing/duplicate windows. Draft update probes confirmed
+parameter changes on both steps. Exact weighted total losses were 3.6966471672058105 and
+3.094103330373764; the local four-panel PNG and step-2 model/optimizer checkpoint were
+verified. Artifacts are under `outputs/image-text-full-20261014/preflight/training/`.
+
+A separate fresh full-data run has started at `outputs/image-text-full-20261014/`, using
+no preflight checkpoint restore. Its controller loaded all 610 windows and confirmed
+39 optimizer steps/39 learning-rate steps for one epoch. Final full-data coverage,
+metrics, PNG and checkpoint acceptance remain pending.
+
+### 2026-10-14 — Full-pass capture retention corrected
+
+The first complete-pass attempt failed before its first optimizer commit. Its twenty
+received captures occupied approximately 138 GiB, exceeding the 128 GiB Mooncake store;
+eviction left missing layer keys when training read the oldest window. Its incomplete
+coverage and logs are preserved under `outputs/image-text-full-20261014/full_attempt1/`.
+
+The full-data recipe now allocates 256 GiB. A regression checks the conservative bound
+for sixteen queued windows, four pooled results, and one in-flight maximum-length
+capture. Capture-read exceptions now identify the real supervision window and preserve
+their original cause. All 23 focused tests, both affected typechecks, applicable hooks,
+and both review axes pass. A separate fresh run has mounted the 256 GiB segment and
+started its 39-step training loop; complete-pass acceptance remains pending.

@@ -74,7 +74,7 @@ def write_pass_config(
     config.training.save_interval = 0
     config.training.save_per_epoch = True
     config.inference.max_sample_pool_size = 4
-    config.mooncake.global_segment_size = "128GB"
+    config.mooncake.global_segment_size = "256GB"
     config.mooncake.local_buffer_size = "16GB"
     if cli_args:
         config = OmegaConf.merge(config, OmegaConf.from_dotlist(cli_args))

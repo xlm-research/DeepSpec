@@ -218,6 +218,23 @@ def test_padding_only_rank_produces_finite_zero_loss_without_reading_mooncake(
     assert controller.get_speeds()["training_total"] == 1
 
 
+def test_full_data_capture_read_failure_identifies_the_real_window(tmp_path, monkeypatch):
+    from torchspec.training.data_fetcher import MooncakeDataset
+
+    controller = full_controller(tmp_path, monkeypatch, count=1)
+    prompt = controller.get_prompts(1)[0]
+    controller.push_inference_results([output(prompt.data_id)])
+    assert controller.try_dispatch_batch()
+    rank_queue = controller.get_train_queues()[0]
+
+    class MissingCapture:
+        def get(self, **kwargs):
+            raise TimeoutError("missing layer keys")
+
+    with pytest.raises(RuntimeError, match=f"{prompt.data_id}.*missing layer keys"):
+        next(iter(MooncakeDataset(rank_queue, MissingCapture(), device=torch.device("cpu"))))
+
+
 def test_full_data_inference_failure_reports_window_and_stops_without_reloading(
     tmp_path, monkeypatch
 ):
