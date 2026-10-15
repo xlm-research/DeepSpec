@@ -35,6 +35,12 @@ def validate_supervision_capture(tokenizer, input_ids, loss_mask, row):
         if message["role"] == "assistant"
     ]
     assert len(blocks) == len(assistants), "Captured assistant spans must match retained messages"
+    source_assistants = [message for message in row["messages"] if message["role"] == "assistant"]
+    for message, block in zip(source_assistants, blocks, strict=True):
+        for field in ("reasoning_content", "content"):
+            content = message.get(field)
+            if isinstance(content, str) and content.strip():
+                assert content.strip() in block.group(1), f"Captured assistant lost {field}"
     selected_indices = set(window["supervised_message_indices"])
     selected = [
         block for index, block in zip(assistants, blocks, strict=True) if index in selected_indices
@@ -100,7 +106,8 @@ def main():
     output.mkdir(parents=True, exist_ok=True)
     recipe = Path(cli.config) if cli.config else Path(__file__).with_name("config.yaml")
     if cli.legacy_text_only:
-        recipe = recipe.parent.parent / "qwen3.8-27b-1node" / "config.yaml"
+        if cli.config is None:
+            recipe = recipe.parent.parent / "qwen3.8-27b-1node" / "config.yaml"
         fixture = output / "legacy_text.jsonl"
         fixture.write_text(
             json.dumps(

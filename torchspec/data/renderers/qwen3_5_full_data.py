@@ -6,11 +6,18 @@ from torchspec.data.renderers.qwen3_5_multimodal import Qwen35MultimodalRenderer
 
 
 class Qwen35FullDataRenderer(Qwen35MultimodalRenderer):
-    CACHE_VERSION = "qwen35-full-data-native-system-selected-segments-v1"
+    CACHE_VERSION = "qwen35-full-data-native-system-selected-segments-thinking-v2"
 
     def __init__(self, tokenizer: Any) -> None:
         super().__init__(tokenizer)
         template = tokenizer.get_chat_template()
+        if "preserve_thinking" not in template:
+            condition = "{%- if loop.index0 > ns.last_query_index %}"
+            if template.count(condition) != 1:
+                raise ValueError("Unsupported native template for historical reasoning")
+            template = template.replace(
+                condition, "{%- if preserve_thinking or loop.index0 > ns.last_query_index %}"
+            )
         rejection = "{{- raise_exception('System message must be at the beginning.') }}"
         if template.count(rejection) != 1:
             raise ValueError("Unsupported native template for ordered later system messages")

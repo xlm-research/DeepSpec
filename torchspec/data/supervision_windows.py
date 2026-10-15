@@ -13,7 +13,25 @@ from transformers import AutoProcessor, AutoTokenizer
 from torchspec.data.renderers import RENDERER_REGISTRY
 from torchspec.data.utils import extract_media_urls
 
-WINDOW_CACHE_VERSION = "qwen35-full-data-windows-v2"
+WINDOW_CACHE_VERSION = "qwen35-full-data-windows-thinking-v3"
+
+
+def preparation_model_fingerprint(model: str) -> dict[str, str]:
+    """Identify the local model files that determine rendering and image expansion."""
+    directory = Path(model)
+    return {
+        name: hashlib.sha256((directory / name).read_bytes()).hexdigest()
+        for name in (
+            "config.json",
+            "chat_template.jinja",
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "processor_config.json",
+            "preprocessor_config.json",
+            "added_tokens.json",
+        )
+        if (directory / name).is_file()
+    }
 
 
 def _cache_media_reference(
@@ -340,6 +358,8 @@ def prepare_full_data(args: Any) -> dict[str, Any]:
         record.update(width=image.width, height=image.height, mode=image.mode)
     report = {
         "cache_version": WINDOW_CACHE_VERSION,
+        "model_files": preparation_model_fingerprint(args.model),
+        "renderer_version": renderer.CACHE_VERSION,
         "source": str(source.resolve()),
         "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
         "model": str(Path(args.model).resolve()),

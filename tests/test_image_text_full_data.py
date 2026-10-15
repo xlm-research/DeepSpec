@@ -44,6 +44,53 @@ def prepare_full(tmp_path, checkpoint, messages, *, max_length=4096, relative_ou
     return rows, json.loads((output / "manifest.json").read_text())
 
 
+def test_preflight_selects_actual_gif_and_cached_images_despite_text_mentions(tmp_path):
+    script = Path(__file__).parents[1] / "examples/qwen3.8-27b-image-text-1node/full_train.py"
+    select = runpy.run_path(str(script))["prepare_preflight_inputs"]
+    cached = "file:///cache/full-data/media/remote.image"
+    rows = []
+    for index in range(20):
+        uri = "file:///image.gif" if index == 18 else cached if index == 19 else "file:///image.png"
+        window = {
+            "source_id": f"source_{index}",
+            "source_index": index,
+            "window_id": f"window_{index}",
+            "expanded_tokens": 2000 if index == 0 else 1000,
+            "image_count": 1,
+            "assistant_count": 1,
+            "supervised_assistant_ordinals": [0],
+            "supervised_message_indices": [1],
+        }
+        rows.append(
+            {
+                "data_id": window["window_id"],
+                "metadata": {"supervision_window": window},
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "Discuss .gif and /full-data/media/ paths."},
+                            {"type": "image_url", "image_url": {"url": uri}},
+                        ],
+                    },
+                    {"role": "assistant", "content": "An image."},
+                ],
+            }
+        )
+    data = tmp_path / "train.jsonl"
+    data.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {"source_count": 20, "media": {"https://example.org/image": {"local_uri": cached}}}
+        )
+    )
+    selected, _ = select(data, manifest, tmp_path / "preflight")
+    ids = {json.loads(line)["data_id"] for line in selected.read_text().splitlines()}
+    assert len(ids) == 17
+    assert {"window_18", "window_19"} <= ids
+
+
 def test_full_data_preparation_preserves_all_answers_without_smoke_repetition(tmp_path, checkpoint):
     messages = [
         {
@@ -73,6 +120,19 @@ def test_full_data_preparation_preserves_all_answers_without_smoke_repetition(tm
     assert manifest["window_count"] == 1
     assert manifest["sources"][0]["assistant_message_indices"] == [1, 3]
     assert "_repeat_" not in rows[0]["data_id"]
+    from transformers import AutoTokenizer
+
+    from torchspec.data.renderers import RENDERER_REGISTRY
+
+    tokenizer = AutoTokenizer.from_pretrained(checkpoint, trust_remote_code=True)
+    native_template = tokenizer.get_chat_template()
+    renderer = RENDERER_REGISTRY.create("qwen3.5-full-data", tokenizer)
+    ids, mask = renderer.render(rows[0]["messages"], max_seq_length=4096)
+    supervised = tokenizer.decode([token for token, keep in zip(ids, mask, strict=True) if keep])
+    assert messages[1]["reasoning_content"] in supervised
+    assert messages[1]["content"] in supervised
+    assert messages[3]["content"] in supervised
+    assert tokenizer.get_chat_template() == native_template
 
 
 def test_full_data_windows_fit_expanded_limit_without_cutting_assistant_segments(
@@ -493,3 +553,84 @@ def test_gpu_preflight_selects_distinct_windows_covering_changed_behavior_and_ta
     assert {f"window_{i}" for i in range(6)} <= set(ids)
     assert "not full-source acceptance" in json.loads(subset_manifest.read_text())["purpose"]
     CompleteDataPass(str(subset_manifest), 4, 4).validate_dataset(chosen)
+
+
+def test_loop_full_data_configuration_keeps_execution_features_and_postnorm(tmp_path, monkeypatch):
+    from torchspec.config.train_config import load_config
+
+    root = Path(__file__).parents[1]
+    target = "/mnt/afs_agents/yankuihao/model_ckpts/1009_9b_mhc4_loop3_from50_zxh_glmv25_all16_16nodes/ckpt-225-bf16"
+    monkeypatch.setenv("TARGET_MODEL_PATH", target)
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "model": target,
+                "window_count": 17,
+                "min_loss_tokens": 14,
+                "max_length": 131072,
+                "max_images": 20,
+            }
+        )
+    )
+    writer = runpy.run_path(str(root / "examples/qwen3.8-27b-image-text-1node/full_train.py"))[
+        "write_pass_config"
+    ]
+    path = writer(
+        manifest,
+        tmp_path / "train.jsonl",
+        tmp_path / "output",
+        tmp_path / "cache",
+        base_config_path=root / "examples/qwen3.5-loop-mhc-image-text-dspark-1-node/config.yaml",
+    )
+    config = load_config(str(path))
+    assert config.training.num_train_steps == config.training.lr_total_steps == 2
+    assert config.inference.vllm.direct_hidden_state_capture
+    assert not config.inference.last_hidden_states_prenorm
+    assert config.inference.aux_hidden_states_layers == [3, 27, 51, 75, 78]
+    assert not config.inference.vllm.extra_args.language_model_only
+    assert config.inference.vllm.extra_args.limit_mm_per_prompt.image == 20
+    assert config.debug.verify_parameter_updates
+    assert Path(config.model.draft_model_config).name == "qwen3_5_loop_mhc_dspark.json"
+
+
+def test_local_acceptance_matches_weighted_distribution_overlap_and_is_replotable(tmp_path):
+    from torchspec.utils.dspark_metrics import LocalDSparkMetrics, plot_acceptance_curve
+
+    target = [[0.6, 0.3, 0.1], [0.1, 0.1, 0.8]]
+    draft = [[0.1, 0.2, 0.7], [0.1, 0.2, 0.7]]
+    weights = [1.0, 0.25]
+    overlap = sum(
+        w * sum(min(p, q) for p, q in zip(ps, qs, strict=True))
+        for w, ps, qs in zip(weights, target, draft, strict=True)
+    ) / sum(weights)
+    l1 = sum(
+        w * sum(abs(p - q) for p, q in zip(ps, qs, strict=True))
+        for w, ps, qs in zip(weights, target, draft, strict=True)
+    ) / sum(weights)
+    logger = LocalDSparkMetrics(str(tmp_path), l1_alpha=0.9)
+    logger.record(
+        {
+            "train/ce_loss": 3.0,
+            "train/l1_loss": l1,
+            "train/confidence_loss": 0.5,
+            "train/avg_acc": 0.99,
+        },
+        1,
+    )
+    logger.finalize(1)
+    records = [json.loads(line) for line in (tmp_path / "metrics.jsonl").read_text().splitlines()]
+    assert records[0]["estimated_training_acceptance"] == pytest.approx(overlap)
+    assert records[0]["estimated_training_acceptance"] != pytest.approx(0.99)
+    plot_acceptance_curve(records, tmp_path / "replot.png")
+    for name in ("acceptance.png", "loss.png", "replot.png"):
+        with Image.open(tmp_path / name) as image:
+            image.verify()
+
+
+@pytest.mark.parametrize("l1,weight", [(-0.1, 0.9), (2.1, 0.9), (float("nan"), 0.9), (0.0, 0.0)])
+def test_acceptance_rejects_unmeasured_or_invalid_distribution_loss(l1, weight):
+    from torchspec.utils.dspark_metrics import estimated_training_acceptance
+
+    with pytest.raises(ValueError):
+        estimated_training_acceptance({"l1_loss": l1, "loss_weights": {"l1_loss": weight}})

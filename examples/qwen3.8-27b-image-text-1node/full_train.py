@@ -15,6 +15,7 @@ from urllib.parse import unquote, urlsplit
 from omegaconf import OmegaConf
 
 from torchspec.config.train_config import load_config
+from torchspec.data.utils import extract_media_urls
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 ROOT = SCRIPT_DIR.parents[1]
@@ -26,9 +27,11 @@ def write_pass_config(
     output_dir: Path,
     cache_dir: Path,
     cli_args: list[str] | None = None,
+    *,
+    base_config_path: Path | None = None,
 ) -> Path:
     manifest = json.loads(manifest_path.read_text())
-    config = load_config(str(SCRIPT_DIR / "config.yaml"))
+    config = load_config(str(base_config_path or SCRIPT_DIR / "config.yaml"))
     endpoint = math.ceil(manifest["window_count"] / 16)
     required = {
         "model.target_model_path": manifest["model"],
@@ -98,6 +101,14 @@ def prepare_preflight_inputs(
     manifest = json.loads(manifest_path.read_text())
     rows = [json.loads(line) for line in data_path.read_text().splitlines()]
     selected: dict[str, dict[str, Any]] = {}
+    remote_media = {
+        media["local_uri"]
+        for reference, media in manifest.get("media", {}).items()
+        if reference.startswith("https://")
+    }
+
+    def image_urls(row: dict[str, Any]) -> list[str]:
+        return (extract_media_urls(row["messages"]) or {}).get("images", [])
 
     def choose(row: dict[str, Any]) -> None:
         selected.setdefault(row["data_id"], row)
@@ -120,10 +131,12 @@ def prepare_preflight_inputs(
             and any(block.get("type") == "image_url" for block in m["content"])
             for m in row["messages"]
         ),
-        lambda row: row["metadata"]["supervision_window"]["assistant_count"]
-        > len(row["metadata"]["supervision_window"]["supervised_assistant_ordinals"]),
-        lambda row: ".gif" in json.dumps(row["messages"]).lower(),
-        lambda row: "/full-data/media/" in json.dumps(row["messages"]),
+        lambda row: (
+            row["metadata"]["supervision_window"]["assistant_count"]
+            > len(row["metadata"]["supervision_window"]["supervised_assistant_ordinals"])
+        ),
+        lambda row: any(urlsplit(url).path.lower().endswith(".gif") for url in image_urls(row)),
+        lambda row: any(url in remote_media for url in image_urls(row)),
     ):
         matches = [row for row in rows if predicate(row)]
         if matches:
@@ -168,10 +181,10 @@ def prepare_preflight_inputs(
     return data, report
 
 
-def run_stage(command: list[str], log_path: Path) -> None:
+def run_stage(command: list[str], log_path: Path, *, use_v2: bool = False) -> None:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     environment = dict(os.environ)
-    environment["VLLM_USE_V2_MODEL_RUNNER"] = "0"
+    environment["VLLM_USE_V2_MODEL_RUNNER"] = "1" if use_v2 else "0"
     environment["TORCHSPEC_LOG_DIR"] = str(log_path.parent / "actor_logs")
     with log_path.open("w") as log:
         process = subprocess.Popen(
@@ -196,13 +209,19 @@ def run_stage(command: list[str], log_path: Path) -> None:
 
 def prepared_cache_is_valid(directory: Path, source: Path, model: str) -> bool:
     from torchspec.controller.data_pass import CompleteDataPass
-    from torchspec.data.supervision_windows import WINDOW_CACHE_VERSION
+    from torchspec.data.renderers.qwen3_5_full_data import Qwen35FullDataRenderer
+    from torchspec.data.supervision_windows import (
+        WINDOW_CACHE_VERSION,
+        preparation_model_fingerprint,
+    )
 
     try:
         manifest_path = directory / "manifest.json"
         manifest = json.loads(manifest_path.read_text())
         if (
             manifest["cache_version"] != WINDOW_CACHE_VERSION
+            or manifest.get("model_files") != preparation_model_fingerprint(model)
+            or manifest.get("renderer_version") != Qwen35FullDataRenderer.CACHE_VERSION
             or manifest["source_count"] != 327
             or manifest["max_length"] != 131072
             or manifest["source_sha256"] != hashlib.sha256(source.read_bytes()).hexdigest()
@@ -226,13 +245,21 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--cache-dir", type=Path, required=True)
+    parser.add_argument("--config", type=Path, default=SCRIPT_DIR / "config.yaml")
+    parser.add_argument(
+        "--legacy-text-config",
+        type=Path,
+        default=SCRIPT_DIR.parent / "qwen3.8-27b-1node" / "config.yaml",
+    )
     parser.add_argument("--prepare-only", action="store_true")
     parser.add_argument("--preflight-only", action="store_true")
     cli, overrides = parser.parse_known_args()
     output = cli.output_dir.resolve()
     cache = cli.cache_dir.resolve() / "full-data"
     source = ROOT / "mydata/image-text-327.jsonl"
-    base = load_config(str(SCRIPT_DIR / "config.yaml"))
+    base = load_config(str(cli.config))
+    use_v2 = base.inference.vllm.direct_hidden_state_capture
+    os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "1" if use_v2 else "0"
     model = base.model.target_model_path
     if not prepared_cache_is_valid(cache, source, model):
         prepare_full_data(
@@ -252,6 +279,7 @@ def main() -> None:
         output,
         cache / "tokenization",
         overrides,
+        base_config_path=cli.config,
     )
     if cli.prepare_only:
         return
@@ -266,6 +294,7 @@ def main() -> None:
         data,
         preflight / "training",
         cache / "preflight-tokenization",
+        base_config_path=cli.config,
     )
     run_stage(
         [
@@ -279,26 +308,32 @@ def main() -> None:
             str(preflight / "prefill"),
         ],
         preflight / "prefill.log",
+        use_v2=use_v2,
     )
     run_stage(
         [
             sys.executable,
             str(SCRIPT_DIR / "prefill.py"),
             "--legacy-text-only",
+            "--config",
+            str(cli.legacy_text_config),
             "--output",
             str(preflight / "legacy-text"),
         ],
         preflight / "legacy-text.log",
+        use_v2=use_v2,
     )
     run_stage(
         [sys.executable, "-m", "torchspec.train_entry", "--config", str(preflight_config)],
         preflight / "training.log",
+        use_v2=use_v2,
     )
     if cli.preflight_only:
         return
     run_stage(
         [sys.executable, "-m", "torchspec.train_entry", "--config", str(config)],
         output / "training.log",
+        use_v2=use_v2,
     )
 
 
