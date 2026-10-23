@@ -34,3 +34,24 @@ def test_qwen_loop_mhc_backend_is_forwarded_only_when_selected(monkeypatch, back
         assert "VLLM_QWEN3_5_MHC_BACKEND" not in env
     else:
         assert env["VLLM_QWEN3_5_MHC_BACKEND"] == backend
+
+
+def test_triton_cache_override_reaches_ray_workers(monkeypatch):
+    monkeypatch.setenv("TRITON_CACHE_DIR", "/afs/conda/cache")
+    monkeypatch.setenv("TORCHSPEC_TRITON_CACHE_DIR", "/tmp/torchspec-triton-test")
+
+    env = get_torchspec_env_vars()
+
+    assert env["TRITON_CACHE_DIR"] == "/tmp/torchspec-triton-test"
+    assert env["TORCHSPEC_TRITON_CACHE_DIR"] == "/tmp/torchspec-triton-test"
+
+
+@pytest.mark.parametrize("override", [None, ""])
+def test_inherited_triton_cache_does_not_override_other_ray_jobs(monkeypatch, override):
+    monkeypatch.setenv("TRITON_CACHE_DIR", "/afs/conda/cache")
+    if override is None:
+        monkeypatch.delenv("TORCHSPEC_TRITON_CACHE_DIR", raising=False)
+    else:
+        monkeypatch.setenv("TORCHSPEC_TRITON_CACHE_DIR", override)
+
+    assert "TRITON_CACHE_DIR" not in get_torchspec_env_vars()

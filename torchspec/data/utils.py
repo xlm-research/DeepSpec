@@ -112,6 +112,10 @@ class DataCollatorWithPadding:
             "input_ids": batch_input_ids,
             "attention_mask": batch_attention_mask,
             "loss_mask": batch_loss_mask,
+            # Count before padding; sharded samples and dummy samples supply overrides.
+            "num_input_tokens": sum(
+                item.get("num_input_tokens", item["input_ids"].numel()) for item in features
+            ),
             "hidden_states": None,
             "target": None,
             "last_hidden_states": None,

@@ -25,6 +25,7 @@ import re
 import shutil
 import tempfile
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import ray
@@ -41,6 +42,58 @@ from torchspec.utils.dspark_metrics import LocalDSparkMetrics
 from torchspec.utils.logging import get_tb_writer, logger
 
 
+def _merge_training_metrics(rank_metrics: list[dict]) -> dict:
+    """Keep reduced training metrics and combine per-rank throughput measurements."""
+    if not rank_metrics or not rank_metrics[0]:
+        return {}
+    metrics = dict(rank_metrics[0])
+    if "_num_input_tokens" in metrics:
+        metric_step = metrics.get("_metrics_step", metrics.get("train/global_step"))
+        if any(
+            m.get("_metrics_step", m.get("train/global_step")) != metric_step for m in rank_metrics
+        ):
+            raise RuntimeError("Cannot combine training throughput metrics from different steps")
+        metrics.pop("_num_input_tokens")
+        metrics["perf/train_tokens"] = sum(m["_num_input_tokens"] for m in rank_metrics)
+        metrics["perf/train_gpus"] = len(rank_metrics)
+        metrics["perf/draft_train_time"] = max(m["perf/draft_train_time"] for m in rank_metrics)
+    return metrics
+
+
+@dataclass
+class _TrainingTiming:
+    """Timing totals for metrics emitted during this invocation, including a deferred tail."""
+
+    total_wait_time: float = 0.0
+    total_compute_time: float = 0.0
+
+    def update(self, metrics: dict, dispatch_wait: float, global_batch_size: int) -> None:
+        # Data fetching can overlap CUDA work. This measures time spent obtaining
+        # data, not GPU idle time; wait + compute is not an end-to-end duration.
+        wait_time = dispatch_wait + metrics.get("perf/data_time", 0.0)
+        self.total_wait_time += wait_time
+        self.total_compute_time += metrics.get("perf/compute_time", 0.0)
+        metrics.update(
+            {
+                "perf/dispatch_wait": dispatch_wait,
+                "perf/wait_time": wait_time,
+                "perf/total_wait_time": self.total_wait_time,
+                "perf/total_compute_time": self.total_compute_time,
+            }
+        )
+        if "perf/draft_train_time" in metrics:
+            # The trainer already includes all batch waits and transfers. Add only
+            # the controller dispatch wait belonging to this optimizer step.
+            metrics["perf/draft_train_time"] += dispatch_wait
+            draft_time = metrics["perf/draft_train_time"]
+            train_gpus = metrics.get("perf/train_gpus", 0)
+            if draft_time > 0 and train_gpus > 0:
+                metrics["perf/train_tgs"] = metrics["perf/train_tokens"] / (draft_time * train_gpus)
+        step_time = metrics.get("perf/step_time", 0.0)
+        if step_time > 0:
+            metrics["perf/train_capacity"] = global_batch_size / step_time
+
+
 def _write_training_metrics(
     metrics: dict,
     train_step: int,
@@ -50,6 +103,33 @@ def _write_training_metrics(
     loss = metrics.get("train/avg_loss")
     if os.environ.get("TORCHSPEC_CI_STEP_LOGS") == "1" and isinstance(loss, (int, float)):
         logger.info(f"TRAIN_STEP step={train_step} loss={loss:.6f}")
+
+    if "perf/wait_time" in metrics and (train_step % 5 == 0 or train_step <= 5):
+        draft_timing = (
+            f"draft={metrics['perf/draft_train_time']:.3f}s "
+            if "perf/draft_train_time" in metrics
+            else ""
+        )
+        tgs_timing = (
+            f"tgs={metrics['perf/train_tgs']:.1f} tokens/GPU/s "
+            if "perf/train_tgs" in metrics
+            else ""
+        )
+        logger.info(
+            f"TIMING step={train_step}: "
+            f"{draft_timing}"
+            f"step={metrics.get('perf/step_time', 0):.3f}s "
+            f"wait={metrics['perf/wait_time']:.3f}s "
+            f"[dispatch={metrics['perf/dispatch_wait']:.3f}s "
+            f"data={metrics.get('perf/data_time', 0):.3f}s] "
+            f"compute={metrics.get('perf/compute_time', 0):.3f}s "
+            f"[fwd={metrics.get('perf/forward_time', 0):.3f}s "
+            f"bwd={metrics.get('perf/backward_time', 0):.3f}s "
+            f"opt={metrics.get('perf/optimizer_time', 0):.3f}s] "
+            f"{tgs_timing}"
+            f"total_wait={metrics['perf/total_wait_time']:.3f}s "
+            f"total_compute={metrics['perf/total_compute_time']:.3f}s"
+        )
 
     if getattr(wandb, "run", None) is not None:
         wandb.log(metrics)
@@ -285,6 +365,7 @@ def training_loop(
     queued_batches = 0
     last_saved_step: int | None = None
     previous_dispatch_wait: float | None = None
+    timing = _TrainingTiming()
     progress = tqdm(
         total=num_steps,
         desc="Training",
@@ -302,7 +383,7 @@ def training_loop(
             remaining_steps * accumulation_steps,
         )
         if enable_perf:
-            t_dispatch = time.time()
+            t_dispatch = time.perf_counter()
         status = None
         wait_start = time.monotonic()
         received_count = -1
@@ -383,7 +464,7 @@ def training_loop(
         else:
             # The current optimizer step is fully queued.
             if enable_perf:
-                dispatch_wait = time.time() - t_dispatch
+                dispatch_wait = time.perf_counter() - t_dispatch
             else:
                 dispatch_wait = 0.0
 
@@ -406,8 +487,8 @@ def training_loop(
                     )
                 )
 
-            # Log metrics from training (use rank 0's metrics - they're already all-reduced)
-            metrics = train_results[0] if train_results and train_results[0] else {}
+            # Loss metrics are reduced already; throughput needs all ranks' counts and durations.
+            metrics = _merge_training_metrics(train_results)
             metric_step = int(metrics.pop("_metrics_step", completed_steps))
             metric_dispatch_wait = (
                 previous_dispatch_wait
@@ -425,25 +506,7 @@ def training_loop(
                 metrics.update(inference_metrics)
 
                 if enable_perf:
-                    metrics["perf/dispatch_wait"] = metric_dispatch_wait
-                    step_time = metrics.get("perf/step_time", 0)
-                    if step_time > 0:
-                        metrics["perf/train_capacity"] = args.global_batch_size / step_time
-
-                    if metric_step % 5 == 0 or metric_step <= 5:
-                        data_t = metrics.get("perf/data_time", 0)
-                        compute_t = metrics.get("perf/compute_time", 0)
-                        fwd_t = metrics.get("perf/forward_time", 0)
-                        bwd_t = metrics.get("perf/backward_time", 0)
-                        opt_t = metrics.get("perf/optimizer_time", 0)
-                        logger.info(
-                            f"TIMING step={metric_step}: "
-                            f"step={step_time:.3f}s "
-                            f"data={data_t:.3f}s "
-                            f"compute={compute_t:.3f}s "
-                            f"[fwd={fwd_t:.3f}s bwd={bwd_t:.3f}s opt={opt_t:.3f}s] "
-                            f"dispatch={metric_dispatch_wait:.3f}s"
-                        )
+                    timing.update(metrics, metric_dispatch_wait, args.global_batch_size)
 
                 _write_training_metrics(
                     metrics,
@@ -471,7 +534,13 @@ def training_loop(
             if enable_perf:
                 postfix["I"] = f"{metrics.get('perf/infer_capacity', 0):.1f}"
                 postfix["T"] = f"{metrics.get('perf/train_capacity', 0):.1f}"
-                postfix["wait"] = f"{dispatch_wait:.1f}s"
+                if "perf/draft_train_time" in metrics:
+                    postfix["draft"] = f"{metrics['perf/draft_train_time']:.2f}s"
+                if "perf/train_tgs" in metrics:
+                    postfix["TGS"] = f"{metrics['perf/train_tgs']:.1f}"
+                if "perf/wait_time" in metrics:
+                    postfix["wait"] = f"{metrics['perf/wait_time']:.2f}s"
+                    postfix["compute"] = f"{metrics.get('perf/compute_time', 0):.2f}s"
                 postfix["pool"] = status["sample_pool_size"]
             postfix["epoch"] = f"{current_epoch}/{num_epochs}"
             # Set postfix before update so tqdm emits only one line
@@ -540,16 +609,13 @@ def training_loop(
     final_train_results = train_group.flush_pending_train_metrics()
     if not isinstance(final_train_results, (list, tuple)):
         final_train_results = []
-    final_metrics = final_train_results[0] if final_train_results and final_train_results[0] else {}
+    final_metrics = _merge_training_metrics(final_train_results)
     if final_metrics:
         final_metric_step = int(final_metrics.pop("_metrics_step", completed_steps))
         final_metrics["train/step"] = final_metric_step
         final_metrics["inference/step"] = completed_steps
         if enable_perf and previous_dispatch_wait is not None:
-            final_metrics["perf/dispatch_wait"] = previous_dispatch_wait
-            step_time = final_metrics.get("perf/step_time", 0)
-            if step_time > 0:
-                final_metrics["perf/train_capacity"] = args.global_batch_size / step_time
+            timing.update(final_metrics, previous_dispatch_wait, args.global_batch_size)
         _write_training_metrics(
             final_metrics,
             final_metric_step,
@@ -581,6 +647,11 @@ def training_loop(
         f"avg inference={final_status['avg_inference_speed']:.1f} entries/s | "
         f"avg training={final_status['avg_training_speed']:.1f} entries/s"
     )
+    if enable_perf:
+        logger.info(
+            f"Training timing totals (this run): wait={timing.total_wait_time:.3f}s "
+            f"compute={timing.total_compute_time:.3f}s"
+        )
 
 
 def run_training_loop(

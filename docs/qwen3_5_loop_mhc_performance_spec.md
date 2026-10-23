@@ -1,6 +1,6 @@
 # Qwen3.5 Loop/mHC：TP=8、128K 单 token TTFT 算子融合优化
 
-状态：根据已完成讨论整理的本地规格；尚未发布到 issue tracker，尚未实施或完成性能验收。测试边界已提出，等待用户核对。记录日期：2026-10-12。
+状态：本文保留 2026-10-12 第一阶段的历史规格。Sinkhorn 融合随后已完成[实施与性能验收](qwen3_5_loop_mhc_performance_results.md)；本文后续“待核对”“未实施”等描述反映当时状态。2026-10-15 的继续优化以[本轮决策与完整方案](qwen3_5_loop_mhc_performance_plan.md#2026-10-15继续优化的决策树)为准，采用 131072 输入加 1 输出及覆盖用例零差异门槛，现已完成[第二阶段实施与验收](qwen3_5_loop_mhc_fusion_results.md)。
 
 ## Problem Statement
 

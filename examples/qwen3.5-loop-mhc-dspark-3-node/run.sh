@@ -15,6 +15,7 @@
 #   CACHE_DIR           Defaults to cache/qwen3.5-loop-mhc-dspark-3-node
 #   LOG_DIR             Defaults to running_logs
 #   MOONCAKE_PROTOCOL   tcp (default), or rdma when configured on all nodes
+#   TORCHSPEC_TRITON_CACHE_DIR  Node-local cache (default: /tmp/torchspec-triton-$UID)
 #   RAY_ADDRESS         Existing Ray address (default: auto)
 #   WANDB_MODE          online (default), offline, or disabled
 #
@@ -51,6 +52,7 @@ export RAY_ADDRESS="${RAY_ADDRESS:-auto}"
 OUTPUT_DIR="${OUTPUT_DIR:-$ROOT_DIR/outputs/qwen3.5-loop-mhc-dspark-3-node_$timestamp}"
 CACHE_DIR="${CACHE_DIR:-$ROOT_DIR/cache/qwen3.5-loop-mhc-dspark-3-node}"
 LOG_DIR="${LOG_DIR:-$ROOT_DIR/running_logs}"
+triton_cache_dir="${TORCHSPEC_TRITON_CACHE_DIR:-/tmp/torchspec-triton-${UID}}"
 export WANDB_NAME="${WANDB_NAME:-qwen3.5-loop-mhc-dspark-3-node_$timestamp}"
 
 overrides=("output_dir=$OUTPUT_DIR" "cache_dir=$CACHE_DIR")
@@ -135,13 +137,17 @@ launch=(
   decode.weight_sync_interval=0
 )
 if [[ "$dry_run" == true ]]; then
-  printf 'LOOP_TARGET_MODEL_PATH=%q RAY_ADDRESS=%q VLLM_USE_V2_MODEL_RUNNER=1 ' "$LOOP_TARGET_MODEL_PATH" "$RAY_ADDRESS"
+  printf 'LOOP_TARGET_MODEL_PATH=%q RAY_ADDRESS=%q TORCHSPEC_TRITON_CACHE_DIR=%q TRITON_CACHE_DIR=%q VLLM_USE_V2_MODEL_RUNNER=1 ' "$LOOP_TARGET_MODEL_PATH" "$RAY_ADDRESS" "$triton_cache_dir" "$triton_cache_dir"
   printf '%q ' "${launch[@]}"
   printf '\n'
   exit 0
 fi
 
 source "$ROOT_DIR/h800conda.sh"
+# Override the shared cache inherited from Conda and existing Ray nodes.
+# get_torchspec_env_vars forwards this path to each actor before Triton imports.
+export TORCHSPEC_TRITON_CACHE_DIR="$triton_cache_dir"
+export TRITON_CACHE_DIR="$triton_cache_dir"
 export VLLM_USE_V2_MODEL_RUNNER=1
 export TORCHSPEC_LOG_LEVEL="${TORCHSPEC_LOG_LEVEL:-INFO}"
 

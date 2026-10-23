@@ -9,6 +9,12 @@ final norm 保持冻结。vLLM 不加载训练中的 DSpark 草稿权重，不�
 副本。训练长度上限为 131072 tokens，global batch 为 `8 × 1 × 4 = 32`。
 数据默认使用 `mydata/sensenova-flash-lite-v42-text-1000000.jsonl`。
 
+数据中的 assistant 推理可以保存在 `content` 开头的 `<think>...</think>` 中，
+也可以使用独立的 `reasoning_content` 字段。公共预处理会检查目标模型模板，
+自动选择它支持的表示，避免额外插入空 think 块或丢失推理。冲突的推理内容或
+无法保留推理的模板会明确报错。缓存标识包含预处理版本和目标模板内容；更新后
+首次启动会重新预处理，旧缓存保留但不再复用，无需手动修改原始数据或模型模板。
+
 在仓库根目录一键启动（自动准备 Ray，再启动 DSpark 训练）：
 
 ```bash

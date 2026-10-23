@@ -20,10 +20,12 @@ _TORCHSPEC_ENV_KEYS = [
     "TORCHINDUCTOR_FX_GRAPH_CACHE",
     "TORCHSPEC_LOG_DIR",
     "TORCHSPEC_LOG_LEVEL",
+    "TORCHSPEC_TRITON_CACHE_DIR",
     "TP_SOCKET_IFNAME",
     "CUTE_DSL_CACHE_DIR",
     "TORCHSPEC_FLASH_ATTN_OPT_LEVEL",
     "VLLM_QWEN3_5_MHC_BACKEND",
+    "VLLM_QWEN3_5_MHC_FUSION",
     "VLLM_USE_V2_MODEL_RUNNER",
 ]
 
@@ -62,4 +64,8 @@ def get_torchspec_env_vars() -> dict[str, str]:
         **{k: "1" for k in _RAY_NOSET_VISIBLE_DEVICES_KEYS},
     }
     env.update({k: os.environ[k] for k in _TORCHSPEC_ENV_KEYS if k in os.environ})
+    # Opt in explicitly so an inherited Conda cache does not override the
+    # node-specific cache settings of unrelated training jobs.
+    if cache_dir := env.get("TORCHSPEC_TRITON_CACHE_DIR"):
+        env["TRITON_CACHE_DIR"] = cache_dir
     return env

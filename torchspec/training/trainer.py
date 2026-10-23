@@ -52,6 +52,12 @@ from torchspec.utils.profiling import TrainProfiler
 from torchspec.utils.train_dump import extract_gradients, extract_model_weights
 
 
+def _measure_draft_train_time(started_at: float, end_event: torch.cuda.Event) -> float:
+    """Observe GPU completion without blocking the training thread's launch work."""
+    end_event.synchronize()
+    return time.perf_counter() - started_at
+
+
 @dataclasses.dataclass
 class DeferredTrainMetrics:
     """One-step-delayed GPU metric transfer.
@@ -74,6 +80,8 @@ class DeferredTrainMetrics:
         default_factory=list
     )
     step_events: Optional[tuple[torch.cuda.Event, torch.cuda.Event]] = None
+    draft_train_time_future: Optional[concurrent.futures.Future[float]] = None
+    num_input_tokens: Optional[int] = None
 
     def finalize(self) -> dict:
         if self.step_events is not None:
@@ -83,6 +91,10 @@ class DeferredTrainMetrics:
 
         metrics = self.finalize_values(self.cpu_values.tolist())
         metrics["_metrics_step"] = self.metric_step
+        if self.draft_train_time_future is not None:
+            metrics["perf/draft_train_time"] = self.draft_train_time_future.result()
+        if self.num_input_tokens is not None:
+            metrics["_num_input_tokens"] = self.num_input_tokens
 
         if self.step_events is not None:
             metrics["perf/step_time"] = (
@@ -122,7 +134,7 @@ class Trainer(abc.ABC):
         self.draft_model = None
         self.optimizer: Optional[BF16Optimizer] = None
         self.lr_scheduler = None
-        self.data_fetcher: Optional[MooncakeDataFetcher] = None
+        self.data_fetcher: Optional[MooncakeDataFetcher | PrefetchedDataFetcher] = None
         self.train_queue = None
         self.mooncake_store: Optional[EagleMooncakeStore] = None
         self._eval_cache: list[dict] = []
@@ -140,6 +152,11 @@ class Trainer(abc.ABC):
 
         self._enable_perf_metrics = getattr(args, "enable_perf_metrics", True)
         self._pending_train_metrics: Optional[DeferredTrainMetrics] = None
+        self._timing_executor = (
+            concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="draft-timing")
+            if self._enable_perf_metrics
+            else None
+        )
 
         self._io_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         self._eval_cache_save_future: Optional[concurrent.futures.Future] = None
@@ -414,8 +431,12 @@ class Trainer(abc.ABC):
         perf = self._enable_perf_metrics
         if perf:
             data_time = 0.0
+            num_input_tokens = 0
             compute_events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
             t_data_start = time.time()
+            # Include the first batch's queue wait and transfer, with or without prefetch.
+            draft_started_at = time.perf_counter()
+            draft_train_time_future = None
 
         # Gradient sync control for micro-batch accumulation.
         # FSDP2 fully_shard: use set_requires_gradient_sync(bool)
@@ -430,6 +451,7 @@ class Trainer(abc.ABC):
 
             if perf:
                 data_time += time.time() - t_data_start
+                num_input_tokens += batch["num_input_tokens"]
                 evt_start = torch.cuda.Event(enable_timing=True)
                 evt_end = torch.cuda.Event(enable_timing=True)
                 evt_start.record()
@@ -455,13 +477,19 @@ class Trainer(abc.ABC):
             if is_last:
                 self._maybe_dump(batch, step_metrics, step, batch_idx)
                 _evt_opt_s = torch.cuda.Event(enable_timing=True)
-                _evt_opt_e = torch.cuda.Event(enable_timing=True)
+                _evt_opt_e = torch.cuda.Event(enable_timing=True, blocking=perf)
                 _evt_opt_s.record()
                 if getattr(self.args, "verify_parameter_updates", False):
                     grad_norm = self.optimizer.step(verify_update=True)
                 else:
                     grad_norm = self.optimizer.step()
                 _evt_opt_e.record()
+                if perf:
+                    # Capture completion now, independently of metric aggregation
+                    # and the later materialization of deferred metrics.
+                    draft_train_time_future = self._timing_executor.submit(
+                        _measure_draft_train_time, draft_started_at, _evt_opt_e
+                    )
                 step_metrics["_opt_events"] = (_evt_opt_s, _evt_opt_e)
 
             if perf:
@@ -486,7 +514,12 @@ class Trainer(abc.ABC):
                 metrics.data_time = data_time
                 metrics.compute_events = compute_events
                 metrics.optimizer_events = optimizer_events
+                metrics.draft_train_time_future = draft_train_time_future
+                metrics.num_input_tokens = num_input_tokens
             else:
+                metrics["_num_input_tokens"] = num_input_tokens
+                if draft_train_time_future is not None:
+                    metrics["perf/draft_train_time"] = draft_train_time_future.result()
                 # Immediate aggregation synchronized CUDA, so event queries are ready.
                 metrics["perf/data_time"] = data_time
                 metrics["perf/compute_time"] = (
@@ -631,6 +664,8 @@ class Trainer(abc.ABC):
         return checkpoint.load(self)
 
     def close(self) -> None:
+        if self._timing_executor is not None:
+            self._timing_executor.shutdown(wait=True)
         self._wait_for_eval_cache_save()
         self._io_executor.shutdown(wait=True)
         if self.mooncake_store is not None and hasattr(self.mooncake_store, "close"):

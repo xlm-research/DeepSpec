@@ -516,14 +516,18 @@ def test_qwen_multimodal_dataset_keeps_structured_images_tools_and_reasoning(tmp
 
         def apply_chat_template(self, messages, **kwargs):
             self.calls.append((messages, kwargs))
-            return "native-prompt"
+            return "native-prompt" + "".join(
+                str(message.get("reasoning_content") or "") + str(message.get("content") or "")
+                for message in messages
+            )
 
         def encode(self, text, **kwargs):
+            if text.startswith("native-prompt"):
+                return [5, 90, 91, 92, 30, 10, 20, 21, 40, 41, 30]
             return {
                 "<|im_start|>assistant": [10, 20],
                 "<|im_start|>assistant\n": [10, 20, 21],
                 "<|im_end|>": [30],
-                "native-prompt": [5, 90, 91, 92, 30, 10, 20, 21, 40, 41, 30],
             }[text]
 
         def convert_tokens_to_ids(self, token):

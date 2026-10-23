@@ -38,6 +38,9 @@ class StubK3Tokenizer:
     def _text_ids(text: str) -> list[int]:
         return [1000 + ord(char) for char in text]
 
+    def decode(self, token_ids, **kwargs):
+        return "".join(chr(token - 1000) if token >= 1000 else " " for token in token_ids)
+
     def apply_chat_template(self, messages, **kwargs) -> list[int]:
         self.calls.append({"messages": messages, **kwargs})
         token_ids: list[int] = []
@@ -48,6 +51,7 @@ class StubK3Tokenizer:
                 if name := message.get("name"):
                     token_ids.extend([300, *self._text_ids(name), 301])
                 token_ids.append(self.SEP)
+                token_ids.extend(self._text_ids(message.get("reasoning_content") or ""))
                 token_ids.extend(self._text_ids(str(message.get("content") or "")))
                 token_ids.extend([self.CLOSE, self.EOM])
             else:
@@ -283,7 +287,14 @@ def test_render_rejects_invalid_generation_config(generation_config, match):
         )
 
 
-def test_disabled_generation_rejects_nonempty_reasoning():
+@pytest.mark.parametrize(
+    "assistant",
+    [
+        {"content": "answer", "reasoning_content": "reason"},
+        {"content": "<think>reason</think>answer"},
+    ],
+)
+def test_disabled_generation_rejects_nonempty_reasoning(assistant):
     renderer = K3Renderer(StubK3Tokenizer())
 
     with pytest.raises(ValueError, match="would discard non-empty assistant reasoning"):
@@ -292,8 +303,7 @@ def test_disabled_generation_rejects_nonempty_reasoning():
                 {"role": "user", "content": "question"},
                 {
                     "role": "assistant",
-                    "content": "answer",
-                    "reasoning_content": "reason",
+                    **assistant,
                 },
             ],
             max_seq_length=1024,

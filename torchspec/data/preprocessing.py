@@ -41,6 +41,7 @@ except ImportError:
     process_vision_info = None
 
 from torchspec.data.parse import create_parser
+from torchspec.data.reasoning import rendering_cache_fingerprint
 from torchspec.data.template import TEMPLATE_REGISTRY, ChatTemplate
 from torchspec.data.utils import (
     pack_loss_mask,
@@ -280,7 +281,9 @@ def build_eagle3_dataset(
     if cache_dir and cache_key:
         load_from_cache_file = True
         os.makedirs(cache_dir, exist_ok=True)
-        cache_file_name = os.path.join(cache_dir, f"{cache_key}.pkl")
+        cache_file_name = os.path.join(
+            cache_dir, f"{cache_key}-{rendering_cache_fingerprint(tokenizer)}.pkl"
+        )
         print(f"dataset is cached at {cache_file_name}")
     elif cache_dir is None and cache_key is None:
         load_from_cache_file = False

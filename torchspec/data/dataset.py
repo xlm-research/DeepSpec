@@ -35,6 +35,7 @@ from torchspec.data.parse import (
     has_unbalanced_thinking_tags,
 )
 from torchspec.data.preprocessing import _normalize_conversation, preprocess_conversations
+from torchspec.data.reasoning import rendering_cache_fingerprint
 from torchspec.data.renderers import RENDERER_REGISTRY
 from torchspec.data.template import TEMPLATE_REGISTRY
 from torchspec.data.utils import (
@@ -465,12 +466,15 @@ def load_conversation_dataset(args):
     train_with_decode = getattr(args, "train_with_decode", False)
     min_loss_tokens_val = getattr(args, "min_loss_tokens", 0)
     renderer_version = RENDERER_REGISTRY.cache_version(renderer_name) if renderer_name else None
+    tokenizer = load_tokenizer(args.target_model_path, trust_remote_code=True)
+    rendering_fingerprint = rendering_cache_fingerprint(tokenizer)
     cache_params = (
         f"{dataset_name}-{args.train_data_path}{file_stat}-{args.target_model_path}"
         f"-{max_length}-template={chat_template_name}-renderer={renderer_name}"
         f"-renderer-version={renderer_version}-ltlo={last_turn_loss_only_flag}"
         f"-defer={defer_tokenization}-decode={train_with_decode}"
         f"-mlt={min_loss_tokens_val}"
+        f"-rendering={rendering_fingerprint}"
     )
     if train_with_decode and not defer_tokenization:
         # Older caches filtered decode prompts by their pre-generation masks.

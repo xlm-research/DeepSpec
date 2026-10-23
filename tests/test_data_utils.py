@@ -2,9 +2,39 @@ import os
 from pathlib import Path
 
 import pytest
+import torch
 
 from torchspec.data import utils as data_utils
-from torchspec.data.utils import is_local_data_path
+from torchspec.data.utils import DataCollatorWithPadding, is_local_data_path
+
+
+def test_collator_counts_input_tokens_before_padding_and_includes_context():
+    features = [
+        {
+            "input_ids": torch.zeros(1, length, dtype=torch.long),
+            "loss_mask": torch.zeros(1, length, dtype=torch.long),
+        }
+        for length in (3, 5)
+    ]
+    batch = DataCollatorWithPadding()(features)
+
+    assert batch["input_ids"].shape == (2, 128)
+    assert batch["num_input_tokens"] == 8
+    assert not batch["loss_mask"].any()
+
+
+def test_collator_excludes_dummy_samples_from_input_token_count():
+    real = {"input_ids": torch.zeros(1, 3), "loss_mask": torch.ones(1, 3)}
+    dummy = {
+        "input_ids": torch.zeros(1, 5),
+        "loss_mask": torch.zeros(1, 5),
+        "num_input_tokens": 0,
+    }
+
+    batch = DataCollatorWithPadding()([real, dummy])
+
+    assert batch["num_input_tokens"] == 3
+
 
 # ---------------------------------------------------------------------------
 # is_local_data_path

@@ -18,16 +18,70 @@ to disable the timing and throughput measurements.
 
 ## Metrics Reference
 
-All metrics live under the `perf/` namespace in wandb (tied to `train/step`).
+All metrics live under the `perf/` namespace in W&B and TensorBoard (tied to
+`train/step`). Full-data runs also retain them in `metrics.jsonl`.
 
 ### Training Metrics (per optimizer step)
 
 | Metric | Unit | Source | Description |
 |---|---|---|---|
-| `perf/step_time` | seconds | `trainer.py` | Wall-clock time of `train_from_queue`, covering data fetch + compute + optimizer step. Accurate because `_aggregate_metrics` ends with `.item()` which syncs CUDA. |
+| `perf/draft_train_time` | seconds | `trainer.py` + `loop.py` | Controller dispatch wait plus the maximum trainer wall-clock duration across training ranks, from starting to wait for the first batch to GPU completion of the optimizer update, across all gradient-accumulation micro-batches. |
+| `perf/train_tokens` | tokens | `data/utils.py` + `trainer.py` + `loop.py` | Total input tokens across all training ranks and accumulation micro-batches, excluding padding, dummy samples, and USP lookahead overlap. Includes context tokens regardless of the loss mask. |
+| `perf/train_gpus` | GPUs | `loop.py` | Number of draft training actors/GPUs; target inference GPUs are excluded. |
+| `perf/train_tgs` | tokens/GPU/s | `loop.py` | `train_tokens / (draft_train_time * train_gpus)`, including dispatch and data waits. Omitted if the measured duration is zero. |
+| `perf/step_time` | seconds | `trainer.py` | Trainer step duration, covering data fetch + compute + optimizer step. Immediate metrics use wall-clock time after aggregation synchronizes CUDA; deferred metrics use CUDA events spanning the trainer step. |
 | `perf/data_time` | seconds | `trainer.py` | Wall-clock time spent in the data iterator (Ray queue get + Mooncake RDMA fetch + collation + H2D copy). Measured with `time.time()` since this is CPU/network-bound work. |
-| `perf/compute_time` | seconds | `trainer.py` | GPU execution time for forward + backward + optimizer step. Measured with **CUDA events** (`torch.cuda.Event(enable_timing=True)`), extracted at the existing `.item()` sync point in `_aggregate_metrics`. No additional `torch.cuda.synchronize()` calls. |
+| `perf/wait_time` | seconds | `loop.py` | `dispatch_wait + data_time`: controller dispatch waiting plus the trainer's data-fetch time for the same optimizer step. |
+| `perf/compute_time` | seconds | `trainer.py` | CUDA-event duration of forward + backward + optimizer, including communication waits on that execution path. Read after the existing immediate or deferred metric synchronization; no additional synchronization is introduced for the totals. |
+| `perf/total_wait_time` | seconds | `loop.py` | Cumulative `wait_time` over reported optimizer steps in this invocation. |
+| `perf/total_compute_time` | seconds | `loop.py` | Cumulative `compute_time` over reported optimizer steps in this invocation. |
 | `perf/train_capacity` | samples/s | `loop.py` | `global_batch_size / step_time`. The effective training throughput if data were always available. |
+
+Use `draft_train_time` to compare draft training speed at the same batch size,
+sequence lengths, accumulation count, and hardware, after warmup. The trainer
+starts its clock **before requesting the first batch**, with or without CPU
+prefetch. Its interval includes initial and later batch waits, data loading,
+H2D, CPU preparation, forward/loss, backward, gradient communication, and the
+optimizer update (including copying updated parameters back to the model).
+The controller adds that optimizer step's `dispatch_wait` before reporting the
+metric, including when trainer metrics are deferred or flushed at shutdown.
+Do not add `data_time` or `wait_time` again: the trainer interval already includes
+data fetching, which may overlap GPU work.
+
+Metric aggregation, logging, evaluation, and checkpoint saving are outside the
+measured interval. This is one duration per optimizer update, not a cumulative
+total or pure GPU compute time. Keep the prefetch configuration fixed when
+comparing runs. The controller uses the longest interval across training ranks.
+
+`train_tgs` measures input-token training throughput, not decoded output or sampled
+DSpark prediction positions. Token counts are captured before batch padding using
+CPU metadata, accumulated per optimizer step, and summed from the existing Ray
+actor results. USP ranks count only their own sequence chunk, excluding overlapping
+lookahead tokens. Counts and durations stay paired when metrics are deferred or
+flushed at shutdown. This adds no GPU collective or per-micro-batch host sync.
+The denominator includes data waits, so TGS reflects the training pipeline's
+observed throughput. W&B, TensorBoard, and full-data `metrics.jsonl` receive the
+same values as the `TIMING` log and progress bar.
+
+An independent timing thread waits for the CUDA event immediately after the
+optimizer and records completion with `time.perf_counter()`. This avoids adding
+a GPU wait to the training thread before metric aggregation, and preserves the
+original duration when metrics are reported one step later or flushed at the
+end. The wall-clock observation can include a small thread scheduling delay;
+compare averages over warmed-up steps rather than individual sub-millisecond
+differences. Disabling performance metrics also disables this timing worker.
+
+`compute_time` already includes the optimizer; do not add `optimizer_time`
+again. Timings other than `draft_train_time` use rank 0, not a sum across GPUs. They cover all
+micro-batches in the optimizer step. Data fetching can overlap queued GPU work,
+so `wait_time` measures time spent obtaining data, not GPU idle time, and
+`wait_time + compute_time` is not end-to-end wall time.
+
+The cumulative metrics reset when the training process restarts, including on
+checkpoint resume. They exclude evaluation and checkpoint saving. Deferred
+metrics are paired with the dispatch wait from their own step; the final pending
+step is included when metrics are flushed at shutdown. The `TIMING` log shows
+per-step and cumulative durations, and completion logs report the final totals.
 
 ### Inference Metrics (aggregated between training steps)
 
@@ -73,7 +127,7 @@ warmup instead of averaging the moving-window throughput snapshots.
 When perf metrics are enabled, the progress bar shows additional fields:
 
 ```
-Training: 10%|== | loss=0.350, acc=0.830, thru=12.1, I=18.5, T=13.2, wait=0.1s, pool=24, epoch=1/10
+Training: 10%|== | loss=0.350, acc=0.830, thru=12.1, I=18.5, T=13.2, draft=1.25s, TGS=32000.0, wait=0.10s, compute=1.20s, pool=24, epoch=1/10
 ```
 
 | Key | Meaning |
@@ -81,7 +135,10 @@ Training: 10%|== | loss=0.350, acc=0.830, thru=12.1, I=18.5, T=13.2, wait=0.1s, 
 | `thru` | Actual pipeline throughput (samples/s). This is the realized end-to-end speed of the system — how many samples are actually flowing through the pipeline per second. In steady state, `thru ≈ min(I, T)`. Derived from the controller's 10-second sliding window on sample pool inflow. |
 | `I` | Inference capacity (samples/s) — how fast inference *could* produce if training were infinitely fast. |
 | `T` | Training capacity (samples/s) — how fast training *could* consume if inference were infinitely fast. |
-| `wait` | Dispatch wait time (seconds) |
+| `draft` | Dispatch wait plus trainer duration from waiting for the first batch through GPU completion of the optimizer update (seconds) |
+| `TGS` | Input tokens per draft training GPU per second, including data waits |
+| `wait` | Dispatch wait plus data-fetch time for the reported optimizer step (seconds) |
+| `compute` | Forward + backward + optimizer time for that same step (seconds) |
 | `pool` | Current sample pool size |
 
 When perf metrics are disabled, the bar shows only `thru` (pipeline throughput).
@@ -149,10 +206,11 @@ reducing sequence length.
 `torch.cuda.synchronize()` forces the CPU to wait for all GPU work to
 complete, which **stalls the CUDA execution pipeline** and can measurably
 degrade training throughput. CUDA events (`torch.cuda.Event(enable_timing=True)`)
-insert non-blocking markers into the GPU stream. `event.record()` is
-essentially free (~500ns). Timing is extracted later at an existing sync point
-(`_aggregate_metrics` calls `.item()` which naturally syncs), so no extra
-synchronization is introduced.
+insert markers into the GPU stream with low overhead. GPU-stage timing is
+extracted later at an existing immediate or deferred metric sync point.
+`draft_train_time` instead observes the optimizer's completion event in a
+dedicated thread to include CPU work and all micro-batch waits in its
+wall-clock interval.
 
 ### Why `time.time()` for data loading?
 

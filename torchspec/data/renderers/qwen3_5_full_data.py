@@ -2,11 +2,14 @@
 
 from typing import Any
 
+from torchspec.data.reasoning import REASONING_FORMAT_VERSION, apply_chat_template_with_reasoning
 from torchspec.data.renderers.qwen3_5_multimodal import Qwen35MultimodalRenderer
 
 
 class Qwen35FullDataRenderer(Qwen35MultimodalRenderer):
-    CACHE_VERSION = "qwen35-full-data-native-system-selected-segments-thinking-v2"
+    CACHE_VERSION = (
+        f"qwen35-full-data-native-system-selected-segments-thinking-v2-{REASONING_FORMAT_VERSION}"
+    )
 
     def __init__(self, tokenizer: Any) -> None:
         super().__init__(tokenizer)
@@ -37,7 +40,7 @@ class Qwen35FullDataRenderer(Qwen35MultimodalRenderer):
             tokenize=False,
             chat_template=self.full_data_chat_template,
         )
-        return self.tokenizer.apply_chat_template(messages, **options)
+        return apply_chat_template_with_reasoning(self.tokenizer, messages, **options)
 
     def compute_loss_mask(
         self,

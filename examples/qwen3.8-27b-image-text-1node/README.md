@@ -1,5 +1,7 @@
 # Sensenova Flash Lite v42 单机图文 DSpark
 
+新增模块、已有模块的修改点、训练数据流和验收结果见[多模态 DSpark 训练实现说明](../../docs/qwen3_8_27b_multimodal_implementation.md)。
+
 全量模式使用全部 327 条不同训练源会话，从零训练 DSpark 草稿模型，
 先进行真实 GPU 图文预填充验证、原文本回归和 17 个不同监督窗口的两步
 训练预检（尾步包含 1 个真实窗口及 15 个零 loss padding），再完整遍历

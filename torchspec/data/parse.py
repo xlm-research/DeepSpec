@@ -27,6 +27,10 @@ from typing import TYPE_CHECKING, Dict, List, Tuple
 import torch
 from transformers import PreTrainedTokenizer
 
+from torchspec.data.reasoning import (
+    apply_chat_template_with_reasoning,
+    normalize_reasoning_messages,
+)
 from torchspec.data.template import ChatTemplate
 
 if TYPE_CHECKING:
@@ -168,7 +172,9 @@ class GeneralParser(Parser):
 
     def _apply_chat_template(self, messages, **kwargs) -> str:
         kwargs.setdefault("add_generation_prompt", False)
-        conversation = self.tokenizer.apply_chat_template(messages, tokenize=False, **kwargs)
+        conversation = apply_chat_template_with_reasoning(
+            self.tokenizer, messages, tokenize=False, **kwargs
+        )
         return conversation
 
     def format(self, conversation: "Conversation", **kwargs) -> str:
@@ -220,7 +226,7 @@ class GeneralParser(Parser):
             if bos_token:
                 parts.append(bos_token)
 
-            for msg in messages:
+            for msg in normalize_reasoning_messages(messages, inline=True):
                 if msg["role"] == "system":
                     parts.append(msg["content"])
                 elif msg["role"] == "user":
@@ -355,18 +361,20 @@ class ThinkingParser(GeneralParser):
         # ThinkingParser always generates prompt before appending last assistant content
         kwargs.pop("add_generation_prompt", None)
         if messages[-1]["role"] == "assistant":
-            conversation_history = self.tokenizer.apply_chat_template(
+            conversation_history = apply_chat_template_with_reasoning(
+                self.tokenizer,
                 messages[:-1],
                 tokenize=False,
                 add_generation_prompt=True,
                 add_special_tokens=False,
                 **kwargs,
             )
-            conversation = (
-                conversation_history
-                + messages[-1]["content"]
-                + self.chat_template.end_of_turn_token
-            )
+            content = normalize_reasoning_messages([messages[-1]], inline=True)[0]["content"]
+            if conversation_history.rstrip().endswith("<think>") and content.lstrip().startswith(
+                "<think>"
+            ):
+                content = content.lstrip()[len("<think>") :]
+            conversation = conversation_history + content + self.chat_template.end_of_turn_token
             return conversation
         else:
             raise Exception(f"The last message is not assistant but {messages[-1]['role']}")

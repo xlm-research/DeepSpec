@@ -15,6 +15,7 @@
 #   TARGET_MODEL_PATH  Target checkpoint (default supplied by h800conda.sh)
 #   MOONCAKE_PROTOCOL  tcp (default), or rdma when configured
 #   RAY_ADDRESS        Ray address (default: local)
+#   WANDB_API_KEY      W&B key; falls back to wandb_key in the root .env file
 #
 # --dry-run prints the command without contacting Ray or starting training.
 # --print-config-only loads and prints the resolved config without training.
@@ -95,6 +96,15 @@ if [[ "$dry_run" == true ]]; then
 fi
 
 source "$ROOT_DIR/h800conda.sh"
+# Load the local W&B credential without placing it in CLI args or run configs.
+# An explicitly exported WANDB_API_KEY takes precedence over the .env file.
+if [[ -z "${WANDB_API_KEY:-}" && -f "$ROOT_DIR/.env" ]]; then
+  WANDB_API_KEY="$(
+    source "$ROOT_DIR/.env"
+    printf '%s' "${WANDB_API_KEY:-${wandb_key:-}}"
+  )"
+  export WANDB_API_KEY
+fi
 # The local extract_hidden_states implementation is supported by Model Runner V1.
 export VLLM_USE_V2_MODEL_RUNNER=0
 export TORCHSPEC_LOG_LEVEL="${TORCHSPEC_LOG_LEVEL:-INFO}"

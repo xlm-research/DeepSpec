@@ -10,7 +10,7 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
-from torchspec.data.utils import pack_loss_mask, serialize_packed_loss_mask
+from torchspec.data.utils import DataCollatorWithPadding, pack_loss_mask, serialize_packed_loss_mask
 from torchspec.training.data_fetcher import (
     MooncakeDataFetcher,
     MooncakeDataset,
@@ -175,6 +175,60 @@ def make_sample(idx: int) -> TrainSample:
 
 
 class TestMooncakeDataset:
+    def test_dummy_sample_has_no_input_tokens(self):
+        ray_queue = MockRayQueue()
+        ray_queue.put(
+            TrainSample(
+                mooncake_key="dummy",
+                tensor_shapes={"input_ids": (5,), "hidden_states": (5, 2)},
+                packed_loss_mask="5",
+                metadata={"zero_loss_dummy": True},
+            )
+        )
+        ray_queue.put(None)
+        store = MockMooncakeStore()
+        samples = list(MooncakeDataset(ray_queue, store, torch.device("cpu")))
+
+        assert store.call_count == 0
+        assert DataCollatorWithPadding()(samples)["num_input_tokens"] == 0
+
+    @pytest.mark.parametrize(
+        ("seq_len", "sp_size", "lookahead", "max_seq_length"),
+        [(7, 2, 2, None), (3, 4, 3, None), (12, 4, 2, 7)],
+    )
+    def test_usp_input_token_count_excludes_lookahead_and_padding(
+        self, seq_len, sp_size, lookahead, max_seq_length
+    ):
+        sample = TrainSample(
+            mooncake_key="sharded",
+            tensor_shapes={"input_ids": (1, seq_len)},
+            packed_loss_mask=f"0,{seq_len}",
+        )
+        dataset = MooncakeDataset(
+            MockRayQueue(),
+            MockMooncakeStore(),
+            torch.device("cpu"),
+            usp_enabled=True,
+            ttt_length=lookahead,
+            max_seq_length=max_seq_length,
+        )
+        dataset._sp_world_size = sp_size
+        dataset._sp_ring_size = 1
+        global_len = min(seq_len, max_seq_length) if max_seq_length is not None else seq_len
+        local_len = (global_len + sp_size - 1) // sp_size + lookahead
+        token_counts = []
+        attention_counts = []
+        for rank in range(sp_size):
+            dataset._sp_rank = rank
+            feature = dataset._local_usp_loss_and_position(sample, local_len)
+            feature["input_ids"] = torch.zeros(1, local_len, dtype=torch.long)
+            batch = DataCollatorWithPadding(usp_enabled=True)([feature])
+            token_counts.append(batch["num_input_tokens"])
+            attention_counts.append(batch["attention_mask"].sum().item())
+
+        assert sum(token_counts) == global_len
+        assert sum(attention_counts) > global_len  # Lookahead repeats some real positions.
+
     def test_iterates_samples(self):
         ray_queue = MockRayQueue()
         store = MockMooncakeStore()

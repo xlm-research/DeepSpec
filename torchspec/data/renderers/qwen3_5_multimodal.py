@@ -2,11 +2,12 @@
 
 import torch
 
+from torchspec.data.reasoning import REASONING_FORMAT_VERSION, apply_chat_template_with_reasoning
 from torchspec.models.ops.loss_mask import compute_assistant_loss_mask
 
 
 class Qwen35MultimodalRenderer:
-    CACHE_VERSION = "qwen35-native-vision-mask-v1"
+    CACHE_VERSION = f"qwen35-native-vision-mask-v1-{REASONING_FORMAT_VERSION}"
     RECOMPUTE_PREFILL_MASK = True
 
     def __init__(self, tokenizer):
@@ -31,7 +32,7 @@ class Qwen35MultimodalRenderer:
         options.update(
             tools=tools, preserve_thinking=True, add_generation_prompt=False, tokenize=False
         )
-        return self.tokenizer.apply_chat_template(messages, **options)
+        return apply_chat_template_with_reasoning(self.tokenizer, messages, **options)
 
     def compute_loss_mask(self, input_ids, *, last_turn_only=False):
         ids = torch.as_tensor(input_ids, dtype=torch.long)

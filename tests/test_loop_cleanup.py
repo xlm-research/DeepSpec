@@ -155,13 +155,16 @@ def _run_mock_training_loop(
     steps_per_epoch: int,
     dispatch_results=None,
     train_metrics=None,
+    flushed_metrics=None,
+    enable_perf_metrics=False,
+    training_num_gpus=1,
     checkpoint_dir=None,
     save_interval=0,
     save_per_epoch=False,
 ):
     args = SimpleNamespace(
         training_num_nodes=1,
-        training_num_gpus_per_node=1,
+        training_num_gpus_per_node=training_num_gpus,
         num_train_steps=num_steps,
         draft_accumulation_steps=1,
         steps_per_epoch=steps_per_epoch,
@@ -169,7 +172,7 @@ def _run_mock_training_loop(
         global_batch_size=1,
         per_dp_rank_batch_size=1,
         prefetch_depth=prefetch_depth,
-        enable_perf_metrics=False,
+        enable_perf_metrics=enable_perf_metrics,
         save_interval=save_interval,
         checkpoint_dir=checkpoint_dir,
         save_per_epoch=save_per_epoch,
@@ -196,18 +199,32 @@ def _run_mock_training_loop(
         "avg_training_speed": 0.0,
     }
 
-    actor = mock.MagicMock()
-    actor.get_global_step.remote.return_value = 0
-
-    def train(*, step, num_batches):
+    def train(*, rank, step, num_batches):
         assert num_batches == 1
         events.append(f"train:{step}")
-        return dict(train_metrics or {})
+        metrics = train_metrics[step] if isinstance(train_metrics, list) else train_metrics
+        if isinstance(metrics, list):
+            metrics = metrics[rank]
+        return dict(metrics or {})
 
-    actor.train_from_queue.remote.side_effect = train
+    actors = []
+    for rank in range(training_num_gpus):
+        actor = mock.MagicMock()
+        actor.get_global_step.remote.return_value = 0
+        actor.train_from_queue.remote.side_effect = lambda *, step, num_batches, rank=rank: train(
+            rank=rank, step=step, num_batches=num_batches
+        )
+        actors.append(actor)
     train_group = mock.MagicMock()
-    train_group._actor_handlers = [actor]
+    train_group._actor_handlers = actors
     train_group.save_model.side_effect = lambda step, **kwargs: events.append(f"save:{step + 1}")
+    train_group.flush_pending_train_metrics.return_value = (
+        [dict(m) for m in flushed_metrics]
+        if isinstance(flushed_metrics, list)
+        else [dict(flushed_metrics)]
+        if flushed_metrics
+        else []
+    )
 
     eval_state = eval_utils.EvalSetupState(
         eval_interval=0,
@@ -236,6 +253,127 @@ def _run_mock_training_loop(
         )
 
     return events, controller, mock_sleep
+
+
+@pytest.mark.parametrize("deferred", [False, True])
+@pytest.mark.parametrize("enable_perf", [False, True])
+@pytest.mark.parametrize("training_num_gpus", [1, 2])
+def test_training_timing_logs_matching_steps_and_counts_deferred_tail(
+    monkeypatch, deferred, enable_perf, training_num_gpus
+):
+    monkeypatch.setenv("TORCHSPEC_CI_STEP_LOGS", "1")
+    steps = [
+        {
+            "_metrics_step": 1,
+            "train/avg_loss": 1.0,
+            "perf/data_time": 0.25,
+            "perf/compute_time": 2.0,
+            "perf/optimizer_time": 0.5,
+            "perf/step_time": 3.0,
+            "perf/draft_train_time": 2.5,
+            "_num_input_tokens": 120,
+        },
+        {
+            "_metrics_step": 2,
+            "train/avg_loss": 0.5,
+            "perf/data_time": 0.75,
+            "perf/compute_time": 4.0,
+            "perf/optimizer_time": 1.0,
+            "perf/step_time": 5.0,
+            "perf/draft_train_time": 4.5,
+            "_num_input_tokens": 300,
+        },
+    ]
+    if training_num_gpus == 2:
+        steps = [
+            [steps[0], {**steps[0], "perf/draft_train_time": 4.0, "_num_input_tokens": 80}],
+            [steps[1], {**steps[1], "perf/draft_train_time": 6.0, "_num_input_tokens": 240}],
+        ]
+    writer = mock.MagicMock()
+    with (
+        mock.patch.object(loop.time, "perf_counter", side_effect=[10.0, 11.0, 20.0, 23.0]),
+        mock.patch.object(loop, "get_tb_writer", return_value=writer),
+        mock.patch.object(loop.wandb, "run", None),
+        mock.patch.object(loop.logger, "info") as log,
+    ):
+        _run_mock_training_loop(
+            prefetch_depth=1,
+            num_steps=2,
+            steps_per_epoch=2,
+            train_metrics=[{}, steps[0]] if deferred else steps,
+            flushed_metrics=steps[1] if deferred else None,
+            enable_perf_metrics=enable_perf,
+            training_num_gpus=training_num_gpus,
+        )
+
+    scalars = [call.args for call in writer.add_scalar.call_args_list]
+    waits = [(value, step) for key, value, step in scalars if key == "perf/wait_time"]
+    totals = [(key, value, step) for key, value, step in scalars if key.startswith("perf/total_")]
+    timing_logs = [call.args[0] for call in log.call_args_list if call.args[0].startswith("TIMING")]
+    if not enable_perf:
+        assert not waits
+        assert not totals
+        assert not timing_logs
+        assert not any(key == "perf/train_tgs" for key, _, _ in scalars)
+        return
+
+    assert waits == [(1.25, 1), (3.75, 2)]
+    assert totals == [
+        ("perf/total_wait_time", 1.25, 1),
+        ("perf/total_compute_time", 2.0, 1),
+        ("perf/total_wait_time", 5.0, 2),
+        ("perf/total_compute_time", 6.0, 2),
+    ]
+    assert len(timing_logs) == 2
+    draft_times = [3.5, 7.5] if training_num_gpus == 1 else [5.0, 9.0]
+    assert f"step=1: draft={draft_times[0]:.3f}s step=3.000s wait=1.250s" in timing_logs[0]
+    assert f"step=2: draft={draft_times[1]:.3f}s step=5.000s wait=3.750s" in timing_logs[1]
+    # Add each step's dispatch wait once; data_time is already in the trainer interval.
+    assert [(value, step) for key, value, step in scalars if key == "perf/draft_train_time"] == [
+        (draft_times[0], 1),
+        (draft_times[1], 2),
+    ]
+    expected_tokens = [120, 300] if training_num_gpus == 1 else [200, 540]
+    expected_tgs = [120 / 3.5, 40.0] if training_num_gpus == 1 else [20.0, 30.0]
+    assert [(value, step) for key, value, step in scalars if key == "perf/train_tokens"] == [
+        (expected_tokens[0], 1),
+        (expected_tokens[1], 2),
+    ]
+    assert [(value, step) for key, value, step in scalars if key == "perf/train_tgs"] == [
+        (expected_tgs[0], 1),
+        (expected_tgs[1], 2),
+    ]
+    assert [(value, step) for key, value, step in scalars if key == "perf/train_gpus"] == [
+        (training_num_gpus, 1),
+        (training_num_gpus, 2),
+    ]
+    assert not any(key == "_num_input_tokens" for key, _, _ in scalars)
+    assert f"tgs={expected_tgs[0]:.1f} tokens/GPU/s" in timing_logs[0]
+    assert f"tgs={expected_tgs[1]:.1f} tokens/GPU/s" in timing_logs[1]
+    log.assert_any_call("Training timing totals (this run): wait=5.000s compute=6.000s")
+
+
+def test_throughput_rejects_rank_metrics_from_different_optimizer_steps():
+    with pytest.raises(RuntimeError, match="different steps"):
+        loop._merge_training_metrics(
+            [
+                {"_metrics_step": 1, "_num_input_tokens": 10, "perf/draft_train_time": 1.0},
+                {"_metrics_step": 2, "_num_input_tokens": 10, "perf/draft_train_time": 1.0},
+            ]
+        )
+
+
+@pytest.mark.parametrize("draft_time", [0.0, 1.0])
+def test_tgs_handles_empty_input_and_zero_duration(draft_time):
+    metrics = loop._merge_training_metrics(
+        [{"_num_input_tokens": 0, "perf/draft_train_time": draft_time}]
+    )
+    loop._TrainingTiming().update(metrics, dispatch_wait=0.0, global_batch_size=1)
+
+    if draft_time == 0:
+        assert "perf/train_tgs" not in metrics
+    else:
+        assert metrics["perf/train_tgs"] == 0.0
 
 
 @pytest.mark.parametrize("save_per_epoch", [False, True])

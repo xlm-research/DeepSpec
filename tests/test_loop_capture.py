@@ -9,16 +9,19 @@ import torch
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("tokens", [7, 8192])
-def test_loop_router_fusion_preserves_branch_post_and_mix(monkeypatch, tokens):
+@pytest.mark.parametrize("fusion", ["none", "all"])
+def test_loop_router_fusion_preserves_branch_post_and_mix(monkeypatch, tokens, fusion):
     from vllm.model_executor.models.qwen3_5_loop import Qwen3_5MHCRouter
 
     monkeypatch.setenv("VLLM_QWEN3_5_MHC_BACKEND", "torch")
+    monkeypatch.setenv("VLLM_QWEN3_5_MHC_FUSION", "none")
     reference = Qwen3_5MHCRouter(128, 4, 20).cuda()
     generator = torch.Generator(device="cuda").manual_seed(29)
     with torch.no_grad():
         reference.weight.normal_(std=0.03, generator=generator)
         reference.bias.normal_(std=0.03, generator=generator)
     monkeypatch.setenv("VLLM_QWEN3_5_MHC_BACKEND", "triton")
+    monkeypatch.setenv("VLLM_QWEN3_5_MHC_FUSION", fusion)
     candidate = Qwen3_5MHCRouter(128, 4, 20).cuda()
     candidate.load_state_dict(reference.state_dict())
     residual = torch.randn(tokens, 4, 128, device="cuda", dtype=torch.bfloat16, generator=generator)

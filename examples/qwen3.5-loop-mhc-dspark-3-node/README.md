@@ -96,6 +96,18 @@ prefix caching。
 
 ## 恢复训练
 
+`run.sh` 和 `restart.sh` 使用各节点本地的 `/tmp/torchspec-triton-$UID` 作为 Triton
+缓存，并通过 Ray runtime env 传递给目标 worker，覆盖 Conda 或旧 Ray 节点继承的
+共享盘缓存。需要自定义位置时设置 `TORCHSPEC_TRITON_CACHE_DIR`，该路径必须在所有
+节点可用，建议使用本地 SSD。更改缓存或内核代码后须重启目标进程才能生效。
+此启动脚本自动设置 `TORCHSPEC_TRITON_CACHE_DIR` 来启用跨节点覆盖；其他训练任务
+未设置该变量时保留原来的节点缓存行为，不转发驱动进程继承的 `TRITON_CACHE_DIR`。
+
+`restart.sh` 默认启用 `VLLM_QWEN3_5_MHC_BACKEND=triton` 和
+`VLLM_QWEN3_5_MHC_FUSION=all`，保留显式环境变量覆盖。需要回退原 PyTorch 路径时，
+分别设置为 `torch` 和 `none`。mHC 内核复用运行时长度参数，变长样本及最后一个
+prefill chunk 不再各自产生新的长度特化版本。
+
 ```bash
 LOAD_PATH=/absolute/path/to/previous-output/checkpoints \
 CKPT_STEP=1000 \

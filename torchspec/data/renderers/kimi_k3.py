@@ -20,6 +20,12 @@
 
 from typing import Any
 
+from torchspec.data.reasoning import (
+    REASONING_FORMAT_VERSION,
+    apply_chat_template_with_reasoning,
+    normalize_reasoning_messages,
+)
+
 
 class K3Renderer:
     """Render Kimi-K3 XTML through the checkpoint's remote tokenizer code.
@@ -45,7 +51,7 @@ class K3Renderer:
 
     # Included in the dataset tokenization cache key. Bump whenever rendering
     # semantics change in a way that can alter input_ids or loss masks.
-    CACHE_VERSION = "generation-config-v3"
+    CACHE_VERSION = f"generation-config-v3-{REASONING_FORMAT_VERSION}"
 
     def __init__(self, tokenizer: Any):
         self.tokenizer = tokenizer
@@ -97,7 +103,8 @@ class K3Renderer:
         training prompts diverge from what the checkpoint renders at serving
         time for a request that named no effort, so the default stays ``None``.
         """
-        token_ids = self.tokenizer.apply_chat_template(
+        token_ids = apply_chat_template_with_reasoning(
+            self.tokenizer,
             messages,
             tools=tools,
             tokenize=True,
@@ -159,7 +166,7 @@ class K3Renderer:
         cls,
         messages: list[dict[str, Any]],
     ) -> None:
-        for index, message in enumerate(messages):
+        for index, message in enumerate(normalize_reasoning_messages(messages)):
             if message.get("role") != "assistant":
                 continue
             if any(message.get(field) for field in cls._REASONING_FIELDS):

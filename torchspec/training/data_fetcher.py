@@ -167,6 +167,7 @@ class MooncakeDataset(IterableDataset):
                 )
                 for key, shape in sample.tensor_shapes.items()
             }
+            result["num_input_tokens"] = 0
         elif pp_manifest is not None:
             result = self._load_vllm_pp_layers(sample, pp_manifest, dtypes)
         else:
@@ -441,7 +442,7 @@ class MooncakeDataset(IterableDataset):
         self,
         sample: TrainSample,
         local_len: int,
-    ) -> dict[str, torch.Tensor]:
+    ) -> dict[str, torch.Tensor | int]:
         sp_ulysses_size = max(1, self._sp_world_size // self._sp_ring_size)
         global_len = self._usp_global_len(sample)
         chunk_size = self._usp_chunk_size(global_len)
@@ -474,6 +475,8 @@ class MooncakeDataset(IterableDataset):
             "loss_mask": loss_mask.to(self.device),
             "attention_mask": attention_mask.to(self.device),
             "position_ids": position_ids.to(self.device),
+            # Count each input position on its owning SP rank, excluding lookahead and padding.
+            "num_input_tokens": min(chunk_size, valid_len),
         }
 
     def _should_skip_usp_sharded_sample(self, sample: TrainSample) -> bool:
