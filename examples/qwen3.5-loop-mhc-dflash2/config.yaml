@@ -1,0 +1,104 @@
+# One 8-GPU node: four FSDP training ranks and one TP=4 Loop/mHC target.
+model:
+  target_model_path: ${oc.env:TARGET_MODEL_PATH,/mnt/afs_agents/yankuihao/model_ckpts/1009_9b_mhc4_loop3_from50_zxh_glmv25_all16_16nodes/ckpt-225-bf16}
+  target_model_backend: vllm
+  draft_model_config: configs/draft_models/qwen3_5_loop_mhc_dflash2.json
+  embedding_key: model.language_model.embed_tokens.weight
+  lm_head_key: lm_head.weight
+  norm_key: model.language_model.norm.weight
+  trust_remote_code: true
+
+dataset:
+  train_data_path: ../../mydata/test_20.jsonl
+  chat_template: qwen
+  prompt_key: conversations
+  last_turn_loss_only: true
+  shuffle_dataset: true
+  length_group_size: 1
+  min_loss_tokens: 16
+
+training:
+  attention_backend: flex_attention
+  fsdp_strategy: FULL_SHARD
+  gradient_checkpointing: true
+  micro_batch_size: 1
+  draft_accumulation_steps: 1
+  learning_rate: 1e-4
+  max_concurrent_batches: 1
+  max_grad_norm: 0.5
+  max_seq_length: 131072
+  num_epochs: 1
+  prefetch_depth: 1
+  save_interval: 2
+  save_per_epoch: true
+  max_checkpoints: 2
+  seed: 42
+  train_with_decode: false
+  training_num_gpus_per_node: 4
+  training_num_nodes: 1
+  distributed_timeout_minutes: 60
+  ttt_length: 7
+  warmup_ratio: 0.0
+  dflash_block_size: 8
+  dflash_num_anchors: 512
+  dflash_num_target_layers: 5
+  dflash_loss_decay_gamma: 7.0
+  dflash_ce_loss_alpha: 1.0
+  dflash_l1_loss_alpha: 0.0
+  dflash2_selector_loss_alpha: 1.0
+
+inference:
+  inference_engine_type: vllm
+  inference_num_gpus: 4
+  inference_num_gpus_per_engine: 4
+  inference_num_gpus_per_node: 8
+  inference_batch_size: 1
+  inference_buffer_threshold: 4
+  inference_fetch_batch: 1
+  max_sample_pool_size: 4
+  # CE + selector does not consume final states. The existing direct-capture
+  # connector still publishes the independent post-norm final slot (80).
+  store_last_hidden_states: false
+  last_hidden_states_prenorm: false
+  aux_hidden_states_layers: [3, 27, 51, 75, 78]
+  vllm:
+    nnodes: 1
+    tp_size: 4
+    pp_size: 1
+    init_timeout: 1800
+    dist_timeout: 1800
+    mem_fraction_static: 0.80
+    direct_hidden_state_capture: true
+    extra_args:
+      dtype: bfloat16
+      enforce_eager: true
+      language_model_only: true
+      mamba_ssm_cache_dtype: float32
+      max_model_len: 131072
+      max_num_batched_tokens: 8192
+      max_num_seqs: 1
+      enable_chunked_prefill: true
+
+decode:
+  target_only: false
+  max_new_tokens: 1
+  min_new_tokens: 1
+  speculative_algorithm: null
+  speculative_draft_model_path: null
+  weight_sync_enabled: false
+  weight_sync_interval: 0
+
+mooncake:
+  master_server_address: null
+  metadata_server: null
+  protocol: tcp
+  global_segment_size: 64GB
+  local_buffer_size: 16GB
+  host_buffer_size: 8GB
+
+output_dir: ./outputs/qwen3.5-loop-mhc-dflash2
+cache_dir: ./cache/qwen3.5-loop-mhc-dflash2
+logging:
+  report_to: none
+debug:
+  enable_perf_metrics: true

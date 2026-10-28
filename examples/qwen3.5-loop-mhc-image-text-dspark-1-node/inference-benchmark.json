@@ -1,0 +1,227 @@
+{
+  "schema_version": 1,
+  "date": "2026-10-23",
+  "run_id": "fa7082cb07304cd7b87db033712f57eb",
+  "status": "complete",
+  "vllm_branch": "autoresearch/loop-image-prefill-20261023",
+  "retained_commit": "e92cadc862730336efa13eb0967e560ae33969d8",
+  "environment": {
+    "activation": "source /mnt/afs_share/lezewei/TorchSpec/h800conda-tmp.sh",
+    "python": "3.12.14",
+    "torch": "2.13.0+cu130",
+    "cuda": "13.0",
+    "triton": "3.7.1",
+    "vllm_package_metadata_version": "0.26.1rc1.dev719+g1ee54c40d.d20260912",
+    "vllm_import_path": "/mnt/afs_share/lezewei/TorchSpec/vllm/vllm/__init__.py",
+    "inference_gpus": "NVIDIA H800 GPUs 0,1,2,3"
+  },
+  "measurement": {
+    "scope": "Sum of four real image-text requests: generate through complete Mooncake hidden-state read",
+    "excluded": [
+      "model initialization",
+      "first compilation",
+      "subsequent correctness checks"
+    ],
+    "warmup_rounds": 1,
+    "timed_rounds": 3,
+    "aggregation": "median of the three per-round sums",
+    "baseline_seconds": 61.842753160744905,
+    "retained_seconds": 46.9908957593143,
+    "retained_round_seconds": [
+      46.95191118493676,
+      47.016478300094604,
+      46.9908957593143
+    ],
+    "time_ratio": 0.7598448218689927,
+    "target_time_ratio": 0.8,
+    "latency_reduction_percent": 24.01551781310073,
+    "speedup": 1.3160581887500356,
+    "windows": [
+      {
+        "data_id": "image_text_source_114_window_0000",
+        "input_tokens": 11065,
+        "images": 3,
+        "median_seconds": 1.7277128957211971
+      },
+      {
+        "data_id": "image_text_source_205_window_0000",
+        "input_tokens": 65484,
+        "images": 1,
+        "median_seconds": 8.755479458719492
+      },
+      {
+        "data_id": "image_text_source_58_window_0000",
+        "input_tokens": 131071,
+        "images": 2,
+        "median_seconds": 18.245319541543722
+      },
+      {
+        "data_id": "image_text_source_247_window_0001",
+        "input_tokens": 130903,
+        "images": 22,
+        "median_seconds": 18.273015182465315
+      }
+    ]
+  },
+  "retained_configuration": {
+    "tp_size": 4,
+    "max_num_batched_tokens": 8192,
+    "disable_custom_all_reduce": true,
+    "dtype": "bfloat16",
+    "mamba_ssm_cache_dtype": "float32",
+    "max_model_len": 131072,
+    "enforce_eager": true,
+    "VLLM_USE_V2_MODEL_RUNNER": "1",
+    "VLLM_QWEN3_5_MHC_BACKEND": "triton",
+    "VLLM_QWEN3_5_MHC_FUSION": "all",
+    "aux_execution_layers": [
+      3,
+      27,
+      51,
+      75,
+      78
+    ],
+    "aux_capture_slots": [
+      4,
+      28,
+      52,
+      76,
+      79
+    ],
+    "final_capture_slot": 80,
+    "final_state": "post-norm"
+  },
+  "validation": {
+    "observations": 16,
+    "full_input_ids_and_supervision_mask": "unchanged",
+    "full_feature_shapes_and_finite_values": "pass",
+    "feature_sample_positions_per_window": 257,
+    "all_sampled_features_bitwise_equal": true,
+    "greedy_completion_tokens": "unchanged",
+    "kernel_and_config_tests_passed": 92,
+    "capture_and_engine_tests_passed": 35,
+    "applicable_vllm_pre_commit_checks": "pass",
+    "guard_log": "vllm/autoresearch-results/logs/0005-guard.json"
+  },
+  "experiments": [
+    {
+      "iteration": 1,
+      "hypothesis": "Test TP=2: fewer ranks may reduce replicated mHC and communication costs",
+      "source_commit": "57e6dcebc57658a2007909ed338227f58366e0db",
+      "tuning": {
+        "tp_size": 2,
+        "max_num_batched_tokens": 8192,
+        "disable_custom_all_reduce": true
+      },
+      "round_seconds": [
+        67.81804623454809,
+        68.62917294353247,
+        67.4855824187398
+      ],
+      "median_seconds": 67.81804623454809,
+      "time_ratio": 1.096620748081378,
+      "correctness_failure_count": 36,
+      "guard": "not_run",
+      "outcome": "discard",
+      "report": "outputs/loop-autoresearch-20261023/measurement-20261023-191430.json"
+    },
+    {
+      "iteration": 2,
+      "hypothesis": "Test TP=1: eliminate all-reduce while retaining full BF16 image-text capture",
+      "source_commit": "58cd8b5157e816b1b51859d230daf0f522a26025",
+      "tuning": {
+        "tp_size": 1,
+        "max_num_batched_tokens": 8192,
+        "disable_custom_all_reduce": true
+      },
+      "round_seconds": [
+        77.57424831390381,
+        78.51915780454874,
+        77.8682367913425
+      ],
+      "median_seconds": 77.8682367913425,
+      "time_ratio": 1.2591327651429638,
+      "correctness_failure_count": 32,
+      "guard": "not_run",
+      "outcome": "discard",
+      "report": "outputs/loop-autoresearch-20261023/measurement-20261023-192442.json"
+    },
+    {
+      "iteration": 3,
+      "hypothesis": "Fuse four-token block-diagonal BF16 Tensor Core mHC residual merge while preserving every reference rounding boundary and fallback path",
+      "source_commit": "2528eccd3c02fc830f45c59575cc2352652d7353",
+      "tuning": {
+        "tp_size": 4,
+        "max_num_batched_tokens": 8192,
+        "disable_custom_all_reduce": true
+      },
+      "round_seconds": [
+        49.88274056464434,
+        49.82772867754102,
+        49.748286817222834
+      ],
+      "median_seconds": 49.82772867754102,
+      "time_ratio": 0.8057165331567013,
+      "correctness_failure_count": 0,
+      "guard": "pass",
+      "outcome": "keep",
+      "report": "outputs/loop-autoresearch-20261023/measurement-20261023-212642.json"
+    },
+    {
+      "iteration": 4,
+      "hypothesis": "Increase TP=4 prefill chunk size from 8192 to 16384 tokens to reduce scheduling and per-chunk operator overhead while retaining the Tensor Core merge",
+      "source_commit": "9f2be9ac4e6f00959cceb34559a7997b3a33e76c",
+      "tuning": {
+        "tp_size": 4,
+        "max_num_batched_tokens": 16384,
+        "disable_custom_all_reduce": true
+      },
+      "round_seconds": [
+        47.891599372029305,
+        48.109977800399065,
+        47.96216092631221
+      ],
+      "median_seconds": 47.96216092631221,
+      "time_ratio": 0.7755502217316629,
+      "correctness_failure_count": 32,
+      "guard": "fail",
+      "outcome": "discard",
+      "report": "outputs/loop-autoresearch-20261023/measurement-20261023-213602.json"
+    },
+    {
+      "iteration": 5,
+      "hypothesis": "Tune exact mHC normalization launch geometry and reuse the consumed FP32 square buffer for normalized output",
+      "source_commit": "e92cadc862730336efa13eb0967e560ae33969d8",
+      "tuning": {
+        "tp_size": 4,
+        "max_num_batched_tokens": 8192,
+        "disable_custom_all_reduce": true
+      },
+      "round_seconds": [
+        46.95191118493676,
+        47.016478300094604,
+        46.9908957593143
+      ],
+      "median_seconds": 46.9908957593143,
+      "time_ratio": 0.7598448218689927,
+      "correctness_failure_count": 0,
+      "guard": "pass",
+      "outcome": "keep",
+      "report": "outputs/loop-autoresearch-20261023/measurement-20261023-215048.json"
+    }
+  ],
+  "reproduction": [
+    "source h800conda-tmp.sh",
+    "bash vllm/benchmarks/qwen3_5_loop_autoresearch/run.sh",
+    "bash vllm/benchmarks/qwen3_5_loop_autoresearch/guard.sh"
+  ],
+  "frozen_source_and_input_sha256": {
+    "h800conda-tmp.sh": "a57bd1b668ed1822783c34f6e5b1af0becc381dcbd2edb36b4fff6615ccce3b2",
+    "examples/qwen3.5-loop-mhc-image-text-dspark-1-node/config.yaml": "a40ae622755aa66db02bf8eacf339ccd3f396d84f3b9a97b75acd01040d2e395",
+    "examples/qwen3.8-27b-image-text-1node/prefill.py": "201331d5e2837d5653d8db4e7d2270418c7e2172b474ebe21526621fa8eb6784",
+    "torchspec/inference/engine/vllm_engine.py": "f539c4ea14204ab1f781136e040397b6a326526de71b953383cc82f9d89a31be",
+    "torchspec/inference/engine/mooncake_hidden_states_connector.py": "58b35137f90727a3c92e3f806becdcb24b5ac751483e064bb77c635b90e6854e",
+    "torchspec/training/data_fetcher.py": "f49dd152ab9728c2776b978886d598ebd250d5059ebdfa0fe6a9394ebf5336f2",
+    "outputs/loop-autoresearch-20261023/samples.jsonl": "3169e74a8e86a8cafac5099419339ae4f1a016632ca33af2ff01c754acc22a96"
+  }
+}

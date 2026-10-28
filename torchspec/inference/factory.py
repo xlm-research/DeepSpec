@@ -383,7 +383,11 @@ def _prepare_vllm_engines(
         node_rank = i % nnodes if nnodes > 1 else 0
 
         bundle_offset = i * gpus_per_engine
-        base_gpu_id = int(reordered_gpu_ids[bundle_offset])
+        gpu_ids = [
+            int(gpu_id)
+            for gpu_id in reordered_gpu_ids[bundle_offset : bundle_offset + gpus_per_engine]
+        ]
+        base_gpu_id = gpu_ids[0]
 
         scheduling_strategy = PlacementGroupSchedulingStrategy(
             placement_group=pg_obj,
@@ -403,6 +407,7 @@ def _prepare_vllm_engines(
             num_gpus_per_engine=gpus_per_engine,
             node_rank=node_rank,
             engine_group=engine_group,
+            gpu_ids=gpu_ids,
         )
         engines.append(engine)
 

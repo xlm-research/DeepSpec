@@ -1,0 +1,176 @@
+{
+  "startup": [
+    {
+      "iteration": 1,
+      "environment": "afs",
+      "total_seconds": 84.32635017111897,
+      "import_seconds": 74.34423832967877,
+      "python": "/mnt/afs_share/miniconda3/envs/deepspec_vllm_torchtitan_envs/bin/python",
+      "torch": "2.13.0+cu130",
+      "cuda": true,
+      "torch_path": "/mnt/afs_share/miniconda3/envs/deepspec_vllm_torchtitan_envs/lib/python3.12/site-packages/torch/__init__.py",
+      "vllm_path": "/mnt/afs_share/lezewei/TorchSpec/vllm/vllm/__init__.py"
+    },
+    {
+      "iteration": 1,
+      "environment": "tmp",
+      "total_seconds": 16.916811916977167,
+      "import_seconds": 10.844997350126505,
+      "python": "/tmp/deepspec_vllm_torchtitan_envs/bin/python",
+      "torch": "2.13.0+cu130",
+      "cuda": true,
+      "torch_path": "/tmp/deepspec_vllm_torchtitan_envs/lib/python3.12/site-packages/torch/__init__.py",
+      "vllm_path": "/mnt/afs_share/lezewei/TorchSpec/vllm/vllm/__init__.py"
+    },
+    {
+      "iteration": 2,
+      "environment": "tmp",
+      "total_seconds": 17.23046240583062,
+      "import_seconds": 10.608609821647406,
+      "python": "/tmp/deepspec_vllm_torchtitan_envs/bin/python",
+      "torch": "2.13.0+cu130",
+      "cuda": true,
+      "torch_path": "/tmp/deepspec_vllm_torchtitan_envs/lib/python3.12/site-packages/torch/__init__.py",
+      "vllm_path": "/mnt/afs_share/lezewei/TorchSpec/vllm/vllm/__init__.py"
+    },
+    {
+      "iteration": 2,
+      "environment": "afs",
+      "total_seconds": 86.33042657002807,
+      "import_seconds": 75.22268033027649,
+      "python": "/mnt/afs_share/miniconda3/envs/deepspec_vllm_torchtitan_envs/bin/python",
+      "torch": "2.13.0+cu130",
+      "cuda": true,
+      "torch_path": "/mnt/afs_share/miniconda3/envs/deepspec_vllm_torchtitan_envs/lib/python3.12/site-packages/torch/__init__.py",
+      "vllm_path": "/mnt/afs_share/lezewei/TorchSpec/vllm/vllm/__init__.py"
+    },
+    {
+      "iteration": 3,
+      "environment": "afs",
+      "total_seconds": 87.7762245759368,
+      "import_seconds": 78.17086128145456,
+      "python": "/mnt/afs_share/miniconda3/envs/deepspec_vllm_torchtitan_envs/bin/python",
+      "torch": "2.13.0+cu130",
+      "cuda": true,
+      "torch_path": "/mnt/afs_share/miniconda3/envs/deepspec_vllm_torchtitan_envs/lib/python3.12/site-packages/torch/__init__.py",
+      "vllm_path": "/mnt/afs_share/lezewei/TorchSpec/vllm/vllm/__init__.py"
+    },
+    {
+      "iteration": 3,
+      "environment": "tmp",
+      "total_seconds": 17.92256310582161,
+      "import_seconds": 10.744724713265896,
+      "python": "/tmp/deepspec_vllm_torchtitan_envs/bin/python",
+      "torch": "2.13.0+cu130",
+      "cuda": true,
+      "torch_path": "/tmp/deepspec_vllm_torchtitan_envs/lib/python3.12/site-packages/torch/__init__.py",
+      "vllm_path": "/mnt/afs_share/lezewei/TorchSpec/vllm/vllm/__init__.py"
+    },
+    {
+      "iteration": 4,
+      "environment": "tmp",
+      "total_seconds": 18.608172543346882,
+      "import_seconds": 10.245817512273788,
+      "python": "/tmp/deepspec_vllm_torchtitan_envs/bin/python",
+      "torch": "2.13.0+cu130",
+      "cuda": true,
+      "torch_path": "/tmp/deepspec_vllm_torchtitan_envs/lib/python3.12/site-packages/torch/__init__.py",
+      "vllm_path": "/mnt/afs_share/lezewei/TorchSpec/vllm/vllm/__init__.py"
+    },
+    {
+      "iteration": 4,
+      "environment": "afs",
+      "total_seconds": 87.03206032514572,
+      "import_seconds": 76.54001279175282,
+      "python": "/mnt/afs_share/miniconda3/envs/deepspec_vllm_torchtitan_envs/bin/python",
+      "torch": "2.13.0+cu130",
+      "cuda": true,
+      "torch_path": "/mnt/afs_share/miniconda3/envs/deepspec_vllm_torchtitan_envs/lib/python3.12/site-packages/torch/__init__.py",
+      "vllm_path": "/mnt/afs_share/lezewei/TorchSpec/vllm/vllm/__init__.py"
+    },
+    {
+      "iteration": 5,
+      "environment": "afs",
+      "total_seconds": 77.42718552425504,
+      "import_seconds": 67.88887103274465,
+      "python": "/mnt/afs_share/miniconda3/envs/deepspec_vllm_torchtitan_envs/bin/python",
+      "torch": "2.13.0+cu130",
+      "cuda": true,
+      "torch_path": "/mnt/afs_share/miniconda3/envs/deepspec_vllm_torchtitan_envs/lib/python3.12/site-packages/torch/__init__.py",
+      "vllm_path": "/mnt/afs_share/lezewei/TorchSpec/vllm/vllm/__init__.py"
+    },
+    {
+      "iteration": 5,
+      "environment": "tmp",
+      "total_seconds": 18.34346443042159,
+      "import_seconds": 10.204743470996618,
+      "python": "/tmp/deepspec_vllm_torchtitan_envs/bin/python",
+      "torch": "2.13.0+cu130",
+      "cuda": true,
+      "torch_path": "/tmp/deepspec_vllm_torchtitan_envs/lib/python3.12/site-packages/torch/__init__.py",
+      "vllm_path": "/mnt/afs_share/lezewei/TorchSpec/vllm/vllm/__init__.py"
+    }
+  ],
+  "activation": [
+    {
+      "iteration": 1,
+      "environment": "afs",
+      "activation_seconds": 6.367129120975733
+    },
+    {
+      "iteration": 1,
+      "environment": "tmp",
+      "activation_seconds": 3.6413945965468884
+    },
+    {
+      "iteration": 2,
+      "environment": "tmp",
+      "activation_seconds": 4.357296373695135
+    },
+    {
+      "iteration": 2,
+      "environment": "afs",
+      "activation_seconds": 6.7436156533658504
+    },
+    {
+      "iteration": 3,
+      "environment": "afs",
+      "activation_seconds": 7.697148330509663
+    },
+    {
+      "iteration": 3,
+      "environment": "tmp",
+      "activation_seconds": 6.868557695299387
+    },
+    {
+      "iteration": 4,
+      "environment": "tmp",
+      "activation_seconds": 8.512744206935167
+    },
+    {
+      "iteration": 4,
+      "environment": "afs",
+      "activation_seconds": 7.7522653341293335
+    },
+    {
+      "iteration": 5,
+      "environment": "afs",
+      "activation_seconds": 6.517493691295385
+    },
+    {
+      "iteration": 5,
+      "environment": "tmp",
+      "activation_seconds": 5.776345822960138
+    }
+  ],
+  "method": {
+    "date": "2026-10-23",
+    "repetitions_per_environment": 5,
+    "order": "AFS/tmp, tmp/AFS, AFS/tmp, tmp/AFS, AFS/tmp",
+    "cache": "Existing system cache; no cache flush; not a controlled cold-start benchmark.",
+    "activation": "New bash --noprofile --norc: source /mnt/afs_share/miniconda3/etc/profile.d/conda.sh; conda activate <absolute prefix>. Wall time includes shell exit.",
+    "startup": "New bash: source ./h800conda.sh with TORCHSPEC_CONDA_ENV; invoke PIPELINE_PYTHON; import full_train.py using importlib.util.spec_from_file_location; import torch, ray, transformers, vllm; inspect versions and torch.cuda.is_available(); exit. Wall time includes process exit.",
+    "import_seconds": "Time inside Python for full_train.py and torch/ray/transformers/vllm imports only; excludes CUDA availability check and process exit.",
+    "exclusions": "No model weights, dataset preparation, GPU training, archive copy or extraction. Both environments use the same AFS repository source via PYTHONPATH."
+  }
+}

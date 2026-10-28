@@ -44,7 +44,7 @@ hidden states，也无需加载目标 final norm。
 bash run.sh
 ```
 
-入口会自动加载 `h800conda.sh`，在训练节点启动或复用 Ray head，并通过 SSH 并行
+入口会自动加载 `h800conda-tmp.sh`，在训练节点启动或复用 Ray head，并通过 SSH 并行
 启动尚未加入集群的两个推理节点。确认三台机器各至少有 8 张 GPU 后，自动在 head
 执行训练脚本；训练结束后保留 Ray，供下次复用。从推理节点执行时会自动转到 head。
 三台机器需要共享当前仓库和环境，并已配置免密 SSH 及已知主机密钥。
@@ -97,7 +97,7 @@ bash examples/qwen3.8-27b-dflash2-3node/run.sh
 `decode.weight_sync_enabled: false`，采用已有样本监督的 prefill 路径。
 目标模型仍进行前向推理；vLLM 使用 `extract_hidden_states` 提取训练所需状态，
 其中的辅助缓存模块不加载 DFlash2 权重。所有节点应使用当前仓库的本地 vLLM 代码；
-脚本通过 `h800conda.sh` 配置环境，并设置 `VLLM_USE_V2_MODEL_RUNNER=0`，
+脚本通过 `h800conda-tmp.sh` 配置环境，并设置 `VLLM_USE_V2_MODEL_RUNNER=0`，
 使用当前支持 `extract_hidden_states` 的 Model Runner V1。
 
 `training.max_seq_length` 和 vLLM 的 `max_model_len` 都保持为 131072（128K）。

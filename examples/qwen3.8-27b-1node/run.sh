@@ -12,7 +12,7 @@
 #   OUTPUT_DIR         Defaults to a new timestamped output directory
 #   CACHE_DIR          Defaults to cache/qwen3.8-27b-1node
 #   LOG_DIR            Defaults to running_logs
-#   TARGET_MODEL_PATH  Target checkpoint (default supplied by h800conda.sh)
+#   TARGET_MODEL_PATH  Target checkpoint (default supplied by h800conda-tmp.sh)
 #   MOONCAKE_PROTOCOL  tcp (default), or rdma when configured
 #   RAY_ADDRESS        Ray address (default: local)
 #   WANDB_API_KEY      W&B key; falls back to wandb_key in the root .env file
@@ -95,7 +95,7 @@ if [[ "$dry_run" == true ]]; then
   exit 0
 fi
 
-source "$ROOT_DIR/h800conda.sh"
+source "$ROOT_DIR/h800conda-tmp.sh"
 # Load the local W&B credential without placing it in CLI args or run configs.
 # An explicitly exported WANDB_API_KEY takes precedence over the .env file.
 if [[ -z "${WANDB_API_KEY:-}" && -f "$ROOT_DIR/.env" ]]; then

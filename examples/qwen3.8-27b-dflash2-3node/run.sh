@@ -13,7 +13,7 @@
 #   OUTPUT_DIR         Defaults to a new timestamped output directory
 #   CACHE_DIR          Defaults to cache/qwen3_8_27b-dflash2-vllm-decode-3node
 #   LOG_DIR            Defaults to running_logs
-#   TARGET_MODEL_PATH  Target checkpoint (default supplied by h800conda.sh)
+#   TARGET_MODEL_PATH  Target checkpoint (default supplied by h800conda-tmp.sh)
 #   MOONCAKE_PROTOCOL  rdma (default, mlx5_0 on the validated cluster), or tcp
 #   RAY_ADDRESS        Existing Ray address, if not discovered locally
 #
@@ -122,7 +122,7 @@ if [[ "$dry_run" == true ]]; then
   exit 0
 fi
 
-source "$ROOT_DIR/h800conda.sh"
+source "$ROOT_DIR/h800conda-tmp.sh"
 # The local extract_hidden_states implementation is supported by Model Runner V1.
 export VLLM_USE_V2_MODEL_RUNNER=0
 export TORCHSPEC_LOG_LEVEL="${TORCHSPEC_LOG_LEVEL:-INFO}"

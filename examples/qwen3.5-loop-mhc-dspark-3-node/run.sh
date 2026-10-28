@@ -143,7 +143,7 @@ if [[ "$dry_run" == true ]]; then
   exit 0
 fi
 
-source "$ROOT_DIR/h800conda.sh"
+source "$ROOT_DIR/h800conda-tmp.sh"
 # Override the shared cache inherited from Conda and existing Ray nodes.
 # get_torchspec_env_vars forwards this path to each actor before Triton imports.
 export TORCHSPEC_TRITON_CACHE_DIR="$triton_cache_dir"

@@ -16,7 +16,7 @@
 #
 # Useful environment variables:
 #   CONFIG_FILE             Config path (default: the bundled 3-node config)
-#   TARGET_MODEL_PATH       Qwen3.8-27B checkpoint path (set by h800conda.sh)
+#   TARGET_MODEL_PATH       Qwen3.8-27B checkpoint path (set by h800conda-tmp.sh)
 #   TRAIN_NODE_IPS          Optional comma-separated training node IPs
 #   INFERENCE_NODE_IPS      Optional comma-separated inference node IPs
 #   TRAIN_GPUS              Training GPUs per node (default: 8)
@@ -39,9 +39,9 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 ROOT_DIR="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
 cd "$ROOT_DIR"
 
-# h800conda.sh activates the tested environment and prepends the local vLLM
+# h800conda-tmp.sh activates the tested environment and prepends the local vLLM
 # checkout to PYTHONPATH.
-source "$ROOT_DIR/h800conda.sh"
+source "$ROOT_DIR/h800conda-tmp.sh"
 
 export TORCHSPEC_LOG_LEVEL="${TORCHSPEC_LOG_LEVEL:-INFO}"
 export VLLM_WORKER_MULTIPROC_METHOD="${VLLM_WORKER_MULTIPROC_METHOD:-spawn}"

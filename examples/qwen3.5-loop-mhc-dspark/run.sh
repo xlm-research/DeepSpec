@@ -59,7 +59,7 @@ if [[ "$dry_run" == true ]]; then
   printf '\n'
   exit 0
 fi
-source "$repo_dir/h800conda.sh"
+source "$repo_dir/h800conda-tmp.sh"
 export VLLM_USE_V2_MODEL_RUNNER=1
 export TORCHSPEC_LOG_LEVEL="${TORCHSPEC_LOG_LEVEL:-INFO}"
 log_dir="${LOG_DIR:-$repo_dir/running_logs}"

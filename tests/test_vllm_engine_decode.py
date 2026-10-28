@@ -178,7 +178,9 @@ def test_native_decode_config_uses_real_eagle3_method():
     ]
 
 
-def test_direct_prefill_initializes_without_a_draft_and_keeps_final_separate(monkeypatch):
+@pytest.mark.parametrize("gpu_ids", [None, [0, 2, 4, 6]])
+def test_direct_prefill_initializes_without_a_draft_and_keeps_final_separate(monkeypatch, gpu_ids):
+    import os
     import sys
     from types import ModuleType
 
@@ -187,15 +189,19 @@ def test_direct_prefill_initializes_without_a_draft_and_keeps_final_separate(mon
     engine.args = _args(vllm_direct_hidden_state_capture=True, train_with_decode=False)
     engine._num_target_layers = 80
     engine.aux_hidden_state_layer_ids = [4, 28, 52, 76, 79]
-    engine.base_gpu_id = None
+    engine.base_gpu_id = 0 if gpu_ids else None
+    engine.gpu_ids = gpu_ids
+    engine.num_gpus_per_engine = 4
     engine.node_rank = 0
     vllm_stub = ModuleType("vllm")
     vllm_stub.LLM = MagicMock()
     monkeypatch.setitem(sys.modules, "vllm", vllm_stub)
     monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,2,4,6")
 
     engine._init_engine(4, 1, 1, 0.8, None)
 
+    assert os.environ["CUDA_VISIBLE_DEVICES"] == "0,2,4,6"
     kwargs = vllm_stub.LLM.call_args.kwargs
     assert kwargs["speculative_config"] is None
     assert kwargs["kv_transfer_config"]["kv_connector_extra_config"] == {

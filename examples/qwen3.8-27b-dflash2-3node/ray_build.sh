@@ -2,7 +2,7 @@
 # Start or join Ray on this node, then return without --block.
 #
 # Usage: bash examples/qwen3.8-27b-dflash2-3node/ray_build.sh [--dry-run]
-# Run the same command on every node; h800conda.sh activates the Ray environment.
+# Run the same command on every node; h800conda-tmp.sh activates the Ray environment.
 #
 # Environment variables:
 #   MASTER_ADDR       Required: the same head IPv4 address or hostname on all nodes
@@ -46,7 +46,7 @@ RAY_PORT="$((10#$RAY_PORT))"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
-source "$ROOT_DIR/h800conda.sh"
+source "$ROOT_DIR/h800conda-tmp.sh"
 
 for command in ray getent ip awk timeout; do
   command -v "$command" >/dev/null 2>&1 || fail "Required command not found: $command"

@@ -100,10 +100,12 @@ class VllmEngine(InferenceEngine, RayActor):
         num_gpus_per_engine: int = 1,
         node_rank: int = 0,
         engine_group: int = 0,
+        gpu_ids: list[int] | None = None,
     ):
         self.args = args
         self.rank = rank
         self.base_gpu_id = base_gpu_id
+        self.gpu_ids = gpu_ids
         self.num_gpus_per_engine = num_gpus_per_engine
         self.node_rank = node_rank
         self._engine = None
@@ -372,9 +374,13 @@ class VllmEngine(InferenceEngine, RayActor):
         # Pin vLLM's mp workers to the correct physical GPUs.  Without this,
         # all engines on a node see every GPU and their workers collide on
         # devices 0..tp_size-1.
-        if self.base_gpu_id is not None:
-            gpu_ids = [str(self.base_gpu_id + i) for i in range(self.num_gpus_per_engine)]
-            os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(gpu_ids)
+        gpu_ids = getattr(self, "gpu_ids", None)
+        if gpu_ids is None and self.base_gpu_id is not None:
+            gpu_ids = [self.base_gpu_id + i for i in range(self.num_gpus_per_engine)]
+        if gpu_ids is not None:
+            # Ray placement can reserve non-contiguous physical GPUs. Preserve
+            # its assignment instead of accidentally selecting a neighbour.
+            os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpu_ids))
             logger.info(
                 f"VllmEngine rank {self.rank}: set CUDA_VISIBLE_DEVICES={os.environ['CUDA_VISIBLE_DEVICES']}"
             )

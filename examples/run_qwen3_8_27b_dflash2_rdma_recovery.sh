@@ -18,9 +18,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 cd "$ROOT_DIR"
-source "$ROOT_DIR/h800conda.sh"
+source "$ROOT_DIR/h800conda-tmp.sh"
 # The prefill extractor is implemented by the V1 runner in this vLLM checkout.
-# Override h800conda.sh's V2 default before TorchSpec forwards env vars to Ray.
+# Override h800conda-tmp.sh's V2 default before TorchSpec forwards env vars to Ray.
 export VLLM_USE_V2_MODEL_RUNNER=0
 
 BASE_CONFIG="${BASE_CONFIG:-$ROOT_DIR/outputs/qwen3_8_27b-dflash2-128k_20261001_215811/config.yaml}"

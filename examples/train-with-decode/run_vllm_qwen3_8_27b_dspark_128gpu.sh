@@ -24,7 +24,7 @@
 #   CACHE_DIR           Defaults to the existing 3-node tokenization cache
 #   LOG_DIR             Defaults to running_logs
 #   MOONCAKE_PROTOCOL   tcp (default) or rdma, if configured on all nodes
-#   TARGET_MODEL_PATH   Target checkpoint; default supplied by h800conda.sh
+#   TARGET_MODEL_PATH   Target checkpoint; default supplied by h800conda-tmp.sh
 #   RAY_ADDRESS         Existing Ray cluster address, if not discovered locally
 #
 # --dry-run prints the command without activating Conda, contacting Ray, or
@@ -175,7 +175,7 @@ if [[ "$dry_run" == true ]]; then
 fi
 
 # Use the tested H800 environment and locally patched vLLM checkout.
-source "$ROOT_DIR/h800conda.sh"
+source "$ROOT_DIR/h800conda-tmp.sh"
 export TORCHSPEC_LOG_LEVEL="${TORCHSPEC_LOG_LEVEL:-INFO}"
 
 mkdir -p "$LOG_DIR"

@@ -13,7 +13,7 @@ bash examples/qwen3.5-loop-mhc-dspark/run.sh
 
 当前 vLLM 默认使用 `VLLM_QWEN3_5_MHC_BACKEND=triton`、`VLLM_QWEN3_5_MHC_FUSION=all`，直接运行即可启用 Sinkhorn、normalize、pre-aggregate 和 residual-merge 融合。显式环境变量覆盖仍然生效。
 
-启动脚本使用已有 `.venv` 和 `h800conda.sh`，开启 V2 runner。默认输出目录带时间戳；可通过 `OUTPUT_DIR`、`CACHE_DIR`、`TRAIN_DATA_PATH`、`TARGET_MODEL_PATH` 指定路径，或追加 `key=value` 配置覆盖。设置 `TORCHSPEC_LOG_LEVEL=DEBUG` 可记录采集分块、训练样本标识和分项指标。
+启动脚本使用已有 `.venv` 和 `h800conda-tmp.sh`，开启 V2 runner。默认输出目录带时间戳；可通过 `OUTPUT_DIR`、`CACHE_DIR`、`TRAIN_DATA_PATH`、`TARGET_MODEL_PATH` 指定路径，或追加 `key=value` 配置覆盖。设置 `TORCHSPEC_LOG_LEVEL=DEBUG` 可记录采集分块、训练样本标识和分项指标。
 
 默认一轮 20 条有效数据，全局 batch=4，完成五次 optimizer 更新；在第 2、4 步及轮末保存，保留最近两份完整 checkpoint。第 4 步恢复到第 5 步：
 

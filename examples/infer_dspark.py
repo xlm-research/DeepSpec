@@ -1,7 +1,7 @@
 """Run the local Qwen/SenseNova target with a trained DSpark draft.
 
 From the TorchSpec root:
-    source ./h800conda.sh
+    source ./h800conda-tmp.sh
     CUDA_VISIBLE_DEVICES=1 python examples/infer_dspark.py --prompt '你好，请介绍投机解码。'
 """
 
@@ -34,9 +34,8 @@ def main() -> None:
     os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "1"
     os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
-    from vllm.v1.metrics.reader import Counter
-
     from vllm import LLM, SamplingParams
+    from vllm.v1.metrics.reader import Counter
 
     print(f"Target: {args.target_model}\nDSpark draft: {args.draft_model}", flush=True)
     llm = LLM(

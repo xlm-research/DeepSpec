@@ -6,6 +6,7 @@ Training examples ordered from simplest to most advanced.
 |---------|------|---------|-------|-------|------------|
 | [hf-quickstart](hf-quickstart/) | 3 | HuggingFace | Qwen3-8B | 1 | Easiest |
 | [qwen3-8b-single-node](qwen3-8b-single-node/) | 4+ | SGLang | Qwen3-8B | 1 | Easy |
+| [qwen3.5-loop-mhc-dflash2](qwen3.5-loop-mhc-dflash2/) | 8 | vLLM V2 | Qwen3.5 Loop/mHC + DFlash2 | 1 | Advanced |
 | [kimi-k25-2node-h200](kimi-k25-2node-h200/) | 16 | SGLang | Kimi-K2.5 | 2 | Advanced |
 | [kimi-k25-3node-h100](kimi-k25-3node-h100/) | 24 | SGLang | Kimi-K2.5 | 3 | Advanced |
 

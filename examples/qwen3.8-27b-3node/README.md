@@ -24,7 +24,7 @@ bash run.sh dspark
 默认训练/head 节点为 `10.120.0.211`，推理节点为 `10.120.0.218`、`10.120.0.187`。
 入口会复用已有 Ray 节点，并行启动缺少的 worker，等待三台机器各至少有 8 张 GPU 后
 开始训练。任一节点均可执行；从推理节点执行时会通过 SSH 转到 head。
-各节点需要共享当前仓库和 `h800conda.sh` 环境，并配置好免密 SSH 及已知主机密钥。
+各节点需要共享当前仓库和 `h800conda-tmp.sh` 环境，并配置好免密 SSH 及已知主机密钥。
 可用 `TRAIN_NODE_IPS`、`INFERENCE_NODE_IPS`、`RAY_PORT`、`SSH_USER`、`SSH_PORT`
 覆盖连接配置。`bash run.sh dspark --dry-run` 可预览，训练参数和 `LOAD_PATH` 等
 环境变量继续透传给原脚本。省略 `dspark` 时根目录入口默认运行 DFlash2。
@@ -59,7 +59,7 @@ bash examples/qwen3.8-27b-3node/run.sh --print-config-only
 `decode.weight_sync_enabled: false`，采用已有样本监督的 prefill 路径。
 目标模型仍进行前向推理；vLLM 使用 `extract_hidden_states` 提取训练所需状态，
 其中的辅助缓存模块不加载 DSpark 权重。所有节点应使用当前仓库的本地 vLLM 代码；
-脚本通过 `h800conda.sh` 配置环境，并设置 `VLLM_USE_V2_MODEL_RUNNER=0`，
+脚本通过 `h800conda-tmp.sh` 配置环境，并设置 `VLLM_USE_V2_MODEL_RUNNER=0`，
 使用当前支持 `extract_hidden_states` 的 Model Runner V1。
 
 `training.max_seq_length` 和 vLLM 的 `max_model_len` 都保持为 131072（128K）。

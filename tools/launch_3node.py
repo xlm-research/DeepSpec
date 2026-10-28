@@ -20,7 +20,7 @@ HELP = """Usage: bash run.sh [dflash2|dspark] [--dry-run] [key=value ...]
 
 Default: dflash2, head/training 10.120.0.211, inference 10.120.0.218,10.120.0.187.
 Starts missing Ray nodes over SSH, reuses live nodes, then starts training.
-Run from any of the three nodes; all must share this checkout and h800conda.sh.
+Run from any of the three nodes; all must share this checkout and h800conda-tmp.sh.
 SSH must work without a password (known host keys, BatchMode=yes).
 
   bash run.sh
@@ -123,7 +123,7 @@ class Launcher:
             [
                 "set -euo pipefail",
                 f"cd -- {shlex.quote(str(ROOT))}",
-                "source ./h800conda.sh",
+                "source ./h800conda-tmp.sh",
                 "export " + shlex.join([f"{key}={value}" for key, value in self.env.items()]),
                 "exec " + shlex.join(command),
             ]
@@ -263,7 +263,7 @@ def main(argv=None):
             f"Recipe: {recipe}; Ray head: {launcher.address}; workers: {', '.join(launcher.workers)}"
         )
         print(
-            "Plan: activate h800conda.sh on each node; reuse live Ray nodes; start missing nodes;"
+            "Plan: activate h800conda-tmp.sh on each node; reuse live Ray nodes; start missing nodes;"
         )
         print(
             "      wait for 3 x 8 GPUs; run training on the head. No SSH/Ray calls made.",

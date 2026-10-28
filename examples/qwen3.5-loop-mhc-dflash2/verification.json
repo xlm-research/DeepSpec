@@ -1,0 +1,355 @@
+{
+  "timestamp": "2026-10-27T21:22:36.248855+08:00",
+  "status": "single_node_8gpu_online_training_resume_and_default_long_context_validation_passed",
+  "environment": {
+    "activation": "source cp_envs.sh; source h800conda-tmp.sh",
+    "conda_prefix": "/tmp/deepspec_vllm_torchtitan_envs",
+    "torch": "2.13.0+cu130",
+    "transformers": "5.16.1",
+    "ray": "2.58.0",
+    "vllm_checkout": "/mnt/afs_share/lezewei/TorchSpec/vllm",
+    "repo_head": "064ff2f3e102afc10261b6881ec08fdd7e73d415",
+    "vllm_head": "e92cadc862730336efa13eb0967e560ae33969d8"
+  },
+  "requested_topology": {
+    "nodes": 1,
+    "gpus": 8,
+    "target_tp": 4,
+    "training_fsdp_world_size": 4
+  },
+  "validated_topology": {
+    "nodes": 1,
+    "gpus": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7
+    ],
+    "training_gpus": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "target_gpus": [
+      4,
+      5,
+      6,
+      7
+    ],
+    "target_tp": 4,
+    "target_pp": 1,
+    "training_fsdp_world_size": 4,
+    "execution": "concurrent target capture and online FSDP training"
+  },
+  "tests": {
+    "passed": 162,
+    "subtests_passed": 70,
+    "logs": {
+      "dflash_loop_rope_connector_checkpoint": "torchspec-loop-dflash2-tests.log",
+      "vllm_engine_factory_decode": "torchspec-loop-dflash2-gpu-isolated.log",
+      "placement": "torchspec-loop-dflash2-placement.log"
+    },
+    "gpu_allocation_regression": "2 failing cases before the fix; both passed after forwarding the actual Ray GPU list",
+    "lint_new_diagnostics": 0,
+    "lint_preexisting_import_order_diagnostics": 5,
+    "shell_syntax": "passed",
+    "git_diff_check": "passed",
+    "note": "Placement tests replace ray globally during collection and were run in a separate process."
+  },
+  "online_smoke": {
+    "exit_code": 0,
+    "command": "OUTPUT_DIR=outputs/loop_dflash2_8gpu_smoke_20261027 TORCHSPEC_LOG_LEVEL=DEBUG bash examples/qwen3.5-loop-mhc-dflash2/run.sh --smoke",
+    "optimizer_steps_completed_this_run": [
+      1,
+      2
+    ],
+    "fsdp_world_size": 4,
+    "model_tensor_count": 82,
+    "optimizer_tensor_count": 324,
+    "optimizer_parameter_states": 81,
+    "all_tensors_finite": true,
+    "frozen_embedding_equal_to_target": true,
+    "embedding_and_lm_head_absent_from_optimizer": true,
+    "parameter_changes_in_last_step": {
+      "model_state.model.draft_model.candidate_selector.hidden_projection.weight": {
+        "changed_elements": 847699,
+        "max_abs_difference": 0.0001220703125
+      },
+      "model_state.model.draft_model.context_proj.weight": {
+        "changed_elements": 78674740,
+        "max_abs_difference": 0.0001068115234375
+      }
+    },
+    "verification": "outputs/loop_dflash2_8gpu_smoke_20261027/parameter_verification.json",
+    "log": "running_logs/qwen3.5-loop-mhc-dflash2_20261027_210629.log",
+    "output_dir": "outputs/loop_dflash2_8gpu_smoke_20261027",
+    "metrics": [
+      {
+        "train/global_step": 1,
+        "train/avg_loss": 13.004947662353516,
+        "train/selector_loss": 6.955642223358154,
+        "train/grad_norm": 431.7117919921875,
+        "train/lr": 9.045084971874738e-05
+      },
+      {
+        "train/global_step": 2,
+        "train/avg_loss": 29.5882511138916,
+        "train/selector_loss": 29.5886173248291,
+        "train/grad_norm": 335.5380859375,
+        "train/lr": 6.545084971874738e-05
+      }
+    ],
+    "checkpoint_iterations_retained": [
+      1,
+      2
+    ]
+  },
+  "online_resume": {
+    "exit_code": 0,
+    "command": "LOAD_PATH=outputs/loop_dflash2_8gpu_smoke_20261027/checkpoints CKPT_STEP=1 OUTPUT_DIR=outputs/loop_dflash2_8gpu_resume_20261027 TORCHSPEC_LOG_LEVEL=DEBUG bash examples/qwen3.5-loop-mhc-dflash2/run.sh --smoke",
+    "optimizer_steps_completed_this_run": [
+      2
+    ],
+    "fsdp_world_size": 4,
+    "model_tensor_count": 82,
+    "optimizer_tensor_count": 324,
+    "optimizer_parameter_states": 81,
+    "all_tensors_finite": true,
+    "frozen_embedding_equal_to_target": true,
+    "embedding_and_lm_head_absent_from_optimizer": true,
+    "parameter_changes_in_last_step": {
+      "model_state.model.draft_model.context_proj.weight": {
+        "changed_elements": 78685986,
+        "max_abs_difference": 0.0001068115234375
+      },
+      "model_state.model.draft_model.candidate_selector.hidden_projection.weight": {
+        "changed_elements": 843942,
+        "max_abs_difference": 0.0001220703125
+      }
+    },
+    "verification": "outputs/loop_dflash2_8gpu_resume_20261027/parameter_verification.json",
+    "log": "running_logs/qwen3.5-loop-mhc-dflash2_20261027_211004.log",
+    "output_dir": "outputs/loop_dflash2_8gpu_resume_20261027",
+    "metrics": [
+      {
+        "train/global_step": 2,
+        "train/avg_loss": 29.774742126464844,
+        "train/selector_loss": 29.775297164916992,
+        "train/grad_norm": 334.2626953125,
+        "train/lr": 6.545084971874738e-05
+      }
+    ],
+    "from_step": 1,
+    "to_step": 2,
+    "restored_components": [
+      "model",
+      "optimizer",
+      "fp32_master_parameters",
+      "lr_scheduler",
+      "rng"
+    ],
+    "exact_async_sample_replay": false
+  },
+  "default_training": {
+    "exit_code": 0,
+    "command": "OUTPUT_DIR=outputs/loop_dflash2_8gpu_default_20261027 TORCHSPEC_LOG_LEVEL=DEBUG bash examples/qwen3.5-loop-mhc-dflash2/run.sh debug.verify_parameter_updates=true",
+    "optimizer_steps_completed_this_run": [
+      1,
+      2,
+      3,
+      4,
+      5
+    ],
+    "fsdp_world_size": 4,
+    "model_tensor_count": 82,
+    "optimizer_tensor_count": 324,
+    "optimizer_parameter_states": 81,
+    "all_tensors_finite": true,
+    "frozen_embedding_equal_to_target": true,
+    "embedding_and_lm_head_absent_from_optimizer": true,
+    "parameter_changes_in_last_step": {
+      "model_state.model.draft_model.candidate_selector.hidden_projection.weight": {
+        "changed_elements": 168956,
+        "max_abs_difference": 0.0001220703125
+      },
+      "model_state.model.draft_model.context_proj.weight": {
+        "changed_elements": 23528682,
+        "max_abs_difference": 3.0517578125e-05
+      }
+    },
+    "verification": "outputs/loop_dflash2_8gpu_default_20261027/parameter_verification.json",
+    "log": "running_logs/qwen3.5-loop-mhc-dflash2_20261027_211342.log",
+    "output_dir": "outputs/loop_dflash2_8gpu_default_20261027",
+    "metrics": [
+      {
+        "train/global_step": 1,
+        "train/avg_loss": 12.700124740600586,
+        "train/selector_loss": 6.6402974128723145,
+        "train/grad_norm": 370.5049133300781,
+        "train/lr": 9.045084971874738e-05
+      },
+      {
+        "train/global_step": 2,
+        "train/avg_loss": 33.764732360839844,
+        "train/selector_loss": 33.76447677612305,
+        "train/grad_norm": 278.8303527832031,
+        "train/lr": 6.545084971874738e-05
+      },
+      {
+        "train/global_step": 3,
+        "train/avg_loss": 9.564515113830566,
+        "train/selector_loss": 8.992809295654297,
+        "train/grad_norm": 85.2184066772461,
+        "train/lr": 3.4549150281252636e-05
+      },
+      {
+        "train/global_step": 4,
+        "train/avg_loss": 20.830045700073242,
+        "train/selector_loss": 16.512693405151367,
+        "train/grad_norm": 159.40469360351562,
+        "train/lr": 9.549150281252633e-06
+      },
+      {
+        "train/global_step": 5,
+        "train/avg_loss": 19.216556549072266,
+        "train/selector_loss": 13.375486373901367,
+        "train/grad_norm": 121.84161376953125,
+        "train/lr": 0.0
+      }
+    ],
+    "dataset": {
+      "source": "mydata/test_20.jsonl",
+      "tokenized_cache": "cache/qwen3.5-loop-mhc-dflash2/tokenized_dataset/d2c855828d078c4515de06fc99989cd2.pt",
+      "records": 20,
+      "input_tokens": [
+        45709,
+        16892,
+        74100,
+        16854,
+        7177,
+        20865,
+        35153,
+        52160,
+        27301,
+        56696,
+        46593,
+        21086,
+        31654,
+        105647,
+        10382,
+        43808,
+        8251,
+        7286,
+        13242,
+        88326
+      ],
+      "min_input_tokens": 7177,
+      "max_input_tokens": 105647,
+      "total_input_tokens": 729182
+    },
+    "capture_verification": "outputs/loop_dflash2_8gpu_default_20261027/capture_verification.json",
+    "capture": {
+      "log": "running_logs/qwen3.5-loop-mhc-dflash2_20261027_211342.log",
+      "training_epoch_records": 20,
+      "total_training_input_tokens": 729182,
+      "max_training_input_tokens": 105647,
+      "all_training_capture_ranges_contiguous": true,
+      "capture_lengths_match_tokenized_dataset": true,
+      "capture_slots": [
+        4,
+        28,
+        52,
+        76,
+        79,
+        80
+      ],
+      "max_prefill_chunk_tokens": 8192,
+      "all_logged_requests_including_prefetch": 22,
+      "training_request_lengths": [
+        88326,
+        20865,
+        10382,
+        7177,
+        56696,
+        105647,
+        43808,
+        13242,
+        35153,
+        31654,
+        7286,
+        46593,
+        16892,
+        21086,
+        74100,
+        8251,
+        52160,
+        27301,
+        45709,
+        16854
+      ],
+      "training_request_chunk_counts": [
+        11,
+        3,
+        2,
+        1,
+        7,
+        13,
+        6,
+        2,
+        5,
+        4,
+        1,
+        6,
+        3,
+        3,
+        10,
+        2,
+        7,
+        4,
+        6,
+        3
+      ]
+    },
+    "configured_max_sequence_length": 131072,
+    "dflash_num_anchors": 512,
+    "epochs_completed": 1,
+    "checkpoint_iterations_saved": [
+      2,
+      4,
+      5
+    ],
+    "checkpoint_iterations_retained": [
+      4,
+      5
+    ]
+  },
+  "prior_sequential_validation": "outputs/loop_dflash2_validation_20261027/sequential_verification.json",
+  "service_shutdown": {
+    "authorized_by_user": true,
+    "supervisor_programs": {
+      "gpu-monitor": "STOPPED",
+      "embedding-monitor": "STOPPED"
+    },
+    "gpu_memory_used_mib_after_validation": {
+      "0": 0,
+      "1": 0,
+      "2": 0,
+      "3": 0,
+      "4": 0,
+      "5": 0,
+      "6": 0,
+      "7": 0
+    }
+  },
+  "remaining": {
+    "full_128k_boundary_input": "not tested; longest validated input is 105647 tokens",
+    "long_run_convergence": "not evaluated",
+    "acceptance_rate_or_speedup": "not measured"
+  },
+  "shutdown": "All three online 8-GPU runs exited 0 and released all GPU workers. Existing Mooncake unmount and Ray queue-owner teardown warnings remain in the logs."
+}

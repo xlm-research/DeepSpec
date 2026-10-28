@@ -10,7 +10,7 @@
 #
 # Useful environment variables:
 #   CUDA_VISIBLE_DEVICES  GPUs to use (default: 0,1,2,3,4,5,6,7)
-#   TARGET_MODEL_PATH     Qwen3.8-27B checkpoint path (set by h800conda.sh)
+#   TARGET_MODEL_PATH     Qwen3.8-27B checkpoint path (set by h800conda-tmp.sh)
 #   TRAIN_DATA_PATH       Training dataset path (overrides the YAML config)
 #   EVAL_DATA_PATH        Optional evaluation dataset override
 #   TRAIN_GPUS            Training GPUs (default: 4)
@@ -87,7 +87,7 @@ fi
 
 cd "$ROOT_DIR"
 # Activate the same environment and local vLLM checkout as the 3-node recipe.
-source "$ROOT_DIR/h800conda.sh"
+source "$ROOT_DIR/h800conda-tmp.sh"
 
 topology_overrides=(
   "training.training_num_nodes=1"

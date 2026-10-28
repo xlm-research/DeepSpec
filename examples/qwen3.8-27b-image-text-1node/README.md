@@ -8,7 +8,7 @@
 全量 DSpark 监督窗口一次：
 
 ```bash
-source h800conda.sh
+source h800conda-tmp.sh
 pip install matplotlib tensorboard requests pillow
 OUTPUT_DIR="$PWD/outputs/image-text-full" \
   bash examples/qwen3.8-27b-image-text-1node/run.sh --full-data
@@ -82,7 +82,7 @@ vLLM 读取完整已有会话，执行 prefill 并生成 1 token；新增 token 
 在仓库根目录准备样本（需要现有 H800 环境）：
 
 ```bash
-source h800conda.sh
+source h800conda-tmp.sh
 python examples/qwen3.8-27b-image-text-1node/prepare_data.py
 ```
 

@@ -16,7 +16,7 @@ def test_vllm_port_probe_uses_engine_init_timeout():
         vllm_init_timeout=45,
         vllm_pp_size=1,
     )
-    pg = (MagicMock(name="pg"), [4], [4])
+    pg = (MagicMock(name="pg"), [0, 1, 2, 3], [0, 2, 4, 6])
 
     engine = MagicMock(name="vllm_engine")
     engine.find_free_port.remote.return_value = MagicMock(name="port_ref")
@@ -51,3 +51,5 @@ def test_vllm_port_probe_uses_engine_init_timeout():
     assert init_refs == [engine.init.remote.return_value]
     assert observed_timeouts == [45.0]
     engine.find_free_port.remote.assert_called_once_with(start_port=10000, consecutive=2)
+    # A TP group may occupy non-contiguous physical devices on a shared node.
+    assert ray_actor.options.return_value.remote.call_args.kwargs["gpu_ids"] == [0, 2, 4, 6]

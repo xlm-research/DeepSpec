@@ -29,7 +29,7 @@ Markov rank 256，默认从头初始化。
 
 ## 启动方式（供检查后使用）
 
-三台机器须共享仓库、模型与数据，使用 `h800conda.sh` 配置的 Python 环境和本仓库的
+三台机器须共享仓库、模型与数据，使用 `h800conda-tmp.sh` 配置的 Python 环境和本仓库的
 本地 vLLM。先按 [Ray 集群说明](../../docs/ray.md#multi-node-local-cluster)启动或加入
 三节点 Ray 集群，再在 head 节点执行本目录脚本。脚本通过 `ray status` 检查连接；
 实际 GPU 资源与节点分配由 TorchSpec placement group 校验。
@@ -96,8 +96,10 @@ prefix caching。
 
 ## 恢复训练
 
-`run.sh` 和 `restart.sh` 使用各节点本地的 `/tmp/torchspec-triton-$UID` 作为 Triton
-缓存，并通过 Ray runtime env 传递给目标 worker，覆盖 Conda 或旧 Ray 节点继承的
+`restart.sh` 默认从 `/tmp/deepspec_vllm_torchtitan_envs` 加载环境，并将 Triton 缓存放在
+该环境的 `.cache/torchspec-triton-$UID` 子目录；设置 `TORCHSPEC_CONDA_ENV` 时缓存默认
+随环境目录调整。直接使用 `run.sh` 时，缓存默认仍为各节点本地的
+`/tmp/torchspec-triton-$UID`。两者均通过 Ray runtime env 将缓存路径传递给目标 worker，覆盖 Conda 或旧 Ray 节点继承的
 共享盘缓存。需要自定义位置时设置 `TORCHSPEC_TRITON_CACHE_DIR`，该路径必须在所有
 节点可用，建议使用本地 SSD。更改缓存或内核代码后须重启目标进程才能生效。
 此启动脚本自动设置 `TORCHSPEC_TRITON_CACHE_DIR` 来启用跨节点覆盖；其他训练任务
